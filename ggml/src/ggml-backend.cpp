@@ -12,6 +12,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
+#include "ggml-moe-cache.h"
 
 #include <assert.h>
 #include <limits.h>
@@ -817,6 +818,12 @@ struct ggml_backend_sched {
     size_t context_buffer_size;
 
     bool op_offload;
+
+    // MoE per-expert cache (opaque pointer to ggml_moe_cache; void* to avoid
+    // pulling moe-cache types into this struct's public-ish definition).
+    // When non-null, ggml_backend_sched_compute_splits redirects the MoE
+    // expert-offload H2D copies through the cache. See ggml/src/ggml-moe-cache.{h,cpp}.
+    void * moe_cache;
 
     int debug;
 
@@ -1635,29 +1642,112 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             expert_size_copy + padding_end);
                     };
 
-                    int id = 0;
-                    while (!ggml_bitset_get(used_ids.data(), id)) {
-                        id++;
+                    // MoE per-expert cache (issue #20757 CUDA backend) — when set,
+                    // redirect this expert's H2D copies through a persistent GPU slot
+                    // cache. Hits skip H2D entirely (D2D from cache slot to input_cpy).
+                    // Misses still do the existing batched H2D, then populate cache
+                    // slots for future hits. Same backend stream is used throughout,
+                    // so all ops are naturally ordered without explicit fences.
+                    ggml_moe_cache_t moe_cache = (ggml_moe_cache_t) sched->moe_cache;
+                    int                    moe_layer_idx = -1;
+                    enum ggml_moe_bucket   moe_bucket    = GGML_MOE_BUCKET_INVALID;
+                    bool use_moe_cache = false;
+                    if (moe_cache &&
+                        ggml_moe_cache_identify_tensor(moe_cache, input,
+                            ggml_moe_cache_n_layers(moe_cache),
+                            &moe_layer_idx, &moe_bucket) &&
+                        ggml_moe_cache_bind_bucket(moe_cache, moe_layer_idx, moe_bucket,
+                            expert_size, n_expert)) {
+                        use_moe_cache = true;
                     }
-                    int32_t first_id = id;
-                    int32_t last_id = first_id;
 
-                    for (++id; id < n_expert; ++id) {
-                        if (!ggml_bitset_get(used_ids.data(), id)) {
-                            continue;
+                    if (use_moe_cache) {
+                        // Phase 1 cache-aware path: classify each used expert,
+                        // H2D-batch the misses, then D2D both miss-populates and
+                        // hit-fetches. All on the same split_backend stream.
+                        std::vector<int32_t>                miss_ids;
+                        std::vector<std::pair<int32_t,int>> hit_slots; // (expert_id, slot)
+                        miss_ids.reserve(n_expert);
+                        hit_slots.reserve(n_expert);
+
+                        for (int64_t id_i = 0; id_i < n_expert; id_i++) {
+                            if (!ggml_bitset_get(used_ids.data(), id_i)) continue;
+                            const int slot = ggml_moe_cache_lookup(
+                                moe_cache, moe_layer_idx, moe_bucket, (int32_t) id_i);
+                            if (slot >= 0) {
+                                hit_slots.emplace_back((int32_t) id_i, slot);
+                            } else {
+                                miss_ids.push_back((int32_t) id_i);
+                            }
                         }
 
-                        if (id == last_id + 1) {
+                        // Batched H2D for misses (contiguous runs)
+                        for (size_t i = 0; i < miss_ids.size(); ) {
+                            int32_t first = miss_ids[i];
+                            int32_t last  = first;
+                            size_t  j     = i + 1;
+                            while (j < miss_ids.size() && miss_ids[j] == last + 1) {
+                                last = miss_ids[j];
+                                j++;
+                            }
+                            copy_experts(first, last);
+                            i = j;
+                        }
+
+                        // D2D populate cache slots for misses (after H2D done above)
+                        for (int32_t id_m : miss_ids) {
+                            const int slot = ggml_moe_cache_select_slot_for_miss(
+                                moe_cache, moe_layer_idx, moe_bucket, id_m);
+                            if (slot < 0) continue;
+                            void * dst = ggml_moe_cache_slot_data(
+                                moe_cache, moe_layer_idx, moe_bucket, slot);
+                            const void * src = (const uint8_t *) input_cpy->data
+                                             + (size_t) id_m * expert_size;
+                            if (ggml_moe_cache_copy_d2d_async(
+                                    split_backend, dst, src, expert_size)) {
+                                ggml_moe_cache_record_slot(
+                                    moe_cache, moe_layer_idx, moe_bucket, slot, id_m);
+                            }
+                        }
+
+                        // D2D fetch into input_cpy for hits
+                        for (const auto & h : hit_slots) {
+                            const int32_t id_h   = h.first;
+                            const int     slot_h = h.second;
+                            const void * src = ggml_moe_cache_slot_data(
+                                moe_cache, moe_layer_idx, moe_bucket, slot_h);
+                            void * dst = (uint8_t *) input_cpy->data
+                                       + (size_t) id_h * expert_size;
+                            ggml_moe_cache_copy_d2d_async(
+                                split_backend, dst, src, expert_size);
+                        }
+                    } else {
+                        // Existing contiguous-batch H2D path (cache disabled or
+                        // tensor not identifiable as MoE expert weights).
+                        int id = 0;
+                        while (!ggml_bitset_get(used_ids.data(), id)) {
+                            id++;
+                        }
+                        int32_t first_id = id;
+                        int32_t last_id = first_id;
+
+                        for (++id; id < n_expert; ++id) {
+                            if (!ggml_bitset_get(used_ids.data(), id)) {
+                                continue;
+                            }
+
+                            if (id == last_id + 1) {
+                                last_id = id;
+                                continue;
+                            }
+
+                            copy_experts(first_id, last_id);
+
+                            first_id = id;
                             last_id = id;
-                            continue;
                         }
-
                         copy_experts(first_id, last_id);
-
-                        first_id = id;
-                        last_id = id;
                     }
-                    copy_experts(first_id, last_id);
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
@@ -1787,10 +1877,17 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
+    sched->moe_cache  = NULL;
 
     ggml_backend_sched_reset(sched);
 
     return sched;
+}
+
+void ggml_backend_sched_set_moe_cache(ggml_backend_sched_t sched, void * cache) {
+    if (sched) {
+        sched->moe_cache = cache;
+    }
 }
 
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
