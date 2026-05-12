@@ -90,6 +90,22 @@ struct ggml_moe_cache {
     std::vector<cell_state> cells;            // n_layers * GGML_MOE_BUCKET_COUNT
     uint64_t lfru_tick = 0;                   // monotonic stamp for LRU tiebreak
 
+    // Pool-manager state (Phase 1+).
+    //
+    // Demand counters are per (layer, bucket, expert_id). They track how
+    // many times the scheduler has missed-and-routed-to-CPU for each
+    // expert, integrated over time with periodic decay. maintain() reads
+    // them to decide which experts to admit into the GPU pool.
+    //
+    // n_experts_per_cell is set on first bind_bucket from the input
+    // tensor's n_expert dimension. Until then we don't size the counters.
+    //
+    // Counter type: uint32_t. Saturates at 4G hints which is way more
+    // than any realistic decode workload.
+    int n_experts_per_cell = 0;
+    std::vector<uint32_t> demand;             // [layers * buckets * n_experts]
+    uint64_t maintain_calls = 0;              // cadence / decay tracking
+
     // Diagnostic env-var flags
     bool force_noop      = false;   // GGML_MOE_CACHE_FORCE_NOOP
     bool force_skip_even = false;   // GGML_MOE_CACHE_FORCE_SKIP_EVEN
@@ -225,6 +241,20 @@ void ggml_moe_cache_free(ggml_moe_cache_t c) {
                           (long long) gpu_dispatches, 100.0 - cpu_pct,
                           avg_misses_when_gpu);
         }
+        if (c->n_experts_per_cell > 0 && !c->demand.empty()) {
+            // Summarize demand counters: how many distinct experts saw any
+            // demand, and the top-N counts (handy when verifying that hint()
+            // is firing and the distribution is Zipfian-ish).
+            uint64_t total_hints = 0;
+            size_t   nonzero     = 0;
+            for (uint32_t d : c->demand) {
+                total_hints += d;
+                if (d > 0) ++nonzero;
+            }
+            moe_cache_log("pool-manager demand: %lld total hints across %zu / %zu (expert, cell) entries; %llu maintain() calls",
+                          (long long) total_hints, nonzero, c->demand.size(),
+                          (unsigned long long) c->maintain_calls);
+        }
     } else {
         moe_cache_log("final stats: no lookups recorded — cache code path never executed");
     }
@@ -276,10 +306,21 @@ bool ggml_moe_cache_bind_bucket(
         int                    layer_idx,
         ggml_moe_bucket       bucket,
         size_t                 expert_size_bytes,
-        int64_t                /*n_experts_total*/) {
+        int64_t                n_experts_total) {
     if (!c || bucket < 0 || bucket >= GGML_MOE_BUCKET_COUNT) return false;
     if (layer_idx < 0 || layer_idx >= c->n_layers)            return false;
     if (expert_size_bytes == 0)                                return false;
+
+    // Lazy-init demand counters on first bind (we need n_experts to size them).
+    // All cells in the model share the same n_experts dimension, so we only
+    // need to do this once.
+    if (c->n_experts_per_cell == 0 && n_experts_total > 0) {
+        c->n_experts_per_cell = (int) n_experts_total;
+        c->demand.assign((size_t) c->n_layers * GGML_MOE_BUCKET_COUNT * c->n_experts_per_cell, 0);
+        moe_cache_log("pool manager: demand counters sized for %d layers x %d buckets x %d experts = %.1f KiB",
+                      c->n_layers, (int) GGML_MOE_BUCKET_COUNT, c->n_experts_per_cell,
+                      c->demand.size() * sizeof(uint32_t) / 1024.0);
+    }
 
     auto & cell = c->cells[cell_idx(layer_idx, bucket)];
     if (cell.bound) {
@@ -426,6 +467,42 @@ void ggml_moe_cache_record_slot(
     cell.slot_map[slot_idx]  = expert_id;
     cell.freq[slot_idx]      = 1;                    // counts the access that caused this populate
     cell.last_tick[slot_idx] = ++c->lfru_tick;       // newest -> escapes immediate LRU eviction
+}
+
+// -----------------------------------------------------------------------------
+// Pool manager (Phase 1+): hint + maintain
+// -----------------------------------------------------------------------------
+
+static inline size_t demand_idx(const ggml_moe_cache * c,
+                                int layer_idx, ggml_moe_bucket bucket, int32_t expert_id) {
+    return ((size_t) layer_idx * GGML_MOE_BUCKET_COUNT + (size_t) bucket)
+           * (size_t) c->n_experts_per_cell + (size_t) expert_id;
+}
+
+void ggml_moe_cache_hint(
+        ggml_moe_cache_t c, int layer_idx, ggml_moe_bucket bucket, int32_t expert_id) {
+    if (!c || c->n_experts_per_cell <= 0) return;
+    if (bucket < 0 || bucket >= GGML_MOE_BUCKET_COUNT) return;
+    if (layer_idx < 0 || layer_idx >= c->n_layers)     return;
+    if (expert_id < 0 || expert_id >= c->n_experts_per_cell) return;
+
+    uint32_t & d = c->demand[demand_idx(c, layer_idx, bucket, expert_id)];
+    if (d != UINT32_MAX) d++;  // saturate at uint32 max
+}
+
+void ggml_moe_cache_maintain(ggml_moe_cache_t c) {
+    if (!c) return;
+    c->maintain_calls++;
+    // Phase 1 stub: pool manager policy not yet implemented. Phase 4 will:
+    //   1. Scan demand counters per cell
+    //   2. Identify experts above admission threshold not already resident
+    //   3. Issue async H2D on the copy stream (S1's stream)
+    //   4. Update slot_map atomically after H2D completes
+    //   5. Periodically decay counters (halve every K maintain() calls)
+    //
+    // Until then, the existing select_slot_for_miss + record_slot path from
+    // compute_splits handles populate synchronously on the miss path. The
+    // hint() data is being accumulated and is available for inspection.
 }
 
 // -----------------------------------------------------------------------------

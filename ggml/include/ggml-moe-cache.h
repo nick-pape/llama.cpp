@@ -111,12 +111,51 @@ int ggml_moe_cache_select_slot_for_miss(
 // Record that an expert now occupies a slot. Called after the H2D copy
 // (or D2D-from-input_cpy) is issued. Updates the slot map atomically
 // for the scheduler (single-threaded at this point, no lock needed).
+//
+// Legacy entry point for the synchronous populate-on-miss flow. The
+// new pool-manager model (hint + maintain) makes this internal-only,
+// but it's retained for the transitional path while Phase 3 (CPU
+// dispatch) is being implemented.
 void ggml_moe_cache_record_slot(
     ggml_moe_cache_t        cache,
     int                      layer_idx,
     enum ggml_moe_bucket    bucket,
     int                      slot_idx,
     int32_t                  expert_id);
+
+// Pool-manager interface (Phase 1+).
+//
+// The cache models a fixed-size GPU pool of expert weights with an
+// async, opportunistic admission/eviction policy. The compute path
+// never waits on a cache miss: misses route to CPU, the cache is
+// informed via a `hint`, and the pool manager decides on its own
+// schedule whether to bring the expert into the pool.
+//
+//   hint     : O(1) demand-counter bump for one expert. Called once
+//              per miss in compute_splits.
+//   maintain : runs the pool manager's policy (scan demand counters,
+//              decide admissions / evictions, issue async H2D on the
+//              copy stream). Caller invokes periodically.
+//
+// Both are no-ops when the cache is disabled / non-CUDA, so they are
+// safe to call unconditionally from the scheduler.
+
+// Bump the demand counter for (layer, bucket, expert_id). Used by the
+// scheduler to register that this expert was needed but not resident,
+// without waiting for any I/O. The pool manager's `maintain()` later
+// uses these counters to make admission decisions.
+void ggml_moe_cache_hint(
+    ggml_moe_cache_t        cache,
+    int                      layer_idx,
+    enum ggml_moe_bucket    bucket,
+    int32_t                  expert_id);
+
+// Run the pool manager's policy. Scans demand counters, admits experts
+// that have crossed the threshold (asynchronously on the copy stream),
+// evicts lower-demand slots to make room. Cheap-no-op if nothing has
+// changed since the last call. Caller decides cadence (per N tokens
+// is typical).
+void ggml_moe_cache_maintain(ggml_moe_cache_t cache);
 
 // Get the device pointer for a slot in (layer, bucket, slot_idx). Used
 // by the scheduler to issue cudaMemcpyAsync directly from this address.
