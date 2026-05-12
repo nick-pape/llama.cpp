@@ -4831,6 +4831,9 @@ extern "C" bool ggml_cuda_moe_cache_d2d_copy_async(
     return err == cudaSuccess;
 }
 
+// Implementation lives further down, after ggml_backend_cuda_device_context is defined.
+bool ggml_backend_cuda_set_op_offload_min_batch_size(int device, int min_batch_size);
+
 int ggml_backend_cuda_get_device_count() {
     return ggml_cuda_info().device_count;
 }
@@ -4892,6 +4895,18 @@ struct ggml_backend_cuda_device_context {
     std::string pci_bus_id;
     int op_offload_min_batch_size;
 };
+
+bool ggml_backend_cuda_set_op_offload_min_batch_size(int device, int min_batch_size) {
+    ggml_backend_reg_t reg = ggml_backend_cuda_reg();
+    if (!reg) return false;
+    const size_t n = ggml_backend_reg_dev_count(reg);
+    if (device < 0 || (size_t) device >= n) return false;
+    ggml_backend_dev_t dev = ggml_backend_reg_dev_get(reg, (size_t) device);
+    if (!dev) return false;
+    auto * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+    dev_ctx->op_offload_min_batch_size = min_batch_size;
+    return true;
+}
 
 static const char * ggml_backend_cuda_device_get_name(ggml_backend_dev_t dev) {
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
@@ -5622,6 +5637,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_cuda_set_op_offload_min_batch_size") == 0) {
+        return (void *)ggml_backend_cuda_set_op_offload_min_batch_size;
     }
     return nullptr;
 }
