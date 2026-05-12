@@ -92,9 +92,54 @@ and their slot composition is frozen until re-warmed.
 S3 commit will be parked on `moe-expert-cache-pagein-s3-stopgap` for the
 record. The path forward is S4 (below) plus an LFU eviction policy.
 
-### LFU → LFRU (in flight)
+### LFRU + S3 sweep (final, page-in branch HEAD)
 
-Pure LFU was a wrong instinct. With cells starting empty, every
+LFRU eviction + S3 adaptive CPU/GPU dispatch, all S* infrastructure
+landed:
+
+| Cache | VRAM | Hit% | Gen t/s | CPU dispatch % | Avg miss/op (GPU) |
+|---|---|---|---|---|---|
+| 0 (baseline) | 0 | — | 36.0 | — | — |
+| 16 | 1.1 GiB | 12.9 | 37.8 | 21.8 | 14.56 |
+| 32 | 2.3 GiB | 13.5 | 38.4 | 21.8 | 13.74 |
+| 64 | 4.5 GiB | 66.7 | 40.6 | 4.1  | 3.12 |
+| 128 | 9.1 GiB | 88.6 | 62.2 | 0.0  | 0.93 |
+
+**The S3-routing trade-off, in one table:**
+
+| Cache | LRU only | LRU + S3 | LFRU + S3 | Best choice |
+|---|---|---|---|---|
+| 16 | 27.0 (below baseline) | **38.8** | 37.8 | S3 (+11.8) |
+| 32 | 33.8 (below baseline) | **38.9** | 38.4 | S3 (+5.1) |
+| 64 | **46.8** | 41.5 | 40.6 | LRU only (-6 with S3) |
+| 128 | **64.6** | 62.3 | 62.2 | LRU only (-2.4 with S3) |
+
+S3 is a clear win at low cache sizes (the cache-too-small regime where
+PCIe stalls dominate). At cache ≥ 64, S3 hurts because it permanently
+freezes some cells on CPU (locked out of further hit-rate evolution),
+dragging the global hit rate down (78.1% → 70.2% at cache=64). S3's
+re-warming task (Task #30) is the structural fix.
+
+**LFRU vs SLRU comparison is within measurement noise** (0.1-1.0 t/s)
+across all cache sizes when combined with S3. The eviction policy
+matters less than expected because S3 routes the cells where eviction
+would matter most (cold cells, miss-heavy) to CPU entirely, bypassing
+the cache. LFRU should still be retained as the default policy because:
+(1) it's the principled choice for warmup, (2) it costs nothing to
+keep, and (3) on a different workload (less long-tail routing) the gap
+could open up.
+
+**The S4 motivation is the cache=128 result:** even at 88.6% hit rate
+with 0% CPU dispatches, every op averages 0.93 misses — every op pays
+a small PCIe stall. S4 (per-op hybrid: GPU does hits, CPU does misses
+on host weights, merge kernel sums) eliminates that stall while keeping
+the cache dynamic.
+
+## Implementation journey notes
+
+### The LFU → LFRU pivot
+
+Pure LFU was the wrong instinct. With cells starting empty, every
 freshly-populated slot enters at `freq=1`. After all slots fill (one
 populate each), every slot has `freq=1`, and the next miss tiebreaks
 by slot index — effectively evicting the just-populated slot every
