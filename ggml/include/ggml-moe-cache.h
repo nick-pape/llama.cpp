@@ -157,6 +157,31 @@ void ggml_moe_cache_hint(
 // is typical).
 void ggml_moe_cache_maintain(ggml_moe_cache_t cache);
 
+// Phase 3: dispatch a MUL_MAT_ID op on the CPU backend, computing the
+// result with the original expert weight tensor (which is already
+// host-resident — CUDA_Host buffer type). Activations and expert IDs
+// are D2H'd from `src1_dev` and `src2_dev` into temporary host buffers,
+// the mini-graph is dispatched on `cpu_backend` synchronously, and the
+// resulting [n_embd, top_k, n_tokens] tensor lives in a host buffer
+// that the caller is responsible for using or discarding.
+//
+// This function does NOT integrate with the GPU output — the next
+// session's S4 work adds the merge kernel that writes specific
+// (token, k_idx) positions from the CPU result back into the GPU
+// MoE output. For now this is a wired-but-unused dispatch validated
+// via timing logs in the cache stats dump.
+//
+// Returns true if dispatch succeeded; false if cpu_backend is null,
+// allocation failed, or the CPU compute returned an error.
+bool ggml_moe_cache_dispatch_cpu(
+    ggml_moe_cache_t            cache,
+    ggml_backend_t              cpu_backend,
+    const struct ggml_tensor *  expert_weights_host, // src[0] of GPU op
+    const struct ggml_tensor *  src1_dev,            // activations (on GPU)
+    const struct ggml_tensor *  src2_dev,            // expert IDs (on GPU)
+    int                          layer_idx,
+    enum ggml_moe_bucket        bucket);
+
 // Get the device pointer for a slot in (layer, bucket, slot_idx). Used
 // by the scheduler to issue cudaMemcpyAsync directly from this address.
 // Phase 2 may replace this with a proper ggml_tensor wrapper.

@@ -506,6 +506,170 @@ void ggml_moe_cache_maintain(ggml_moe_cache_t c) {
 }
 
 // -----------------------------------------------------------------------------
+// Phase 3: CPU dispatch for missed experts (scaffolding)
+// -----------------------------------------------------------------------------
+
+bool ggml_moe_cache_dispatch_cpu(
+        ggml_moe_cache_t          c,
+        ggml_backend_t            cpu_backend,
+        const ggml_tensor *       expert_weights_host,
+        const ggml_tensor *       src1_dev,
+        const ggml_tensor *       src2_dev,
+        int                       layer_idx,
+        ggml_moe_bucket           bucket) {
+    if (!c || !cpu_backend || !expert_weights_host || !src1_dev || !src2_dev) {
+        return false;
+    }
+    (void) layer_idx; (void) bucket;  // reserved for per-cell timing in Phase 4
+
+    // First-call debug: log what we're about to dispatch.
+    static int dbg = 0;
+    if (dbg < 3) {
+        moe_cache_log("cpu dispatch entry [%d]: src0 type=%d ne=[%lld %lld %lld %lld] data=%p, "
+                      "src1 type=%d ne=[%lld %lld %lld %lld] data=%p, "
+                      "src2 type=%d ne=[%lld %lld %lld %lld] data=%p",
+                      dbg,
+                      (int) expert_weights_host->type,
+                      (long long) expert_weights_host->ne[0], (long long) expert_weights_host->ne[1],
+                      (long long) expert_weights_host->ne[2], (long long) expert_weights_host->ne[3],
+                      expert_weights_host->data,
+                      (int) src1_dev->type,
+                      (long long) src1_dev->ne[0], (long long) src1_dev->ne[1],
+                      (long long) src1_dev->ne[2], (long long) src1_dev->ne[3],
+                      src1_dev->data,
+                      (int) src2_dev->type,
+                      (long long) src2_dev->ne[0], (long long) src2_dev->ne[1],
+                      (long long) src2_dev->ne[2], (long long) src2_dev->ne[3],
+                      src2_dev->data);
+        ++dbg;
+    }
+
+    // Stepwise log to bisect crash. First-call only.
+    #define DBG_STEP(s) do { if (dbg <= 1) moe_cache_log("cpu dispatch step: %s", s); } while(0)
+    DBG_STEP("entering body");
+
+    // We construct a mini graph on a dedicated context. Memory needed:
+    //   ~6 * tensor headers (= ~6 * 400 bytes) plus the cgraph's internal
+    //   arrays. Default cgraph size is 2048 nodes which would need >50 KiB
+    //   of arrays alone; we use ggml_new_graph_custom with size=8 below to
+    //   keep this tiny. 32 KiB is conservative.
+    const size_t ctx_size = 32 * 1024;
+    void * ctx_buf = malloc(ctx_size);
+    if (!ctx_buf) {
+        moe_cache_log("cpu dispatch: ctx alloc failed");
+        return false;
+    }
+    DBG_STEP("ctx_buf allocated");
+    ggml_init_params ip = { /*.mem_size=*/ctx_size, /*.mem_buffer=*/ctx_buf, /*.no_alloc=*/true };
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) {
+        free(ctx_buf);
+        return false;
+    }
+    DBG_STEP("ggml_init done");
+
+    const size_t src1_bytes = ggml_nbytes(src1_dev);
+    const size_t src2_bytes = ggml_nbytes(src2_dev);
+    DBG_STEP("nbytes computed");
+
+    const int64_t ne01    = expert_weights_host->ne[1];
+    const int64_t top_k   = src2_dev->ne[0];
+    const int64_t n_toks  = src2_dev->ne[1];
+
+    void * src1_host = aligned_alloc(64, (src1_bytes + 63) & ~63ULL);
+    void * src2_host = aligned_alloc(64, (src2_bytes + 63) & ~63ULL);
+    if (!src1_host || !src2_host) {
+        moe_cache_log("cpu dispatch: aligned host alloc failed");
+        free(src1_host); free(src2_host);
+        ggml_free(ctx); free(ctx_buf);
+        return false;
+    }
+    DBG_STEP("aligned alloc src1/src2");
+
+    ggml_backend_tensor_get(src1_dev, src1_host, 0, src1_bytes);
+    DBG_STEP("d2h src1");
+    ggml_backend_tensor_get(src2_dev, src2_host, 0, src2_bytes);
+    DBG_STEP("d2h src2");
+
+    ggml_tensor * t_src0 = ggml_new_tensor(ctx, expert_weights_host->type, GGML_MAX_DIMS,
+                                           expert_weights_host->ne);
+    memcpy(t_src0->nb, expert_weights_host->nb, sizeof(t_src0->nb));
+    DBG_STEP("new_tensor src0");
+    t_src0->data = expert_weights_host->data;
+
+    ggml_tensor * t_src1 = ggml_new_tensor(ctx, src1_dev->type, GGML_MAX_DIMS, src1_dev->ne);
+    memcpy(t_src1->nb, src1_dev->nb, sizeof(t_src1->nb));
+    DBG_STEP("new_tensor src1");
+    t_src1->data = src1_host;
+
+    ggml_tensor * t_src2 = ggml_new_tensor(ctx, src2_dev->type, GGML_MAX_DIMS, src2_dev->ne);
+    memcpy(t_src2->nb, src2_dev->nb, sizeof(t_src2->nb));
+    DBG_STEP("new_tensor src2");
+    t_src2->data = src2_host;
+
+    const size_t dst_bytes = ne01 * top_k * n_toks * sizeof(float);
+    void * dst_host = aligned_alloc(64, (dst_bytes + 63) & ~63ULL);
+    if (!dst_host) {
+        moe_cache_log("cpu dispatch: dst alloc failed");
+        free(src1_host); free(src2_host);
+        ggml_free(ctx); free(ctx_buf);
+        return false;
+    }
+    DBG_STEP("aligned alloc dst");
+
+    int64_t dst_ne[GGML_MAX_DIMS] = { ne01, top_k, n_toks, 1 };
+    ggml_tensor * t_dst = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, dst_ne);
+    DBG_STEP("new_tensor dst");
+    t_dst->data = dst_host;
+    t_dst->op   = GGML_OP_MUL_MAT_ID;
+    t_dst->src[0] = t_src0;
+    t_dst->src[1] = t_src1;
+    t_dst->src[2] = t_src2;
+    DBG_STEP("set dst op + srcs");
+
+    // Custom-size graph: tiny (8 nodes, no grad) instead of the default
+    // 2048-node graph, which would blow our ctx budget.
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, /*size=*/8, /*grads=*/false);
+    DBG_STEP("new_graph");
+    ggml_build_forward_expand(gf, t_dst);
+    DBG_STEP("build_forward_expand");
+
+    // Dispatch on CPU backend. The strides-copy above is what makes this
+    // work — ggml_new_tensor() computes default contiguous nb[] which
+    // doesn't always match the original tensor's actual layout in the
+    // backing buffer (mxfp4 / q5_K block strides aren't quite what the
+    // default-stride formula produces in all cases). Without that
+    // memcpy of nb[], graph_compute segfaults inside MUL_MAT_ID's row
+    // walker reading garbage offsets.
+    DBG_STEP("about to graph_compute");
+    const int64_t t0 = ggml_time_us();
+    enum ggml_status st = ggml_backend_graph_compute(cpu_backend, gf);
+    DBG_STEP("graph_compute returned");
+    const int64_t t1 = ggml_time_us();
+
+    // Phase 3 scaffolding: the CPU result is in dst_host but NOT yet
+    // integrated into the GPU output. Next session adds the H2D+merge
+    // path. For now we just measure dispatch latency.
+    static int n_calls   = 0;
+    static int64_t total = 0;
+    n_calls++;
+    total += (t1 - t0);
+    if (n_calls <= 8 || (n_calls % 200) == 0) {
+        moe_cache_log("cpu dispatch [%d]: status=%d, %lldµs (running avg %.0fµs); op=[%lld x %lld x %lld]",
+                      n_calls, (int) st, (long long)(t1 - t0), (double) total / n_calls,
+                      (long long) ne01, (long long) top_k, (long long) n_toks);
+    }
+
+    free(dst_host);
+    free(src1_host);
+    free(src2_host);
+    ggml_free(ctx);
+    free(ctx_buf);
+
+    return st == GGML_STATUS_SUCCESS;
+}
+
+// -----------------------------------------------------------------------------
 // S3 adaptive routing
 // -----------------------------------------------------------------------------
 

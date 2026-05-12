@@ -1722,6 +1722,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         // populate-on-miss code below still runs to keep correctness.
                         ggml_moe_cache_maintain(moe_cache);
 
+                        // Pool-manager Phase 3 (scaffolding): when there are misses,
+                        // dispatch the MoE op on the CPU backend in parallel. The
+                        // result is computed but not yet integrated with the GPU
+                        // output — Phase 3b will add a merge kernel. For now we are
+                        // validating that the cross-DSO dispatch works end-to-end
+                        // and measuring its latency. CPU backend is conventionally
+                        // the last entry in sched->backends.
+                        if (!miss_ids.empty() && sched->n_backends > 0) {
+                            ggml_backend_t cpu_backend = sched->backends[sched->n_backends - 1];
+                            ggml_moe_cache_dispatch_cpu(
+                                moe_cache, cpu_backend,
+                                /*expert_weights_host=*/input,
+                                /*src1_dev=*/node->src[1],
+                                /*src2_dev=*/node->src[2],
+                                moe_layer_idx, moe_bucket);
+                        }
+
                         // Batched H2D for misses (contiguous runs) — on COMPUTE stream
                         // because the kernel reads input_cpy directly.
                         for (size_t i = 0; i < miss_ids.size(); ) {
