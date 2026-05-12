@@ -170,6 +170,63 @@ LFRU eviction
 
 Results sweep pending.
 
+### S4 design notes (for next session)
+
+**Goal:** preserve the cache=128 GPU speed while never falling below the
+CPU-MoE baseline at small cache sizes, *and* keep the cache fully
+dynamic (every miss populates a slot for next time).
+
+**The hard part:** per-op routing requires invoking CPU MUL_MAT_ID
+forward from within `compute_splits`, which lives in `ggml-base`.
+`ggml_compute_forward_mul_mat_id` is in `ggml-cpu` — a separate shared
+library. Going through the CPU backend's `graph_compute` requires
+constructing a mini-graph with host-side tensor copies of the
+activations / expert IDs, then dispatching it manually. The expert
+weights are already on `CUDA_Host` (host-pinned), so CPU has direct
+access to them — that part is free.
+
+**Sketch:**
+
+```
+in compute_splits MoE branch, after lookup:
+
+if (miss_count <= K) {
+    // existing GPU path: H2D for misses, kernel, populate, fetch
+} else {
+    // S4 hybrid:
+    // 1. Zero-fill input_cpy at miss positions (GPU memset)
+    // 2. Compute hits-only on GPU (current path with zeroed misses)
+    // 3. In parallel: D2H activations, run CPU MUL_MAT_ID with
+    //    expert IDs masked to misses-only, D2H result not needed
+    //    yet
+    // 4. H2D the CPU result on copy stream
+    // 5. Merge kernel: add CPU result to GPU output
+    // 6. Async populate cache slots (S2's path)
+}
+```
+
+**Open questions:**
+- How to invoke CPU MUL_MAT_ID forward from ggml-base? Options:
+  (a) Reg proc-address mechanism (cleanest, matches S* pattern, but
+      requires exposing `ggml_compute_forward_mul_mat_id`-equivalent
+      from ggml-cpu)
+  (b) Construct ggml_cgraph with the op + call cpu_backend->graph_compute
+      (more code, but no new exports needed)
+- How does the CPU kernel handle "missing expert IDs only" — does it
+  need to be modified to skip slots, or do we mask via the IDs tensor
+  with sentinel values?
+- Merge kernel: can we reuse ggml-cuda's existing ADD op, or do we need
+  a custom kernel because of buffer / stride constraints?
+
+**Risk:** the per-op decision happens at compute time, so the routing
+adapts naturally without needing scheduler-time predictions. But every
+high-miss op still pays CPU compute time (~500-700µs). At cache=128
+where avg miss is 0.93, most ops should fall under the threshold (K=2-3)
+and stay on the GPU fast path. At cache=16 where avg miss is 14, most
+ops route to CPU and we match the CPU baseline.
+
+**Effort estimate:** ~400 LOC. One full focused session.
+
 ### Planned: S4 hybrid + merge kernel
 
 The principled fix for the "even at cache=128 every op has 1-2 misses
