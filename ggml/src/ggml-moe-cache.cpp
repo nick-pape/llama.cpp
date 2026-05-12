@@ -494,32 +494,59 @@ void * ggml_moe_cache_slot_data(
 // -----------------------------------------------------------------------------
 
 typedef bool (*moe_d2d_copy_fn_t)(ggml_backend_t, void *, const void *, size_t);
+typedef bool (*moe_wait_fn_t)(ggml_backend_t);
 
-static moe_d2d_copy_fn_t resolve_d2d_fn(ggml_backend_t backend) {
-    static moe_d2d_copy_fn_t cached_fn = nullptr;
-    static bool              looked_up = false;
-    if (looked_up) return cached_fn;
-
+// Generic one-shot resolver; templated on the symbol name. The function
+// pointer is cached after first lookup so we pay reg traversal cost once
+// per process. Returns nullptr if the symbol isn't exported by this backend.
+template <typename F>
+static F resolve_backend_fn(ggml_backend_t backend, const char * symbol_name, F & cache_slot, bool & looked_up_slot) {
+    if (looked_up_slot) return cache_slot;
     auto * dev = ggml_backend_get_device(backend);
     auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
     if (reg) {
-        cached_fn = (moe_d2d_copy_fn_t) ggml_backend_reg_get_proc_address(
-            reg, "ggml_cuda_moe_cache_d2d_copy_async");
+        cache_slot = (F) ggml_backend_reg_get_proc_address(reg, symbol_name);
     }
-    looked_up = true;
-
-    if (!cached_fn) {
-        moe_cache_log("backend reg does not expose ggml_cuda_moe_cache_d2d_copy_async — "
-                      "all copies will fall back to the existing H2D path (cache disabled effectively)");
-    }
-    return cached_fn;
+    looked_up_slot = true;
+    return cache_slot;
 }
 
 bool ggml_moe_cache_copy_d2d_async(
         ggml_backend_t backend, void * dst, const void * src, size_t size) {
-    auto fn = resolve_d2d_fn(backend);
+    static moe_d2d_copy_fn_t cached_fn = nullptr;
+    static bool              looked_up = false;
+    auto fn = resolve_backend_fn(backend, "ggml_cuda_moe_cache_d2d_copy_async",
+                                 cached_fn, looked_up);
+    if (!fn) {
+        // First-call warning only (looked_up_slot guards repeat).
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            moe_cache_log("backend reg does not expose ggml_cuda_moe_cache_d2d_copy_async — "
+                          "all copies will fall back to the existing H2D path (cache disabled effectively)");
+        }
+        return false;
+    }
+    return fn(backend, dst, src, size);
+}
+
+bool ggml_moe_cache_copy_async_on_copy_stream(
+        ggml_backend_t backend, void * dst, const void * src, size_t size) {
+    static moe_d2d_copy_fn_t cached_fn = nullptr;
+    static bool              looked_up = false;
+    auto fn = resolve_backend_fn(backend, "ggml_cuda_moe_cache_copy_async_on_copy_stream",
+                                 cached_fn, looked_up);
     if (!fn) return false;
     return fn(backend, dst, src, size);
+}
+
+bool ggml_moe_cache_compute_wait_for_copies(ggml_backend_t backend) {
+    static moe_wait_fn_t cached_fn = nullptr;
+    static bool          looked_up = false;
+    auto fn = resolve_backend_fn(backend, "ggml_cuda_moe_cache_compute_wait_for_copies",
+                                 cached_fn, looked_up);
+    if (!fn) return false;
+    return fn(backend);
 }
 
 int ggml_moe_cache_n_layers(ggml_moe_cache_t c) {

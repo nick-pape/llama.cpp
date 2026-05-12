@@ -129,6 +129,26 @@ bool ggml_moe_cache_copy_d2d_async(
     const void *   src,
     size_t         size);
 
+// Page-in infrastructure (S1+): an async copy issued on a DEDICATED stream
+// separate from the backend's primary compute stream. The compute stream is
+// only ordered behind these copies when ggml_moe_cache_compute_wait_for_copies()
+// is called. Lets the scheduler overlap H2D / D2D moves with concurrent
+// compute work on the primary stream. Returns false on non-CUDA backends
+// or copy failure — caller should treat as if no copy happened.
+bool ggml_moe_cache_copy_async_on_copy_stream(
+    ggml_backend_t backend,
+    void *         dst,
+    const void *   src,
+    size_t         size);
+
+// Make the backend's compute stream wait for all copies issued via
+// ggml_moe_cache_copy_async_on_copy_stream() up to this point. Returns
+// false if the backend doesn't expose the copy stream (non-CUDA build).
+// On non-CUDA backends the cache currently falls back to the existing
+// H2D path on the primary stream, where ordering is already implicit
+// and this call is a no-op.
+bool ggml_moe_cache_compute_wait_for_copies(ggml_backend_t backend);
+
 // Number of layers the cache was sized for. Used by the scheduler to validate
 // that layer_idx parsed from tensor names is in range before dispatch.
 int ggml_moe_cache_n_layers(ggml_moe_cache_t cache);

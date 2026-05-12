@@ -1443,6 +1443,29 @@ struct ggml_backend_cuda_context {
 
     cudaStream_t stream() { return stream(device, curr_stream_no); }
 
+    // Dedicated stream + event for the MoE expert cache async cache-fill path.
+    // Created on demand. Allows H2D copies (host pinned -> cache slots) to
+    // overlap with concurrent compute work on the primary stream, without
+    // disturbing the existing streams[device][0..7] indices used elsewhere.
+    cudaStream_t moe_cache_cs            = nullptr;
+    cudaEvent_t  moe_cache_copy_event_in = nullptr;
+
+    cudaStream_t moe_cache_copy_stream() {
+        if (moe_cache_cs == nullptr) {
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaStreamCreateWithFlags(&moe_cache_cs, cudaStreamNonBlocking));
+        }
+        return moe_cache_cs;
+    }
+
+    cudaEvent_t moe_cache_copy_event() {
+        if (moe_cache_copy_event_in == nullptr) {
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaEventCreateWithFlags(&moe_cache_copy_event_in, cudaEventDisableTiming));
+        }
+        return moe_cache_copy_event_in;
+    }
+
     ggml_cuda_stream_context & stream_context() { return concurrent_stream_context; }
 
     cublasHandle_t cublas_handle(int device) {

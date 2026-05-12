@@ -606,6 +606,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    if (moe_cache_copy_event_in != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(moe_cache_copy_event_in));
+    }
+    if (moe_cache_cs != nullptr) {
+        CUDA_CHECK(cudaStreamDestroy(moe_cache_cs));
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -4836,6 +4842,37 @@ extern "C" bool ggml_cuda_moe_cache_d2d_copy_async(
     return err == cudaSuccess;
 }
 
+// Async copy on the dedicated MoE cache copy stream, NOT the compute stream.
+// Callers must call ggml_cuda_moe_cache_compute_wait_for_copies() before
+// launching any compute that depends on the copy result, otherwise the
+// kernel will race the copy. Used by the page-in S1+ infrastructure to
+// overlap H2D/D2D copy traffic with concurrent compute on the primary stream.
+extern "C" bool ggml_cuda_moe_cache_copy_async_on_copy_stream(
+        ggml_backend_t backend, void * dst, const void * src, size_t size) {
+    if (!ggml_backend_is_cuda(backend)) return false;
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    cudaError_t err = cudaMemcpyAsync(
+        dst, src, size, cudaMemcpyDefault, cuda_ctx->moe_cache_copy_stream());
+    return err == cudaSuccess;
+}
+
+// Order the compute stream after the most recent batch of copy-stream work:
+//   1. Record the cache copy event on the copy stream (captures all pending copies)
+//   2. Make the compute stream wait on that event before its next kernel
+// Cheap if no copies were issued (cudaStreamWaitEvent on a never-signaled-yet
+// event is undefined; we always record first to give a well-defined ordering point).
+extern "C" bool ggml_cuda_moe_cache_compute_wait_for_copies(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) return false;
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    cudaEvent_t  evt           = cuda_ctx->moe_cache_copy_event();
+    cudaStream_t copy_stream   = cuda_ctx->moe_cache_copy_stream();
+    cudaStream_t compute_stream = cuda_ctx->stream();
+    cudaError_t err = cudaEventRecord(evt, copy_stream);
+    if (err != cudaSuccess) return false;
+    err = cudaStreamWaitEvent(compute_stream, evt, 0);
+    return err == cudaSuccess;
+}
+
 // Implementation lives further down, after ggml_backend_cuda_device_context is defined.
 bool ggml_backend_cuda_set_op_offload_min_batch_size(int device, int min_batch_size);
 
@@ -5648,6 +5685,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_cuda_moe_cache_d2d_copy_async") == 0) {
         return (void *)ggml_cuda_moe_cache_d2d_copy_async;
+    }
+    if (strcmp(name, "ggml_cuda_moe_cache_copy_async_on_copy_stream") == 0) {
+        return (void *)ggml_cuda_moe_cache_copy_async_on_copy_stream;
+    }
+    if (strcmp(name, "ggml_cuda_moe_cache_compute_wait_for_copies") == 0) {
+        return (void *)ggml_cuda_moe_cache_compute_wait_for_copies;
     }
     return nullptr;
 }
