@@ -1700,6 +1700,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             }
                         }
 
+                        // S3 telemetry: record that this (layer, bucket) dispatched
+                        // on GPU (we wouldn't be in this branch otherwise — offload_op
+                        // returned true), and how many of its experts missed. CPU
+                        // dispatches are recorded by ggml_moe_cache_should_offload_to_gpu
+                        // returning false elsewhere; they don't reach this branch.
+                        ggml_moe_cache_record_dispatch(
+                            moe_cache, moe_layer_idx, moe_bucket,
+                            (int) miss_ids.size(), /*on_cpu=*/false);
+
                         // Batched H2D for misses (contiguous runs) — on COMPUTE stream
                         // because the kernel reads input_cpy directly.
                         for (size_t i = 0; i < miss_ids.size(); ) {
