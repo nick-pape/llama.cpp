@@ -266,6 +266,18 @@ int ggml_moe_cache_lookup(
 
     c->stats.total_lookups++;
 
+    // Periodic hit-rate progress so we can see the cache warming up even if
+    // the process is killed before the destructor stats fire. Coarse enough
+    // to be O(1) per token (40 layers x ~4 buckets x ~8 experts = ~1280
+    // lookups per decode token; every 10000 = ~once per 8 tokens).
+    if ((c->stats.total_lookups % 10000) == 0) {
+        const double hit_rate = (double) c->stats.total_hits / (double) c->stats.total_lookups;
+        moe_cache_log("progress: %lld lookups, %.1f%% hit rate, %.1f MiB allocated",
+                      (long long) c->stats.total_lookups,
+                      hit_rate * 100.0,
+                      c->total_bytes / (1024.0 * 1024.0));
+    }
+
     if (c->force_noop) {
         c->stats.total_misses++;
         return -1;
