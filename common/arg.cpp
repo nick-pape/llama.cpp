@@ -2321,6 +2321,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
+    add_opt(common_arg(
+        {"--moe-expert-cache-size"}, "N",
+        "Number of GPU slots per (layer, bucket) for the MoE expert cache (0 = disabled). "
+        "Used with --cpu-moe / --n-cpu-moe / -ot exps=CPU to cache recently-used experts on GPU. "
+        "Recommended: top_k to 4*top_k for the model (e.g. 8-32 for Qwen3.6 A3B). "
+        "See ggml-org/llama.cpp issue #20757.",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--moe-expert-cache-size must be >= 0");
+            }
+            params.moe_expert_cache_size = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_SIZE"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

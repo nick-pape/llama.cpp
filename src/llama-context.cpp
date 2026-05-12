@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-moe-cache.h"
 #include "llama-arch.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
@@ -346,6 +347,32 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        // initialize MoE per-expert slot cache (if requested) before sched_reserve so it gets attached
+        if (params.moe_expert_cache_size > 0) {
+            ggml_backend_t gpu_backend = nullptr;
+            for (auto & backend : backends) {
+                auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
+                if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    gpu_backend = backend.get();
+                    break;
+                }
+            }
+            if (gpu_backend == nullptr) {
+                LLAMA_LOG_WARN("%s: --moe-expert-cache-size %d requested but no GPU backend available; disabling\n",
+                        __func__, params.moe_expert_cache_size);
+            } else {
+                moe_cache = ggml_moe_cache_init(gpu_backend, (int) model.hparams.n_layer, params.moe_expert_cache_size, 0);
+                if (moe_cache == nullptr) {
+                    LLAMA_LOG_WARN("%s: failed to allocate MoE expert cache (slots=%d, layers=%d); disabling\n",
+                            __func__, params.moe_expert_cache_size, (int) model.hparams.n_layer);
+                } else {
+                    LLAMA_LOG_INFO("%s: MoE expert cache enabled: %d slots/bucket x %d layers, %.2f MiB allocated\n",
+                            __func__, params.moe_expert_cache_size, (int) model.hparams.n_layer,
+                            ggml_moe_cache_total_bytes(moe_cache) / (1024.0 * 1024.0));
+                }
+            }
+        }
+
         sched_reserve();
 
         if (!cparams.flash_attn) {
@@ -367,6 +394,11 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    if (moe_cache != nullptr) {
+        ggml_moe_cache_free(moe_cache);
+        moe_cache = nullptr;
+    }
+
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -410,6 +442,10 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+
+    if (moe_cache != nullptr) {
+        ggml_backend_sched_set_moe_cache(sched.get(), moe_cache);
+    }
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -564,6 +600,9 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                if (moe_cache != nullptr) {
+                    ggml_backend_sched_set_moe_cache(sched.get(), moe_cache);
+                }
                 gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get());
             }
             if (!gf) {
@@ -3221,6 +3260,7 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
+        /*.moe_expert_cache_size       =*/ 0,
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
         /*.no_perf                     =*/ true,
