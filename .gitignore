@@ -160,3 +160,5 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+realistic-results/
+sweep-results/
