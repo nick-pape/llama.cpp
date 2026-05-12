@@ -106,6 +106,25 @@ struct ggml_moe_cache {
     std::vector<uint32_t> demand;             // [layers * buckets * n_experts]
     uint64_t maintain_calls = 0;              // cadence / decay tracking
 
+    // Phase 3b merge queue.
+    //
+    // dispatch_cpu produces a float MoE result on the host and stages it
+    // onto the GPU (scratch_dev) along with a per-(token, k) miss bitmask
+    // (mask_dev). The actual merge into gpu_dst is a CUDA select kernel
+    // that must run AFTER the GPU MoE kernel — drain_pending_merges()
+    // launches all queued kernels on the compute stream after the
+    // existing graph_compute_async completes. cudaFreeAsync hands the
+    // scratch back to the stream-ordered pool once consumed.
+    struct pending_merge {
+        void * gpu_dst   = nullptr;   // device ptr inside the GPU MoE dst tensor
+        void * scratch   = nullptr;   // device ptr holding CPU result (float n_embd*top_k*n_tokens)
+        void * mask      = nullptr;   // device ptr holding mask (uint8_t top_k*n_tokens)
+        int    n_embd    = 0;
+        int    top_k     = 0;
+        int    n_tokens  = 0;
+    };
+    std::vector<pending_merge> pending_merges;
+
     // Diagnostic env-var flags
     bool force_noop      = false;   // GGML_MOE_CACHE_FORCE_NOOP
     bool force_skip_even = false;   // GGML_MOE_CACHE_FORCE_SKIP_EVEN
@@ -512,12 +531,17 @@ void ggml_moe_cache_maintain(ggml_moe_cache_t c) {
 bool ggml_moe_cache_dispatch_cpu(
         ggml_moe_cache_t          c,
         ggml_backend_t            cpu_backend,
+        ggml_backend_t            gpu_backend,
         const ggml_tensor *       expert_weights_host,
         const ggml_tensor *       src1_dev,
         const ggml_tensor *       src2_dev,
+        ggml_tensor *             gpu_dst,
+        const int32_t *           miss_ids,
+        int                       miss_n,
         int                       layer_idx,
         ggml_moe_bucket           bucket) {
-    if (!c || !cpu_backend || !expert_weights_host || !src1_dev || !src2_dev) {
+    if (!c || !cpu_backend || !gpu_backend || !expert_weights_host
+        || !src1_dev || !src2_dev || !gpu_dst || !miss_ids || miss_n <= 0) {
         return false;
     }
     (void) layer_idx; (void) bucket;  // reserved for per-cell timing in Phase 4
@@ -647,9 +671,6 @@ bool ggml_moe_cache_dispatch_cpu(
     DBG_STEP("graph_compute returned");
     const int64_t t1 = ggml_time_us();
 
-    // Phase 3 scaffolding: the CPU result is in dst_host but NOT yet
-    // integrated into the GPU output. Next session adds the H2D+merge
-    // path. For now we just measure dispatch latency.
     static int n_calls   = 0;
     static int64_t total = 0;
     n_calls++;
@@ -660,13 +681,88 @@ bool ggml_moe_cache_dispatch_cpu(
                       (long long) ne01, (long long) top_k, (long long) n_toks);
     }
 
+    if (st != GGML_STATUS_SUCCESS) {
+        free(dst_host); free(src1_host); free(src2_host);
+        ggml_free(ctx); free(ctx_buf);
+        return false;
+    }
+
+    // Build per-(token, k) miss mask from the ids tensor we already D2H'd.
+    // mask[t*top_k + k] = 1 iff ids[t, k] is one of the experts the cache
+    // reported as a miss this op — i.e., the GPU MoE kernel computed
+    // garbage at that (token, k_idx) position and we must overwrite it
+    // with the CPU-computed value.
+    const size_t mask_n = (size_t) top_k * (size_t) n_toks;
+    uint8_t * mask_host = (uint8_t *) malloc(mask_n);
+    if (!mask_host) {
+        free(dst_host); free(src1_host); free(src2_host);
+        ggml_free(ctx); free(ctx_buf);
+        return false;
+    }
+    {
+        const int32_t * ids = (const int32_t *) src2_host;
+        for (size_t i = 0; i < mask_n; ++i) {
+            const int32_t id = ids[i];
+            bool is_miss = false;
+            for (int j = 0; j < miss_n; ++j) {
+                if (miss_ids[j] == id) { is_miss = true; break; }
+            }
+            mask_host[i] = is_miss ? 1u : 0u;
+        }
+    }
+
+    // Stage on GPU. cudaMallocAsync + cudaMemcpyAsync are issued on the
+    // compute stream so the lifetime is correctly ordered with the
+    // select kernel we enqueue later in drain_pending_merges(). The
+    // H2D from pageable host memory is synchronous w.r.t. the host
+    // (CUDA staging copy), so freeing the host buffers immediately
+    // after the call is safe — the device DMA happens on the stream.
+    void * scratch_dev = moe_cuda_malloc_async(gpu_backend, dst_bytes);
+    void * mask_dev    = moe_cuda_malloc_async(gpu_backend, mask_n);
+    if (!scratch_dev || !mask_dev) {
+        moe_cuda_free_async(gpu_backend, scratch_dev);
+        moe_cuda_free_async(gpu_backend, mask_dev);
+        free(mask_host);
+        free(dst_host); free(src1_host); free(src2_host);
+        ggml_free(ctx); free(ctx_buf);
+        return false;
+    }
+    ggml_moe_cache_copy_d2d_async(gpu_backend, scratch_dev, dst_host,  dst_bytes);
+    ggml_moe_cache_copy_d2d_async(gpu_backend, mask_dev,    mask_host, mask_n);
+
+    free(mask_host);
     free(dst_host);
     free(src1_host);
     free(src2_host);
     ggml_free(ctx);
     free(ctx_buf);
 
-    return st == GGML_STATUS_SUCCESS;
+    ggml_moe_cache::pending_merge pm;
+    pm.gpu_dst  = gpu_dst->data;
+    pm.scratch  = scratch_dev;
+    pm.mask     = mask_dev;
+    pm.n_embd   = (int) ne01;
+    pm.top_k    = (int) top_k;
+    pm.n_tokens = (int) n_toks;
+    c->pending_merges.push_back(pm);
+
+    return true;
+}
+
+// Drain the merge queue: launch the select kernel for each pending entry
+// on the GPU compute stream (which already serializes after the GPU MoE
+// kernels enqueued by ggml_backend_graph_compute_async), then return the
+// scratch buffers via cudaFreeAsync. Called once per split after the
+// scheduler's compute_async returns.
+void ggml_moe_cache_drain_pending_merges(ggml_moe_cache_t c, ggml_backend_t gpu_backend) {
+    if (!c || !gpu_backend || c->pending_merges.empty()) return;
+    for (auto & pm : c->pending_merges) {
+        moe_cuda_select_misses_async(gpu_backend, pm.gpu_dst, pm.scratch, pm.mask,
+                                     pm.n_embd, pm.top_k, pm.n_tokens);
+        moe_cuda_free_async(gpu_backend, pm.scratch);
+        moe_cuda_free_async(gpu_backend, pm.mask);
+    }
+    c->pending_merges.clear();
 }
 
 // -----------------------------------------------------------------------------
@@ -746,8 +842,11 @@ void * ggml_moe_cache_slot_data(
 // the standard ggml mechanism for backend-specific entry points.
 // -----------------------------------------------------------------------------
 
-typedef bool (*moe_d2d_copy_fn_t)(ggml_backend_t, void *, const void *, size_t);
-typedef bool (*moe_wait_fn_t)(ggml_backend_t);
+typedef bool   (*moe_d2d_copy_fn_t)(ggml_backend_t, void *, const void *, size_t);
+typedef bool   (*moe_wait_fn_t)(ggml_backend_t);
+typedef void * (*moe_malloc_fn_t)(ggml_backend_t, size_t);
+typedef void   (*moe_free_fn_t)(ggml_backend_t, void *);
+typedef bool   (*moe_select_misses_fn_t)(ggml_backend_t, void *, const void *, const void *, int, int, int);
 
 // Generic one-shot resolver; templated on the symbol name. The function
 // pointer is cached after first lookup so we pay reg traversal cost once
@@ -809,6 +908,36 @@ bool ggml_moe_cache_copy_stream_wait_for_compute(ggml_backend_t backend) {
                                  cached_fn, looked_up);
     if (!fn) return false;
     return fn(backend);
+}
+
+// Phase 3b helpers: stream-ordered GPU alloc/free + select-misses kernel.
+// Resolved once via the reg proc address table (same pattern as the copy
+// primitives above). Returning nullptr / false here means the backend
+// isn't CUDA — dispatch_cpu degrades to a no-merge fallback in that case.
+static void * moe_cuda_malloc_async(ggml_backend_t backend, size_t size) {
+    static moe_malloc_fn_t cached_fn = nullptr;
+    static bool            looked_up = false;
+    auto fn = resolve_backend_fn(backend, "ggml_cuda_moe_cache_malloc_async",
+                                 cached_fn, looked_up);
+    return fn ? fn(backend, size) : nullptr;
+}
+
+static void moe_cuda_free_async(ggml_backend_t backend, void * ptr) {
+    static moe_free_fn_t cached_fn = nullptr;
+    static bool          looked_up = false;
+    auto fn = resolve_backend_fn(backend, "ggml_cuda_moe_cache_free_async",
+                                 cached_fn, looked_up);
+    if (fn) fn(backend, ptr);
+}
+
+static bool moe_cuda_select_misses_async(
+        ggml_backend_t backend, void * dst, const void * src,
+        const void * mask, int n_embd, int top_k, int n_tokens) {
+    static moe_select_misses_fn_t cached_fn = nullptr;
+    static bool                   looked_up = false;
+    auto fn = resolve_backend_fn(backend, "ggml_cuda_moe_cache_select_misses_async",
+                                 cached_fn, looked_up);
+    return fn ? fn(backend, dst, src, mask, n_embd, top_k, n_tokens) : false;
 }
 
 int ggml_moe_cache_n_layers(ggml_moe_cache_t c) {

@@ -170,7 +170,77 @@ LFRU eviction
 
 Results sweep pending.
 
-### S4 design notes (for next session)
+### Pool-manager architecture (P1-P5)
+
+Implemented as a successor to S3 after empirical S3 results showed the
+"per-cell freeze" architecture was fundamentally broken on realistic
+workloads (S3 stuck at ~38 t/s across all cache sizes 16-192 in the
+realistic sweep). The pool manager decouples cache evolution from
+the compute path:
+
+```
+compute path:                pool manager:
+  for each expert in op:        async loop (maintain() callsites):
+    if cache.is_resident(e):      scan demand counters
+      → GPU slot                  promote high-demand experts
+    else:                         issue async H2D on copy stream
+      → CPU compute               update slot_map atomically
+        cache.hint(e)
+```
+
+Status:
+- **P1** (`625e2b5`) — API surface: `lookup`/`hint`/`maintain`, demand
+  counters. ✅
+- **P2** (`615046b`) — Compute path wired: miss → hint, maintain()
+  called per (layer, bucket). ✅
+- **P3 scaffold** (`438dc1d`) — CPU dispatch via mini-cgraph on the
+  CPU backend works end-to-end. Result is computed but **not yet
+  integrated with GPU output** — that's Phase 3b. ⏳
+- **P3b** — Custom CUDA "select" kernel + H2D of CPU result onto GPU
+  scratch + post-kernel enqueue. Closes the loop. Next session.
+- **P4** — Real `maintain()` policy (W-TinyLFU-ish admission + decay).
+- **P5 (v2)** — Batch admissions into single H2Ds for amortization.
+
+### Phase 3b plan (next session)
+
+The CPU dispatch is in place but the result is dropped. To make it
+load-bearing we need to overwrite the (token, k_idx) miss positions of
+the GPU MoE output with the CPU-computed values, post-kernel.
+
+Implementation sketch:
+1. After CPU dispatch returns, the host buffer holds a correct
+   `[n_embd, top_k, n_tokens]` MoE result.
+2. Allocate a GPU scratch buffer of the same shape; cudaMemcpyAsync
+   the CPU result onto it on the *copy stream*.
+3. Encode the miss bitmask: 1 byte per (token, k_idx), set to 1 for
+   miss positions, 0 for hits. H2D this small buffer too (or use a
+   uint64_t per-token bitmask if top_k ≤ 64).
+4. Write a small CUDA kernel `moe_cache_select_misses` that, for each
+   (token, k_idx, dim), tests the bitmask and conditionally writes
+   `dst[t,k,d] = scratch[t,k,d]` (else leaves dst unchanged).
+5. Enqueue:
+   - copy stream: H2D(scratch ← cpu_result), H2D(mask ← cpu_mask)
+   - compute stream: cudaStreamWaitEvent on copy stream's done event
+   - compute stream: launch `moe_cache_select_misses` — runs *after*
+     the MoE kernel (stream-order serialization) and *after* the H2Ds
+6. Now the GPU output has the correct values at all (token, k_idx)
+   positions: hit positions retained from kernel, miss positions
+   overwritten from CPU.
+
+The GPU kernel still does the (incorrect, with stale weights for
+misses) compute, but the select kernel masks it out. This wastes a
+small amount of GPU work but avoids the architectural surgery of
+trying to skip the kernel entirely.
+
+Optimizations to consider after P3b lands:
+- Don't H2D for misses anymore — the kernel can run with whatever
+  stale data is in input_cpy because we overwrite the miss outputs.
+- Stop calling select_slot_for_miss + record_slot (the legacy
+  populate-on-miss path); cache fill becomes P4's responsibility.
+- Skip the GPU kernel entirely when miss_count == top_k (everything
+  is CPU; no GPU work needed).
+
+### S4 design notes (historical, superseded by pool-manager)
 
 **Goal:** preserve the cache=128 GPU speed while never falling below the
 CPU-MoE baseline at small cache sizes, *and* keep the cache fully

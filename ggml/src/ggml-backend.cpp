@@ -1722,20 +1722,27 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         // populate-on-miss code below still runs to keep correctness.
                         ggml_moe_cache_maintain(moe_cache);
 
-                        // Pool-manager Phase 3 (scaffolding): when there are misses,
-                        // dispatch the MoE op on the CPU backend in parallel. The
-                        // result is computed but not yet integrated with the GPU
-                        // output — Phase 3b will add a merge kernel. For now we are
-                        // validating that the cross-DSO dispatch works end-to-end
-                        // and measuring its latency. CPU backend is conventionally
-                        // the last entry in sched->backends.
+                        // Pool-manager Phase 3b: when there are misses, dispatch
+                        // the MoE op on the CPU backend and stage the result as
+                        // a pending merge. The select kernel launched in
+                        // drain_pending_merges() (after graph_compute_async) will
+                        // overwrite the missed (token, k_idx) positions in node's
+                        // output with the CPU-computed values. The H2D-for-misses
+                        // path below still runs (redundant but correct); a future
+                        // optimization will skip those H2Ds when the merge is
+                        // staged, since the GPU kernel's output at those
+                        // positions is going to be overwritten anyway.
+                        // CPU backend is conventionally the last entry in
+                        // sched->backends.
                         if (!miss_ids.empty() && sched->n_backends > 0) {
                             ggml_backend_t cpu_backend = sched->backends[sched->n_backends - 1];
                             ggml_moe_cache_dispatch_cpu(
-                                moe_cache, cpu_backend,
+                                moe_cache, cpu_backend, split_backend,
                                 /*expert_weights_host=*/input,
                                 /*src1_dev=*/node->src[1],
                                 /*src2_dev=*/node->src[2],
+                                /*gpu_dst=*/node,
+                                miss_ids.data(), (int) miss_ids.size(),
                                 moe_layer_idx, moe_bucket);
                         }
 
@@ -1840,6 +1847,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
+            }
+            // Pool-manager Phase 3b: launch any pending merge kernels on the
+            // compute stream. They serialize after the MoE kernels enqueued by
+            // graph_compute_async (same stream) and overwrite missed
+            // (token, k_idx) positions with CPU-computed values.
+            if (sched->moe_cache) {
+                ggml_moe_cache_drain_pending_merges(
+                    (ggml_moe_cache_t) sched->moe_cache, split_backend);
             }
         } else {
             // similar to ggml_backend_compare_graph_backend

@@ -160,27 +160,42 @@ void ggml_moe_cache_maintain(ggml_moe_cache_t cache);
 // Phase 3: dispatch a MUL_MAT_ID op on the CPU backend, computing the
 // result with the original expert weight tensor (which is already
 // host-resident — CUDA_Host buffer type). Activations and expert IDs
-// are D2H'd from `src1_dev` and `src2_dev` into temporary host buffers,
-// the mini-graph is dispatched on `cpu_backend` synchronously, and the
-// resulting [n_embd, top_k, n_tokens] tensor lives in a host buffer
-// that the caller is responsible for using or discarding.
+// are D2H'd, mini-graph dispatched synchronously on cpu_backend.
 //
-// This function does NOT integrate with the GPU output — the next
-// session's S4 work adds the merge kernel that writes specific
-// (token, k_idx) positions from the CPU result back into the GPU
-// MoE output. For now this is a wired-but-unused dispatch validated
-// via timing logs in the cache stats dump.
+// On success, the CPU result is staged as a pending merge: it is
+// H2D'd to a GPU scratch buffer on the GPU backend's stream, paired
+// with a miss-bitmask, and recorded inside the cache. After the GPU
+// MoE kernel runs (at the end of the split's compute), the caller
+// invokes ggml_moe_cache_drain_pending_merges() which launches a
+// per-element select kernel that overwrites missed (token, k_idx)
+// positions in `gpu_dst` with the CPU-computed values.
 //
-// Returns true if dispatch succeeded; false if cpu_backend is null,
-// allocation failed, or the CPU compute returned an error.
+// miss_ids must list the expert IDs that the cache reported as misses
+// for this op. The function reads ids from src2_dev to determine which
+// (token, k_idx) positions belong to those miss experts.
+//
+// Returns true if dispatch succeeded and a merge was queued.
 bool ggml_moe_cache_dispatch_cpu(
     ggml_moe_cache_t            cache,
     ggml_backend_t              cpu_backend,
+    ggml_backend_t              gpu_backend,         // for staging + select kernel
     const struct ggml_tensor *  expert_weights_host, // src[0] of GPU op
     const struct ggml_tensor *  src1_dev,            // activations (on GPU)
     const struct ggml_tensor *  src2_dev,            // expert IDs (on GPU)
+    struct ggml_tensor *         gpu_dst,            // MoE output (on GPU)
+    const int32_t *              miss_ids,
+    int                          miss_n,
     int                          layer_idx,
     enum ggml_moe_bucket        bucket);
+
+// Drain the cache's pending-merge queue: for each merge, launch the
+// CUDA select kernel on the GPU backend's compute stream. Called
+// AFTER ggml_backend_graph_compute_async returns so the select kernels
+// run AFTER the MoE kernels on the same stream (stream-order
+// serialization). No-op on non-CUDA backends or empty queue.
+void ggml_moe_cache_drain_pending_merges(
+    ggml_moe_cache_t cache,
+    ggml_backend_t   gpu_backend);
 
 // Get the device pointer for a slot in (layer, bucket, slot_idx). Used
 // by the scheduler to issue cudaMemcpyAsync directly from this address.

@@ -4898,6 +4898,65 @@ extern "C" bool ggml_cuda_moe_cache_copy_stream_wait_for_compute(ggml_backend_t 
 // Implementation lives further down, after ggml_backend_cuda_device_context is defined.
 bool ggml_backend_cuda_set_op_offload_min_batch_size(int device, int min_batch_size);
 
+// Pool-manager Phase 3b: per-element select. Overwrites positions in the
+// GPU MUL_MAT_ID output (`dst`) with values from `src` (the CPU-computed
+// result, already H2D'd to a GPU scratch buffer) wherever the mask is
+// non-zero. Mask is [top_k, n_tokens] uint8. Layout assumed contiguous
+// [n_embd, top_k, n_tokens] for dst and src. Issued on the supplied
+// stream so the caller controls ordering vs the MoE kernel.
+__global__ static void moe_cache_select_misses_kernel(
+        float *       __restrict__ dst,
+        const float * __restrict__ src,
+        const uint8_t * __restrict__ mask,
+        int n_embd, int top_k, int n_tokens) {
+    const int d  = blockIdx.x * blockDim.x + threadIdx.x;
+    const int kt = blockIdx.y * blockDim.y + threadIdx.y;
+    if (d >= n_embd) return;
+    const int k = kt % top_k;
+    const int t = kt / top_k;
+    if (t >= n_tokens) return;
+    if (mask[t * top_k + k] == 0) return;
+    const size_t off = (size_t) t * top_k * n_embd + (size_t) k * n_embd + (size_t) d;
+    dst[off] = src[off];
+}
+
+// Stream-ordered GPU allocation/free, used for the merge scratches. Both
+// run on the compute stream so the lifetimes are correctly ordered with
+// the kernels that read/write them.
+extern "C" void * ggml_cuda_moe_cache_malloc_async(ggml_backend_t backend, size_t size) {
+    if (!ggml_backend_is_cuda(backend)) return nullptr;
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    void * p = nullptr;
+    cudaError_t err = cudaMallocAsync(&p, size, ctx->stream());
+    return err == cudaSuccess ? p : nullptr;
+}
+
+extern "C" void ggml_cuda_moe_cache_free_async(ggml_backend_t backend, void * ptr) {
+    if (!ggml_backend_is_cuda(backend) || !ptr) return;
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    cudaFreeAsync(ptr, ctx->stream());
+}
+
+extern "C" bool ggml_cuda_moe_cache_select_misses_async(
+        ggml_backend_t backend,
+        void *         dst,
+        const void *   src,
+        const void *   mask,
+        int            n_embd,
+        int            top_k,
+        int            n_tokens) {
+    if (!ggml_backend_is_cuda(backend)) return false;
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    cudaStream_t stream = ctx->stream();
+    dim3 block(64, 4);
+    dim3 grid((n_embd + block.x - 1) / block.x,
+              (top_k * n_tokens + block.y - 1) / block.y);
+    moe_cache_select_misses_kernel<<<grid, block, 0, stream>>>(
+        (float *) dst, (const float *) src, (const uint8_t *) mask,
+        n_embd, top_k, n_tokens);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 int ggml_backend_cuda_get_device_count() {
     return ggml_cuda_info().device_count;
 }
@@ -5756,6 +5815,15 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_cuda_set_active_moe_cache") == 0) {
         return (void *)ggml_cuda_set_active_moe_cache;
+    }
+    if (strcmp(name, "ggml_cuda_moe_cache_select_misses_async") == 0) {
+        return (void *)ggml_cuda_moe_cache_select_misses_async;
+    }
+    if (strcmp(name, "ggml_cuda_moe_cache_malloc_async") == 0) {
+        return (void *)ggml_cuda_moe_cache_malloc_async;
+    }
+    if (strcmp(name, "ggml_cuda_moe_cache_free_async") == 0) {
+        return (void *)ggml_cuda_moe_cache_free_async;
     }
     return nullptr;
 }
