@@ -137,6 +137,23 @@ ggml_moe_cache_t ggml_moe_cache_init(
 
 void ggml_moe_cache_free(ggml_moe_cache_t c) {
     if (!c) return;
+
+    // Dump final stats so we can see whether the cache was actually being used.
+    if (c->stats.total_lookups > 0) {
+        const double hit_rate = (double) c->stats.total_hits / (double) c->stats.total_lookups;
+        int bound_cells = 0;
+        for (const auto & cell : c->cells) if (cell.bound) ++bound_cells;
+        moe_cache_log("final stats: %lld lookups, %lld hits, %lld misses (%.1f%% hit rate); %d / %d cells bound; %.2f MiB total",
+                      (long long) c->stats.total_lookups,
+                      (long long) c->stats.total_hits,
+                      (long long) c->stats.total_misses,
+                      hit_rate * 100.0,
+                      bound_cells, (int) c->cells.size(),
+                      c->total_bytes / (1024.0 * 1024.0));
+    } else {
+        moe_cache_log("final stats: no lookups recorded — cache code path never executed");
+    }
+
     for (auto & cell : c->cells) {
         if (cell.buf) {
             ggml_backend_buffer_free(cell.buf);
