@@ -4807,6 +4807,30 @@ bool ggml_backend_is_cuda(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cuda_guid());
 }
 
+// Expose the primary stream of a CUDA backend's context so that scheduler-level
+// code (e.g., ggml-moe-cache) can issue partial cudaMemcpyAsync calls in-order
+// with the backend's own work. Returns NULL if `backend` is not a CUDA backend.
+// Returned as void* to keep <cuda_runtime.h> out of the public header; callers
+// cast to cudaStream_t. Added for the MoE per-expert cache (#20757).
+void * ggml_backend_cuda_get_stream(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) return NULL;
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    return (void *) cuda_ctx->stream();
+}
+
+// Partial D2D copy primitive used by ggml-moe-cache (lives here so ggml-base
+// doesn't need cuda_runtime.h). Returns false if `backend` isn't CUDA or if
+// the copy fails. Issued on the backend's primary stream so it orders
+// naturally with subsequent compute work on the same backend.
+extern "C" bool ggml_cuda_moe_cache_d2d_copy_async(
+        ggml_backend_t backend, void * dst, const void * src, size_t size) {
+    if (!ggml_backend_is_cuda(backend)) return false;
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    cudaError_t err = cudaMemcpyAsync(
+        dst, src, size, cudaMemcpyDeviceToDevice, cuda_ctx->stream());
+    return err == cudaSuccess;
+}
+
 int ggml_backend_cuda_get_device_count() {
     return ggml_cuda_info().device_count;
 }

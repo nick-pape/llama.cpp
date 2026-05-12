@@ -24,6 +24,13 @@ GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
 
 GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
 
+// Get the primary CUDA stream of a CUDA backend. Returns NULL for non-CUDA backends.
+// The returned stream can be used for issuing direct cudaMemcpyAsync calls that
+// will be ordered correctly with subsequent compute ops on the same backend.
+// Type is cudaStream_t; declared as void * to avoid forcing <cuda_runtime.h>
+// into this header. Callers should cast: `(cudaStream_t)ggml_backend_cuda_get_stream(b)`.
+GGML_BACKEND_API void * ggml_backend_cuda_get_stream(ggml_backend_t backend);
+
 // device buffer
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
 
