@@ -369,6 +369,43 @@ llama_context::llama_context(
                     LLAMA_LOG_INFO("%s: MoE expert cache enabled: %d slots/bucket x %d layers, %.2f MiB allocated\n",
                             __func__, params.moe_expert_cache_size, (int) model.hparams.n_layer,
                             ggml_moe_cache_total_bytes(moe_cache) / (1024.0 * 1024.0));
+
+                    // Force the CUDA backend to offload MoE MUL_MAT_ID during single-token
+                    // decode. Without this, CUDA's default offload threshold (op->ne[2] >= 32)
+                    // keeps decode-time MoE on CPU and the cache hook in compute_splits never
+                    // fires. The env-var override (GGML_OP_OFFLOAD_MIN_BATCH=1) only works if
+                    // it's set before ggml_backend_load_all() runs — which arg parsing of -ot
+                    // already triggers, so we can't reliably set it from common/arg.cpp.
+                    // The runtime setter (looked up via reg proc address so we don't link
+                    // against ggml-cuda in non-CUDA builds) is order-independent.
+                    {
+                        auto * gpu_dev = ggml_backend_get_device(gpu_backend);
+                        auto * gpu_reg = gpu_dev ? ggml_backend_dev_backend_reg(gpu_dev) : nullptr;
+                        using set_min_batch_t = bool (*)(int /*device*/, int /*min_batch_size*/);
+                        auto set_min_batch_fn = gpu_reg
+                            ? (set_min_batch_t) ggml_backend_reg_get_proc_address(gpu_reg, "ggml_backend_cuda_set_op_offload_min_batch_size")
+                            : nullptr;
+                        if (set_min_batch_fn) {
+                            // Resolve the device index from its name (e.g. "CUDA0" -> 0).
+                            const char * dev_name = ggml_backend_dev_name(gpu_dev);
+                            int dev_idx = 0;
+                            if (dev_name) {
+                                const char * p = dev_name;
+                                while (*p && (*p < '0' || *p > '9')) ++p;
+                                if (*p) dev_idx = atoi(p);
+                            }
+                            if (set_min_batch_fn(dev_idx, 1)) {
+                                LLAMA_LOG_INFO("%s: CUDA op_offload_min_batch_size set to 1 on device %d (required for MoE cache to engage during decode)\n",
+                                        __func__, dev_idx);
+                            } else {
+                                LLAMA_LOG_WARN("%s: failed to set CUDA op_offload_min_batch_size on device %d; cache may not engage during decode (set GGML_OP_OFFLOAD_MIN_BATCH=1 before launch as a workaround)\n",
+                                        __func__, dev_idx);
+                            }
+                        } else {
+                            LLAMA_LOG_WARN("%s: GPU backend doesn't expose ggml_backend_cuda_set_op_offload_min_batch_size; cache may not engage during decode on non-CUDA backends or older CUDA builds\n",
+                                    __func__);
+                        }
+                    }
                 }
             }
         }
