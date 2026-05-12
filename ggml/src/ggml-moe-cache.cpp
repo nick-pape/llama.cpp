@@ -133,6 +133,14 @@ struct ggml_moe_cache {
     ggml_moe_cache_stats stats{};
 };
 
+// Forward declarations for the CUDA-resolved helpers used by dispatch_cpu;
+// definitions live with the other backend-reg resolvers further down.
+static void * moe_cuda_malloc_async(ggml_backend_t backend, size_t size);
+static void   moe_cuda_free_async(ggml_backend_t backend, void * ptr);
+static bool   moe_cuda_select_misses_async(ggml_backend_t backend, void * dst,
+                                           const void * src, const void * mask,
+                                           int n_embd, int top_k, int n_tokens);
+
 // -----------------------------------------------------------------------------
 // Logging helper
 // -----------------------------------------------------------------------------
