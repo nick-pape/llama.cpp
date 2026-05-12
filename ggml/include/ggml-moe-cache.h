@@ -32,6 +32,15 @@ extern "C" {
 struct ggml_moe_cache;
 typedef struct ggml_moe_cache * ggml_moe_cache_t;
 
+// Eviction policy. DEFAULT == LFRU. Use --moe-cache-policy {lru,lfru} to
+// override for experimentation; the default tracks whatever performs best
+// on our reference Qwen3.6-A3B benchmarks.
+enum ggml_moe_cache_policy {
+    GGML_MOE_CACHE_POLICY_DEFAULT = 0,
+    GGML_MOE_CACHE_POLICY_LRU     = 1,
+    GGML_MOE_CACHE_POLICY_LFRU    = 2,
+};
+
 // Per-bucket layout. For Qwen3.5MoE, each layer has up to four expert
 // weight tensors (down, gate, up, gate_up combined). Each gets its own
 // slot pool. Identification is by tensor-name substring match.
@@ -54,7 +63,8 @@ ggml_moe_cache_t ggml_moe_cache_init(
     ggml_backend_t backend,
     int            n_layers,
     int            slots_per_bucket,    // user param --moe-expert-cache-size
-    size_t         max_bytes);          // 0 = no cap (allocate everything)
+    size_t         max_bytes,           // 0 = no cap (allocate everything)
+    enum ggml_moe_cache_policy policy); // GGML_MOE_CACHE_POLICY_DEFAULT for LFRU
 
 void ggml_moe_cache_free(ggml_moe_cache_t cache);
 

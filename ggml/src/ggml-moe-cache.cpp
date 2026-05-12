@@ -33,6 +33,7 @@ struct ggml_moe_cache {
     int n_layers           = 0;
     int slots_per_bucket   = 0;
     size_t max_bytes_cap   = 0;
+    ggml_moe_cache_policy policy = GGML_MOE_CACHE_POLICY_LFRU;
 
     // Per-(layer, bucket) cell. Indexed by [layer * GGML_MOE_BUCKET_COUNT + bucket].
     // Allocated lazily on first bind for that cell.
@@ -145,7 +146,8 @@ ggml_moe_cache_t ggml_moe_cache_init(
         ggml_backend_t backend,
         int            n_layers,
         int            slots_per_bucket,
-        size_t         max_bytes) {
+        size_t         max_bytes,
+        ggml_moe_cache_policy policy) {
     if (!backend || n_layers <= 0 || slots_per_bucket <= 0) {
         return nullptr;
     }
@@ -155,6 +157,8 @@ ggml_moe_cache_t ggml_moe_cache_init(
     c->n_layers         = n_layers;
     c->slots_per_bucket = slots_per_bucket;
     c->max_bytes_cap    = max_bytes;
+    c->policy           = (policy == GGML_MOE_CACHE_POLICY_DEFAULT)
+                            ? GGML_MOE_CACHE_POLICY_LFRU : policy;
 
     c->force_noop      = getenv("GGML_MOE_CACHE_FORCE_NOOP")      != nullptr;
     c->force_skip_even = getenv("GGML_MOE_CACHE_FORCE_SKIP_EVEN") != nullptr;
@@ -177,8 +181,11 @@ ggml_moe_cache_t ggml_moe_cache_init(
         moe_cache_log("GGML_MOE_CACHE_FORCE_SKIP_EVEN set; faking hits on even expert_ids (output GARBAGE; diagnostic only)");
     }
 
-    moe_cache_log("init: %d layers x %d buckets, %d slots/bucket (LFRU eviction = LFU + LRU tiebreak); buffers allocated lazily per (layer, bucket)",
-                  n_layers, (int) GGML_MOE_BUCKET_COUNT, slots_per_bucket);
+    const char * policy_name =
+        c->policy == GGML_MOE_CACHE_POLICY_LRU  ? "LRU" :
+        c->policy == GGML_MOE_CACHE_POLICY_LFRU ? "LFRU" : "unknown";
+    moe_cache_log("init: %d layers x %d buckets, %d slots/bucket (%s eviction); buffers allocated lazily per (layer, bucket)",
+                  n_layers, (int) GGML_MOE_BUCKET_COUNT, slots_per_bucket, policy_name);
 
     return c;
 }
@@ -385,17 +392,27 @@ int ggml_moe_cache_select_slot_for_miss(
         return cell.next_unused++;
     }
 
-    // LFRU: evict slot with smallest freq; tiebreak by smallest last_tick
-    // (LRU among the ties). Linear scan; slots <= 128 in practice.
+    // Eviction depends on the cache's configured policy.
     int      victim_slot = 0;
-    uint32_t victim_freq = cell.freq[0];
     uint64_t victim_tick = cell.last_tick[0];
-    for (int s = 1; s < c->slots_per_bucket; s++) {
-        if (cell.freq[s] < victim_freq ||
-            (cell.freq[s] == victim_freq && cell.last_tick[s] < victim_tick)) {
-            victim_freq = cell.freq[s];
-            victim_tick = cell.last_tick[s];
-            victim_slot = s;
+    uint32_t victim_freq = cell.freq[0];
+    if (c->policy == GGML_MOE_CACHE_POLICY_LRU) {
+        // LRU: evict slot with smallest last_tick.
+        for (int s = 1; s < c->slots_per_bucket; s++) {
+            if (cell.last_tick[s] < victim_tick) {
+                victim_tick = cell.last_tick[s];
+                victim_slot = s;
+            }
+        }
+    } else {
+        // LFRU: evict slot with smallest freq; tiebreak by smallest last_tick.
+        for (int s = 1; s < c->slots_per_bucket; s++) {
+            if (cell.freq[s] < victim_freq ||
+                (cell.freq[s] == victim_freq && cell.last_tick[s] < victim_tick)) {
+                victim_freq = cell.freq[s];
+                victim_tick = cell.last_tick[s];
+                victim_slot = s;
+            }
         }
     }
     return victim_slot;

@@ -1,5 +1,7 @@
 #include "arg.h"
 
+#include <cctype>
+
 #include "build-info.h"
 #include "chat.h"
 #include "common.h"
@@ -2350,6 +2352,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_SIZE"));
+    add_opt(common_arg(
+        {"--moe-cache-policy"}, "POLICY",
+        "Eviction policy for the MoE expert cache. Choices: lru, lfru (default). "
+        "On our reference Qwen3.6-A3B benchmarks the gap between policies is "
+        "within measurement noise; the flag exists for A/B on other models.",
+        [](common_params & params, const std::string & value) {
+            std::string v = value;
+            for (auto & c : v) c = (char) std::tolower((unsigned char) c);
+            if      (v == "lru")  params.moe_expert_cache_policy = 1;
+            else if (v == "lfru") params.moe_expert_cache_policy = 2;
+            else if (v == "default" || v.empty()) params.moe_expert_cache_policy = 0;
+            else throw std::invalid_argument("--moe-cache-policy must be one of: lru, lfru, default");
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_POLICY"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",
