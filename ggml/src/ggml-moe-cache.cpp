@@ -35,16 +35,23 @@ struct ggml_moe_cache {
 
     // Per-(layer, bucket) cell. Indexed by [layer * GGML_MOE_BUCKET_COUNT + bucket].
     // Allocated lazily on first bind for that cell.
+    //
+    // Eviction policy is LRU per cell: each slot carries a monotonically-
+    // increasing tick stamped at its last access. On miss, evict the slot
+    // with the smallest tick. On hit, bump the slot's tick. The global
+    // tick counter is per-cache (not per-cell) which is fine: ticks only
+    // need to be comparable within a cell to find the LRU slot.
     struct cell_state {
         bool   bound              = false;
         size_t expert_size_bytes  = 0;        // size of one expert weight in this cell
         size_t slot_stride        = 0;        // padded expert size, slot-aligned
         ggml_backend_buffer_t buf = nullptr;  // own backing buffer for this cell's slots
         uint8_t * base            = nullptr;  // buf base pointer
-        std::vector<int32_t> slot_map;        // [slots]: expert_id resident in each slot
-        int                  next_evict = 0;  // round-robin counter (Phase 2: LRU)
+        std::vector<int32_t>  slot_map;       // [slots]: expert_id resident in each slot
+        std::vector<uint64_t> last_tick;      // [slots]: tick of last hit / populate
     };
     std::vector<cell_state> cells;            // n_layers * GGML_MOE_BUCKET_COUNT
+    uint64_t lru_tick = 0;                    // monotonically-increasing access stamp
 
     // Diagnostic env-var flags
     bool force_noop      = false;   // GGML_MOE_CACHE_FORCE_NOOP
@@ -120,6 +127,7 @@ ggml_moe_cache_t ggml_moe_cache_init(
     c->cells.resize((size_t) n_layers * GGML_MOE_BUCKET_COUNT);
     for (auto & cell : c->cells) {
         cell.slot_map.assign(slots_per_bucket, -1);
+        cell.last_tick.assign(slots_per_bucket, 0);
     }
 
     if (c->force_noop) {
@@ -255,7 +263,12 @@ bool ggml_moe_cache_identify_tensor(
 }
 
 // -----------------------------------------------------------------------------
-// Lookup + slot selection — Phase 1: linear scan, round-robin eviction.
+// Lookup + slot selection — LRU eviction (Phase 1.2).
+//
+// On hit: bump the slot's last_tick so it moves to the head of the LRU.
+// On miss + select_slot_for_miss: pick the slot with the smallest last_tick.
+// A slot that has never been populated (tick=0) is preferred — it's
+// effectively LRU because every populated slot will have tick > 0.
 // -----------------------------------------------------------------------------
 
 int ggml_moe_cache_lookup(
@@ -267,9 +280,7 @@ int ggml_moe_cache_lookup(
     c->stats.total_lookups++;
 
     // Periodic hit-rate progress so we can see the cache warming up even if
-    // the process is killed before the destructor stats fire. Coarse enough
-    // to be O(1) per token (40 layers x ~4 buckets x ~8 experts = ~1280
-    // lookups per decode token; every 10000 = ~once per 8 tokens).
+    // the process is killed before the destructor stats fire.
     if ((c->stats.total_lookups % 10000) == 0) {
         const double hit_rate = (double) c->stats.total_hits / (double) c->stats.total_lookups;
         moe_cache_log("progress: %lld lookups, %.1f%% hit rate, %.1f MiB allocated",
@@ -290,6 +301,7 @@ int ggml_moe_cache_lookup(
     for (int s = 0; s < c->slots_per_bucket; s++) {
         if (cell.slot_map[s] == expert_id) {
             c->stats.total_hits++;
+            cell.last_tick[s] = ++c->lru_tick;  // bump to MRU
             return s;
         }
     }
@@ -303,16 +315,26 @@ int ggml_moe_cache_select_slot_for_miss(
     auto & cell = c->cells[cell_idx(layer_idx, bucket)];
     if (!cell.bound) return -1;
 
-    int slot = cell.next_evict;
-    cell.next_evict = (slot + 1) % c->slots_per_bucket;
-    return slot;
+    // Pick the slot with the smallest last_tick. Unpopulated slots have
+    // tick=0 and so are always preferred over any populated slot.
+    int      victim_slot = 0;
+    uint64_t victim_tick = cell.last_tick[0];
+    for (int s = 1; s < c->slots_per_bucket; s++) {
+        if (cell.last_tick[s] < victim_tick) {
+            victim_tick = cell.last_tick[s];
+            victim_slot = s;
+        }
+    }
+    return victim_slot;
 }
 
 void ggml_moe_cache_record_slot(
         ggml_moe_cache_t c, int layer_idx, ggml_moe_bucket bucket, int slot_idx, int32_t expert_id) {
     if (!c) return;
     if (slot_idx < 0 || slot_idx >= c->slots_per_bucket) return;
-    c->cells[cell_idx(layer_idx, bucket)].slot_map[slot_idx] = expert_id;
+    auto & cell = c->cells[cell_idx(layer_idx, bucket)];
+    cell.slot_map[slot_idx]  = expert_id;
+    cell.last_tick[slot_idx] = ++c->lru_tick;  // mark as MRU so it isn't immediately evicted
 }
 
 // -----------------------------------------------------------------------------
