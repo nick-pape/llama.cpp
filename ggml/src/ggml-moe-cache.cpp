@@ -15,6 +15,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -36,11 +37,33 @@ struct ggml_moe_cache {
     // Per-(layer, bucket) cell. Indexed by [layer * GGML_MOE_BUCKET_COUNT + bucket].
     // Allocated lazily on first bind for that cell.
     //
-    // Eviction policy is LRU per cell: each slot carries a monotonically-
-    // increasing tick stamped at its last access. On miss, evict the slot
-    // with the smallest tick. On hit, bump the slot's tick. The global
-    // tick counter is per-cache (not per-cell) which is fine: ticks only
-    // need to be comparable within a cell to find the LRU slot.
+    // Eviction policy is Segmented-LRU (SLRU). Each cell maintains two
+    // intrusive doubly-linked lists of slot indices:
+    //
+    //   - P (probationary): freshly-populated slots; capacity = ~20% of slots
+    //   - M (protected):    slots that have been hit at least once after
+    //                       entering P; capacity = remainder (~80%)
+    //
+    // All operations are O(1):
+    //
+    //   - On miss + select_slot_for_miss():
+    //       * If a never-used slot exists, take it and add at P-head
+    //       * Otherwise evict P-tail and re-add at P-head
+    //   - On lookup hit, the hit slot is unlinked from its current list
+    //     (P or M) and re-inserted at M-head. If M now exceeds its capacity,
+    //     M-tail is demoted to P-head.
+    //
+    // Why SLRU over plain LRU: pure LRU evicts a slot on the next "stranger"
+    // miss even if it was just used (one-hit wonder pollution). SLRU requires
+    // two hits before a slot moves to the protected pool, so a single-use
+    // expert can't displace something hot. On Qwen3.6-A3B's long-tail Zipfian
+    // routing, this materially raised hit rate over pure LRU in the original
+    // tinyserve / vLLM PR #37190 LFRU policy that inspired this design.
+    //
+    // O(slots) eviction (linear scan of last_tick) was the previous Phase 1.2
+    // approach; with 16-128 slots it didn't show up in profiles, but rather
+    // than keep the inefficiency we got the proper structure right while
+    // rewriting for SLRU.
     struct cell_state {
         bool   bound              = false;
         size_t expert_size_bytes  = 0;        // size of one expert weight in this cell
@@ -48,10 +71,18 @@ struct ggml_moe_cache {
         ggml_backend_buffer_t buf = nullptr;  // own backing buffer for this cell's slots
         uint8_t * base            = nullptr;  // buf base pointer
         std::vector<int32_t>  slot_map;       // [slots]: expert_id resident in each slot
-        std::vector<uint64_t> last_tick;      // [slots]: tick of last hit / populate
+
+        // SLRU list bookkeeping. All vectors are sized to slots_per_bucket
+        // when the cell is allocated. slot_list[s] is the list this slot
+        // currently lives in (LIST_NONE / LIST_P / LIST_M).
+        std::vector<int32_t> prev_in_list;    // [slot] -> prev slot in same list, -1 if head
+        std::vector<int32_t> next_in_list;    // [slot] -> next slot in same list, -1 if tail
+        std::vector<uint8_t> slot_list;       // [slot] -> LIST_*
+        int p_head = -1, p_tail = -1, p_count = 0, p_capacity = 0;
+        int m_head = -1, m_tail = -1, m_count = 0, m_capacity = 0;
+        int next_unused = 0;                  // slots [0, next_unused) have been touched
     };
     std::vector<cell_state> cells;            // n_layers * GGML_MOE_BUCKET_COUNT
-    uint64_t lru_tick = 0;                    // monotonically-increasing access stamp
 
     // Diagnostic env-var flags
     bool force_noop      = false;   // GGML_MOE_CACHE_FORCE_NOOP
@@ -102,6 +133,84 @@ static inline int cell_idx(int layer_idx, ggml_moe_bucket bucket) {
 }
 
 // -----------------------------------------------------------------------------
+// SLRU list ops (O(1) intrusive doubly-linked-list manipulation).
+//
+// Each cell owns two lists, P (probationary) and M (protected). Slots are
+// identified by index in [0, slots_per_bucket). The slot's current list is
+// recorded in slot_list[s]; prev/next pointers (-1 = end) live in
+// prev_in_list[s] / next_in_list[s]. Head/tail/count/capacity are per-list
+// fields on the cell.
+// -----------------------------------------------------------------------------
+
+static constexpr uint8_t SLRU_LIST_NONE = 0;
+static constexpr uint8_t SLRU_LIST_P    = 1;
+static constexpr uint8_t SLRU_LIST_M    = 2;
+
+static inline void slru_unlink(ggml_moe_cache::cell_state & cell, int s) {
+    const int p = cell.prev_in_list[s];
+    const int n = cell.next_in_list[s];
+    if (p >= 0) {
+        cell.next_in_list[p] = n;
+    } else if (cell.slot_list[s] == SLRU_LIST_P) {
+        cell.p_head = n;
+    } else if (cell.slot_list[s] == SLRU_LIST_M) {
+        cell.m_head = n;
+    }
+    if (n >= 0) {
+        cell.prev_in_list[n] = p;
+    } else if (cell.slot_list[s] == SLRU_LIST_P) {
+        cell.p_tail = p;
+    } else if (cell.slot_list[s] == SLRU_LIST_M) {
+        cell.m_tail = p;
+    }
+    if (cell.slot_list[s] == SLRU_LIST_P) {
+        cell.p_count--;
+    } else if (cell.slot_list[s] == SLRU_LIST_M) {
+        cell.m_count--;
+    }
+    cell.prev_in_list[s] = -1;
+    cell.next_in_list[s] = -1;
+    cell.slot_list[s]    = SLRU_LIST_NONE;
+}
+
+static inline void slru_insert_head_p(ggml_moe_cache::cell_state & cell, int s) {
+    cell.slot_list[s]    = SLRU_LIST_P;
+    cell.prev_in_list[s] = -1;
+    cell.next_in_list[s] = cell.p_head;
+    if (cell.p_head >= 0) cell.prev_in_list[cell.p_head] = s;
+    cell.p_head = s;
+    if (cell.p_tail < 0) cell.p_tail = s;
+    cell.p_count++;
+}
+
+static inline void slru_insert_head_m(ggml_moe_cache::cell_state & cell, int s) {
+    cell.slot_list[s]    = SLRU_LIST_M;
+    cell.prev_in_list[s] = -1;
+    cell.next_in_list[s] = cell.m_head;
+    if (cell.m_head >= 0) cell.prev_in_list[cell.m_head] = s;
+    cell.m_head = s;
+    if (cell.m_tail < 0) cell.m_tail = s;
+    cell.m_count++;
+}
+
+// On hit: bring slot s to M-head. If s was in P, this is a promotion (may
+// require demoting M-tail to P-head to keep M within capacity). If s was
+// already in M, this is just a move-to-head within M.
+static inline void slru_promote_to_m(ggml_moe_cache::cell_state & cell, int s) {
+    const bool was_in_p = (cell.slot_list[s] == SLRU_LIST_P);
+    slru_unlink(cell, s);
+    slru_insert_head_m(cell, s);
+    if (was_in_p && cell.m_count > cell.m_capacity) {
+        // Demote M-tail back to P to keep M within its budget.
+        const int demoted = cell.m_tail;
+        if (demoted >= 0) {
+            slru_unlink(cell, demoted);
+            slru_insert_head_p(cell, demoted);
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Lifecycle
 // -----------------------------------------------------------------------------
 
@@ -123,11 +232,22 @@ ggml_moe_cache_t ggml_moe_cache_init(
     c->force_noop      = getenv("GGML_MOE_CACHE_FORCE_NOOP")      != nullptr;
     c->force_skip_even = getenv("GGML_MOE_CACHE_FORCE_SKIP_EVEN") != nullptr;
 
-    // One cell per (layer, bucket); slot_map sized to slots_per_bucket each.
+    // One cell per (layer, bucket). All per-slot vectors are sized here so
+    // the SLRU pointers are valid before the first bind_bucket call (the
+    // buffer itself stays unallocated until bind, but the bookkeeping is cheap
+    // and lets bind_bucket be branch-free w.r.t. list initialization).
     c->cells.resize((size_t) n_layers * GGML_MOE_BUCKET_COUNT);
+    // SLRU capacity split: 20% probationary, 80% protected, with a minimum
+    // of 1 each so the structure makes sense at very small cache sizes.
+    const int p_cap = std::max(1, slots_per_bucket / 5);
+    const int m_cap = std::max(1, slots_per_bucket - p_cap);
     for (auto & cell : c->cells) {
         cell.slot_map.assign(slots_per_bucket, -1);
-        cell.last_tick.assign(slots_per_bucket, 0);
+        cell.prev_in_list.assign(slots_per_bucket, -1);
+        cell.next_in_list.assign(slots_per_bucket, -1);
+        cell.slot_list.assign(slots_per_bucket, SLRU_LIST_NONE);
+        cell.p_capacity = p_cap;
+        cell.m_capacity = m_cap;
     }
 
     if (c->force_noop) {
@@ -137,8 +257,8 @@ ggml_moe_cache_t ggml_moe_cache_init(
         moe_cache_log("GGML_MOE_CACHE_FORCE_SKIP_EVEN set; faking hits on even expert_ids (output GARBAGE; diagnostic only)");
     }
 
-    moe_cache_log("init: %d layers x %d buckets, %d slots/bucket; buffers allocated lazily per (layer, bucket)",
-                  n_layers, (int) GGML_MOE_BUCKET_COUNT, slots_per_bucket);
+    moe_cache_log("init: %d layers x %d buckets, %d slots/bucket (SLRU: %d protected + %d probationary); buffers allocated lazily per (layer, bucket)",
+                  n_layers, (int) GGML_MOE_BUCKET_COUNT, slots_per_bucket, m_cap, p_cap);
 
     return c;
 }
@@ -263,12 +383,12 @@ bool ggml_moe_cache_identify_tensor(
 }
 
 // -----------------------------------------------------------------------------
-// Lookup + slot selection — LRU eviction (Phase 1.2).
+// Lookup + slot selection — SLRU policy (Phase 1.3).
 //
-// On hit: bump the slot's last_tick so it moves to the head of the LRU.
-// On miss + select_slot_for_miss: pick the slot with the smallest last_tick.
-// A slot that has never been populated (tick=0) is preferred — it's
-// effectively LRU because every populated slot will have tick > 0.
+// All operations are O(1) via the SLRU helpers above. The linear scan in
+// lookup() is O(slots) but is unavoidable without a per-cell hashmap; for
+// slots_per_bucket <= 128 (the practical range) it's a single cache-line
+// walk and faster than a hashmap probe.
 // -----------------------------------------------------------------------------
 
 int ggml_moe_cache_lookup(
@@ -298,10 +418,15 @@ int ggml_moe_cache_lookup(
         return 0;
     }
 
+    // Linear scan to locate the expert. With slots_per_bucket <= 128 this is
+    // ~1 cache line of data per scan and dwarfs any hashmap overhead.
     for (int s = 0; s < c->slots_per_bucket; s++) {
         if (cell.slot_map[s] == expert_id) {
             c->stats.total_hits++;
-            cell.last_tick[s] = ++c->lru_tick;  // bump to MRU
+            // Promotion to M-head: first hit moves the slot from P to M; a
+            // second-or-later hit moves within M; either way the slot ends up
+            // at M-head and (if necessary) one entry demotes from M to P.
+            slru_promote_to_m(cell, s);
             return s;
         }
     }
@@ -315,26 +440,35 @@ int ggml_moe_cache_select_slot_for_miss(
     auto & cell = c->cells[cell_idx(layer_idx, bucket)];
     if (!cell.bound) return -1;
 
-    // Pick the slot with the smallest last_tick. Unpopulated slots have
-    // tick=0 and so are always preferred over any populated slot.
-    int      victim_slot = 0;
-    uint64_t victim_tick = cell.last_tick[0];
-    for (int s = 1; s < c->slots_per_bucket; s++) {
-        if (cell.last_tick[s] < victim_tick) {
-            victim_tick = cell.last_tick[s];
-            victim_slot = s;
-        }
+    int victim;
+    if (cell.next_unused < c->slots_per_bucket) {
+        // Cold-start: take the next never-used slot. No list cleanup needed.
+        victim = cell.next_unused++;
+    } else if (cell.p_tail >= 0) {
+        // Normal eviction: P-tail (one-hit-wonder protection — these slots
+        // never escaped probation, so they're the right things to evict).
+        victim = cell.p_tail;
+        slru_unlink(cell, victim);
+    } else {
+        // Defensive: if P is empty (which shouldn't happen with sensible
+        // capacities), fall back to M-tail.
+        victim = cell.m_tail;
+        if (victim < 0) return -1;
+        slru_unlink(cell, victim);
     }
-    return victim_slot;
+
+    // The newly-selected victim slot enters P-head with its (about-to-be-
+    // written) expert id. record_slot just sets slot_map; no further list
+    // manipulation needed.
+    slru_insert_head_p(cell, victim);
+    return victim;
 }
 
 void ggml_moe_cache_record_slot(
         ggml_moe_cache_t c, int layer_idx, ggml_moe_bucket bucket, int slot_idx, int32_t expert_id) {
     if (!c) return;
     if (slot_idx < 0 || slot_idx >= c->slots_per_bucket) return;
-    auto & cell = c->cells[cell_idx(layer_idx, bucket)];
-    cell.slot_map[slot_idx]  = expert_id;
-    cell.last_tick[slot_idx] = ++c->lru_tick;  // mark as MRU so it isn't immediately evicted
+    c->cells[cell_idx(layer_idx, bucket)].slot_map[slot_idx] = expert_id;
 }
 
 // -----------------------------------------------------------------------------
