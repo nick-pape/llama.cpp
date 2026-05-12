@@ -1,6 +1,14 @@
 // SPDX-License-Identifier: MIT
 // MoE per-expert GPU slot cache — Phase 1 implementation.
 // See ggml-moe-cache.h for the public API + design notes.
+//
+// Layout: each (layer, bucket) gets its own backing ggml_backend_buffer.
+// Required because models like Qwen3.6 MXFP4_MOE use mixed quantization
+// across layers (q5_K, q6_K, mxfp4 mixed), so expert_size_bytes varies
+// per layer. A single contiguous buffer with one size-per-bucket fails
+// bind for every layer after the first that has a different quant.
+// Trade-off: O(n_layers * n_buckets) buffer objects instead of 1 —
+// at 40*4 = 160 buffers on Qwen3.6 the overhead is negligible.
 
 #include "ggml-moe-cache.h"
 
@@ -19,25 +27,24 @@
 
 struct ggml_moe_cache {
     ggml_backend_t backend     = nullptr;
-    ggml_backend_buffer_t buf  = nullptr;   // single contiguous backing buffer
-    uint8_t * base             = nullptr;   // buf base pointer; offsets derived from layout
-    size_t total_bytes         = 0;
+    size_t total_bytes         = 0;          // sum of all allocated cell buffers
 
     int n_layers           = 0;
     int slots_per_bucket   = 0;
     size_t max_bytes_cap   = 0;
 
-    // Per-bucket state. Filled lazily on first bind_bucket() call for each bucket.
-    struct bucket_state {
+    // Per-(layer, bucket) cell. Indexed by [layer * GGML_MOE_BUCKET_COUNT + bucket].
+    // Allocated lazily on first bind for that cell.
+    struct cell_state {
         bool   bound              = false;
-        size_t expert_size_bytes  = 0;
-        size_t per_layer_bytes    = 0;       // slots_per_bucket * expert_size_bytes
-        size_t buf_offset_base    = 0;       // base offset within `buf` for layer 0 of this bucket
-        // slot_map[layer * slots_per_bucket + slot] = expert_id (or -1)
-        std::vector<int32_t> slot_map;
-        // round-robin counter per layer (Phase 1; Phase 2 = LRU)
-        std::vector<int>     next_evict;
-    } buckets[GGML_MOE_BUCKET_COUNT];
+        size_t expert_size_bytes  = 0;        // size of one expert weight in this cell
+        size_t slot_stride        = 0;        // padded expert size, slot-aligned
+        ggml_backend_buffer_t buf = nullptr;  // own backing buffer for this cell's slots
+        uint8_t * base            = nullptr;  // buf base pointer
+        std::vector<int32_t> slot_map;        // [slots]: expert_id resident in each slot
+        int                  next_evict = 0;  // round-robin counter (Phase 2: LRU)
+    };
+    std::vector<cell_state> cells;            // n_layers * GGML_MOE_BUCKET_COUNT
 
     // Diagnostic env-var flags
     bool force_noop      = false;   // GGML_MOE_CACHE_FORCE_NOOP
@@ -48,7 +55,7 @@ struct ggml_moe_cache {
 };
 
 // -----------------------------------------------------------------------------
-// Logging helper — matches the ggml log conventions; lightweight stderr fprintf.
+// Logging helper
 // -----------------------------------------------------------------------------
 
 static void moe_cache_log(const char * fmt, ...) {
@@ -61,7 +68,7 @@ static void moe_cache_log(const char * fmt, ...) {
 }
 
 // -----------------------------------------------------------------------------
-// Bucket identification from tensor name
+// Bucket / layer identification from tensor name
 // -----------------------------------------------------------------------------
 
 static ggml_moe_bucket bucket_from_name(const char * name) {
@@ -76,12 +83,15 @@ static ggml_moe_bucket bucket_from_name(const char * name) {
 
 static int layer_from_name(const char * name) {
     if (!name) return -1;
-    // Pattern: "blk.<N>.ffn_..." — sscanf returns 1 on success
     int layer = -1;
     if (sscanf(name, "blk.%d.", &layer) == 1 && layer >= 0) {
         return layer;
     }
     return -1;
+}
+
+static inline int cell_idx(int layer_idx, ggml_moe_bucket bucket) {
+    return layer_idx * GGML_MOE_BUCKET_COUNT + (int) bucket;
 }
 
 // -----------------------------------------------------------------------------
@@ -106,10 +116,10 @@ ggml_moe_cache_t ggml_moe_cache_init(
     c->force_noop      = getenv("GGML_MOE_CACHE_FORCE_NOOP")      != nullptr;
     c->force_skip_even = getenv("GGML_MOE_CACHE_FORCE_SKIP_EVEN") != nullptr;
 
-    // Initialize per-bucket slot maps & evict counters; buffer alloc deferred to bind_bucket.
-    for (int b = 0; b < GGML_MOE_BUCKET_COUNT; b++) {
-        c->buckets[b].slot_map.assign(n_layers * slots_per_bucket, -1);
-        c->buckets[b].next_evict.assign(n_layers, 0);
+    // One cell per (layer, bucket); slot_map sized to slots_per_bucket each.
+    c->cells.resize((size_t) n_layers * GGML_MOE_BUCKET_COUNT);
+    for (auto & cell : c->cells) {
+        cell.slot_map.assign(slots_per_bucket, -1);
     }
 
     if (c->force_noop) {
@@ -119,58 +129,53 @@ ggml_moe_cache_t ggml_moe_cache_init(
         moe_cache_log("GGML_MOE_CACHE_FORCE_SKIP_EVEN set; faking hits on even expert_ids (output GARBAGE; diagnostic only)");
     }
 
+    moe_cache_log("init: %d layers x %d buckets, %d slots/bucket; buffers allocated lazily per (layer, bucket)",
+                  n_layers, (int) GGML_MOE_BUCKET_COUNT, slots_per_bucket);
+
     return c;
 }
 
 void ggml_moe_cache_free(ggml_moe_cache_t c) {
     if (!c) return;
-    if (c->buf) {
-        ggml_backend_buffer_free(c->buf);
-        c->buf = nullptr;
+    for (auto & cell : c->cells) {
+        if (cell.buf) {
+            ggml_backend_buffer_free(cell.buf);
+            cell.buf = nullptr;
+        }
     }
     delete c;
 }
 
 // -----------------------------------------------------------------------------
-// Buffer allocation — eager, once we know expert_size_bytes from the first bound bucket.
-// All buckets share a single backing buffer; offsets are computed from layout.
+// Lazy per-cell buffer allocation
 // -----------------------------------------------------------------------------
 
-static bool ensure_buffer_allocated(ggml_moe_cache * c, size_t expert_size_bytes) {
-    if (c->buf) return true;
+static bool ensure_cell_allocated(ggml_moe_cache * c, ggml_moe_cache::cell_state & cell, size_t expert_size_bytes) {
+    if (cell.bound) return true;
 
-    // Pad each slot to 512 alignment for MMQ kernel safety (matches existing copy_experts padding).
+    // Pad each slot to 512 alignment for MMQ kernel safety (matches the existing
+    // copy_experts padding in ggml-backend.cpp).
     const size_t slot_stride = ((expert_size_bytes + 511) / 512) * 512 + 512;
-    const size_t per_layer   = c->slots_per_bucket * slot_stride;
-    const size_t per_bucket  = c->n_layers * per_layer;
-    const size_t total       = GGML_MOE_BUCKET_COUNT * per_bucket;
+    const size_t total       = (size_t) c->slots_per_bucket * slot_stride;
 
-    if (c->max_bytes_cap > 0 && total > c->max_bytes_cap) {
-        moe_cache_log("buffer would need %zu bytes, exceeds cap of %zu — failing init",
-                      total, c->max_bytes_cap);
+    if (c->max_bytes_cap > 0 && c->total_bytes + total > c->max_bytes_cap) {
+        moe_cache_log("cell alloc would push total to %zu bytes, exceeds cap of %zu",
+                      c->total_bytes + total, c->max_bytes_cap);
         return false;
     }
 
     auto * buft = ggml_backend_get_default_buffer_type(c->backend);
-    c->buf = ggml_backend_buft_alloc_buffer(buft, total);
-    if (!c->buf) {
-        moe_cache_log("failed to allocate %zu bytes on backend", total);
+    cell.buf = ggml_backend_buft_alloc_buffer(buft, total);
+    if (!cell.buf) {
+        moe_cache_log("failed to allocate %zu bytes for cell on backend", total);
         return false;
     }
-    c->base = (uint8_t *) ggml_backend_buffer_get_base(c->buf);
-    c->total_bytes = total;
+    cell.base              = (uint8_t *) ggml_backend_buffer_get_base(cell.buf);
+    cell.expert_size_bytes = expert_size_bytes;
+    cell.slot_stride       = slot_stride;
+    cell.bound             = true;
+    c->total_bytes        += total;
 
-    // Lay out bucket base offsets within the single buffer
-    for (int b = 0; b < GGML_MOE_BUCKET_COUNT; b++) {
-        c->buckets[b].buf_offset_base = b * per_bucket;
-        c->buckets[b].per_layer_bytes = per_layer;
-        // expert_size_bytes filled later in bind_bucket for this bucket
-    }
-
-    moe_cache_log("allocated cache buffer: %.2f GB (%d layers x %d buckets x %d slots x ~%.1f MB/slot)",
-                  total / (1024.0 * 1024.0 * 1024.0),
-                  c->n_layers, GGML_MOE_BUCKET_COUNT, c->slots_per_bucket,
-                  slot_stride / (1024.0 * 1024.0));
     return true;
 }
 
@@ -184,20 +189,18 @@ bool ggml_moe_cache_bind_bucket(
     if (layer_idx < 0 || layer_idx >= c->n_layers)            return false;
     if (expert_size_bytes == 0)                                return false;
 
-    if (!ensure_buffer_allocated(c, expert_size_bytes)) {
-        return false;
+    auto & cell = c->cells[cell_idx(layer_idx, bucket)];
+    if (cell.bound) {
+        if (cell.expert_size_bytes != expert_size_bytes) {
+            // Same (layer, bucket) cell observed at two different sizes —
+            // shouldn't happen because tensor shape is fixed at load time.
+            moe_cache_log("cell (layer=%d, bucket=%d) expert size changed: bound=%zu, got=%zu",
+                          layer_idx, (int) bucket, cell.expert_size_bytes, expert_size_bytes);
+            return false;
+        }
+        return true;
     }
-
-    auto & bs = c->buckets[bucket];
-    if (!bs.bound) {
-        bs.expert_size_bytes = expert_size_bytes;
-        bs.bound = true;
-    } else if (bs.expert_size_bytes != expert_size_bytes) {
-        moe_cache_log("expert size mismatch for bucket %d: bound=%zu, got=%zu",
-                      (int) bucket, bs.expert_size_bytes, expert_size_bytes);
-        return false;
-    }
-    return true;
+    return ensure_cell_allocated(c, cell, expert_size_bytes);
 }
 
 // -----------------------------------------------------------------------------
@@ -226,14 +229,13 @@ bool ggml_moe_cache_identify_tensor(
 
 // -----------------------------------------------------------------------------
 // Lookup + slot selection — Phase 1: linear scan, round-robin eviction.
-// All callers are inside compute_splits which is single-threaded, so no locking.
 // -----------------------------------------------------------------------------
 
 int ggml_moe_cache_lookup(
         ggml_moe_cache_t c, int layer_idx, ggml_moe_bucket bucket, int32_t expert_id) {
     if (!c) return -1;
-    auto & bs = c->buckets[bucket];
-    if (!bs.bound) return -1;
+    auto & cell = c->cells[cell_idx(layer_idx, bucket)];
+    if (!cell.bound) return -1;
 
     c->stats.total_lookups++;
 
@@ -242,14 +244,12 @@ int ggml_moe_cache_lookup(
         return -1;
     }
     if (c->force_skip_even && (expert_id % 2 == 0)) {
-        // Fake a hit on slot 0 of layer 0 — output WILL be garbage, this is timing diagnostic only
         c->stats.total_hits++;
         return 0;
     }
 
-    const int * row = &bs.slot_map[layer_idx * c->slots_per_bucket];
     for (int s = 0; s < c->slots_per_bucket; s++) {
-        if (row[s] == expert_id) {
+        if (cell.slot_map[s] == expert_id) {
             c->stats.total_hits++;
             return s;
         }
@@ -261,12 +261,11 @@ int ggml_moe_cache_lookup(
 int ggml_moe_cache_select_slot_for_miss(
         ggml_moe_cache_t c, int layer_idx, ggml_moe_bucket bucket, int32_t /*expert_id*/) {
     if (!c) return -1;
-    auto & bs = c->buckets[bucket];
-    if (!bs.bound) return -1;
+    auto & cell = c->cells[cell_idx(layer_idx, bucket)];
+    if (!cell.bound) return -1;
 
-    // Phase 1: round-robin per (layer, bucket). Phase 2: LRU.
-    int slot = bs.next_evict[layer_idx];
-    bs.next_evict[layer_idx] = (slot + 1) % c->slots_per_bucket;
+    int slot = cell.next_evict;
+    cell.next_evict = (slot + 1) % c->slots_per_bucket;
     return slot;
 }
 
@@ -274,44 +273,31 @@ void ggml_moe_cache_record_slot(
         ggml_moe_cache_t c, int layer_idx, ggml_moe_bucket bucket, int slot_idx, int32_t expert_id) {
     if (!c) return;
     if (slot_idx < 0 || slot_idx >= c->slots_per_bucket) return;
-    c->buckets[bucket].slot_map[layer_idx * c->slots_per_bucket + slot_idx] = expert_id;
+    c->cells[cell_idx(layer_idx, bucket)].slot_map[slot_idx] = expert_id;
 }
 
 // -----------------------------------------------------------------------------
-// Slot data pointer — used by scheduler to issue copies to/from this address.
-// Layout: buf_offset_base + layer_idx * per_layer_bytes + slot_idx * slot_stride
-// where slot_stride is implicit in per_layer_bytes / slots_per_bucket.
+// Slot data pointer — layout is just (cell.base + slot * stride).
 // -----------------------------------------------------------------------------
 
 void * ggml_moe_cache_slot_data(
         ggml_moe_cache_t c, int layer_idx, ggml_moe_bucket bucket, int slot_idx) {
-    if (!c || !c->base) return nullptr;
-    auto & bs = c->buckets[bucket];
-    if (!bs.bound) return nullptr;
-
-    const size_t slot_stride = bs.per_layer_bytes / c->slots_per_bucket;
-    const size_t offset = bs.buf_offset_base
-                        + (size_t) layer_idx * bs.per_layer_bytes
-                        + (size_t) slot_idx  * slot_stride;
-    return c->base + offset;
+    if (!c) return nullptr;
+    auto & cell = c->cells[cell_idx(layer_idx, bucket)];
+    if (!cell.bound || !cell.base) return nullptr;
+    return cell.base + (size_t) slot_idx * cell.slot_stride;
 }
 
 // -----------------------------------------------------------------------------
-// D2D copy primitive — actual CUDA call lives in ggml-cuda.cu so ggml-base
-// doesn't need to include cuda_runtime.h. When CUDA isn't built, the extern
-// symbol is provided as a weak no-op below; non-CUDA returns false and the
-// scheduler falls back to the existing contiguous-batch H2D path.
+// D2D copy primitive — actual CUDA call lives in ggml-cuda.cu.
 // -----------------------------------------------------------------------------
 
 extern "C" {
-// Provided by ggml-cuda.cu when GGML_USE_CUDA is set; weak no-op otherwise.
 bool ggml_cuda_moe_cache_d2d_copy_async(
     ggml_backend_t backend, void * dst, const void * src, size_t size);
 }
 
 #ifndef GGML_USE_CUDA
-// Weak fallback when CUDA isn't built — keeps ggml-base linking when ggml-cuda
-// isn't part of the build.
 extern "C" __attribute__((weak)) bool ggml_cuda_moe_cache_d2d_copy_async(
         ggml_backend_t /*backend*/, void * /*dst*/, const void * /*src*/, size_t /*size*/) {
     return false;
@@ -320,7 +306,7 @@ extern "C" __attribute__((weak)) bool ggml_cuda_moe_cache_d2d_copy_async(
 
 bool ggml_moe_cache_copy_d2d_async(
         ggml_backend_t backend, void * dst, const void * src, size_t size) {
-    if (!ggml_cuda_moe_cache_d2d_copy_async) return false; // weak symbol may be null
+    if (!ggml_cuda_moe_cache_d2d_copy_async) return false;
     return ggml_cuda_moe_cache_d2d_copy_async(backend, dst, src, size);
 }
 
