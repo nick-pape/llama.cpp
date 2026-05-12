@@ -149,6 +149,12 @@ bool ggml_moe_cache_copy_async_on_copy_stream(
 // and this call is a no-op.
 bool ggml_moe_cache_compute_wait_for_copies(ggml_backend_t backend);
 
+// Inverse: make the copy stream wait for the compute stream's pending work.
+// Use before issuing a copy-stream op that reads memory the compute stream
+// is currently writing (e.g., S2 cache-populate reads from input_cpy that
+// compute's H2D just filled). Returns false on non-CUDA.
+bool ggml_moe_cache_copy_stream_wait_for_compute(ggml_backend_t backend);
+
 // Number of layers the cache was sized for. Used by the scheduler to validate
 // that layer_idx parsed from tensor names is in range before dispatch.
 int ggml_moe_cache_n_layers(ggml_moe_cache_t cache);

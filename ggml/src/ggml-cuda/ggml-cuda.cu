@@ -4873,6 +4873,25 @@ extern "C" bool ggml_cuda_moe_cache_compute_wait_for_copies(ggml_backend_t backe
     return err == cudaSuccess;
 }
 
+// Inverse direction: make the copy stream wait for the compute stream's most
+// recent work. Use before a copy-stream op that reads memory the compute
+// stream is currently writing (e.g., the S2 cache-populate D2D reads from
+// input_cpy that the compute stream's H2D just filled). Reuses the same event
+// slot since the two orderings are never both in flight for the same MoE-branch
+// invocation: compute->copy fires once before the populate batch, copy->compute
+// fires later on the next branch entry.
+extern "C" bool ggml_cuda_moe_cache_copy_stream_wait_for_compute(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) return false;
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    cudaEvent_t  evt           = cuda_ctx->moe_cache_copy_event();
+    cudaStream_t copy_stream   = cuda_ctx->moe_cache_copy_stream();
+    cudaStream_t compute_stream = cuda_ctx->stream();
+    cudaError_t err = cudaEventRecord(evt, compute_stream);
+    if (err != cudaSuccess) return false;
+    err = cudaStreamWaitEvent(copy_stream, evt, 0);
+    return err == cudaSuccess;
+}
+
 // Implementation lives further down, after ggml_backend_cuda_device_context is defined.
 bool ggml_backend_cuda_set_op_offload_min_batch_size(int device, int min_batch_size);
 
@@ -5691,6 +5710,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_cuda_moe_cache_compute_wait_for_copies") == 0) {
         return (void *)ggml_cuda_moe_cache_compute_wait_for_copies;
+    }
+    if (strcmp(name, "ggml_cuda_moe_cache_copy_stream_wait_for_compute") == 0) {
+        return (void *)ggml_cuda_moe_cache_copy_stream_wait_for_compute;
     }
     return nullptr;
 }

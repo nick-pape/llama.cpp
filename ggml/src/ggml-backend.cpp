@@ -1662,9 +1662,28 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
 
                     if (use_moe_cache) {
-                        // Phase 1 cache-aware path: classify each used expert,
-                        // H2D-batch the misses, then D2D both miss-populates and
-                        // hit-fetches. All on the same split_backend stream.
+                        // Cache-aware MoE path. Pipeline:
+                        //
+                        //   compute stream (primary):   wait <- copy_stream (prev token's populates done)
+                        //                               H2D batch -> input_cpy (for missed experts)
+                        //   compute stream:             D2D fetch <- cache slots -> input_cpy (for hits)
+                        //                               MUL_MAT_ID kernel
+                        //
+                        //   copy stream (S2):           wait <- compute_stream (after H2D, before reading input_cpy)
+                        //                               D2D populate -> cache slots (fire-and-forget;
+                        //                                                            benefits NEXT token only)
+                        //
+                        // The populate is moved off the compute stream so it doesn't
+                        // block this token's kernel. Correctness for THIS token only
+                        // depends on the H2D and the hit-fetches, both still on the
+                        // compute stream and serialized normally.
+                        //
+                        // The leading "wait <- copy_stream" handles cross-token
+                        // ordering: if NEXT token's hit-fetch reads a slot that THIS
+                        // token's populate is still copying, we must wait for the
+                        // populate before fetching.
+                        ggml_moe_cache_compute_wait_for_copies(split_backend);
+
                         std::vector<int32_t>                miss_ids;
                         std::vector<std::pair<int32_t,int>> hit_slots; // (expert_id, slot)
                         miss_ids.reserve(n_expert);
@@ -1681,7 +1700,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             }
                         }
 
-                        // Batched H2D for misses (contiguous runs)
+                        // Batched H2D for misses (contiguous runs) — on COMPUTE stream
+                        // because the kernel reads input_cpy directly.
                         for (size_t i = 0; i < miss_ids.size(); ) {
                             int32_t first = miss_ids[i];
                             int32_t last  = first;
@@ -1694,23 +1714,36 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             i = j;
                         }
 
-                        // D2D populate cache slots for misses (after H2D done above)
-                        for (int32_t id_m : miss_ids) {
-                            const int slot = ggml_moe_cache_select_slot_for_miss(
-                                moe_cache, moe_layer_idx, moe_bucket, id_m);
-                            if (slot < 0) continue;
-                            void * dst = ggml_moe_cache_slot_data(
-                                moe_cache, moe_layer_idx, moe_bucket, slot);
-                            const void * src = (const uint8_t *) input_cpy->data
-                                             + (size_t) id_m * expert_size;
-                            if (ggml_moe_cache_copy_d2d_async(
-                                    split_backend, dst, src, expert_size)) {
-                                ggml_moe_cache_record_slot(
-                                    moe_cache, moe_layer_idx, moe_bucket, slot, id_m);
+                        // Populate cache slots for misses — on the COPY stream so it
+                        // doesn't block this token's kernel. The populate reads from
+                        // input_cpy which compute just wrote, so we have to order the
+                        // copy stream after the compute stream first.
+                        if (!miss_ids.empty()) {
+                            ggml_moe_cache_copy_stream_wait_for_compute(split_backend);
+                            for (int32_t id_m : miss_ids) {
+                                const int slot = ggml_moe_cache_select_slot_for_miss(
+                                    moe_cache, moe_layer_idx, moe_bucket, id_m);
+                                if (slot < 0) continue;
+                                void * dst = ggml_moe_cache_slot_data(
+                                    moe_cache, moe_layer_idx, moe_bucket, slot);
+                                const void * src = (const uint8_t *) input_cpy->data
+                                                 + (size_t) id_m * expert_size;
+                                if (ggml_moe_cache_copy_async_on_copy_stream(
+                                        split_backend, dst, src, expert_size)) {
+                                    // record_slot is bookkeeping-only; the actual
+                                    // D2D is in flight on copy stream. Next token's
+                                    // compute_wait_for_copies (at top of this branch)
+                                    // ensures the copy finishes before any hit-fetch
+                                    // tries to read the slot.
+                                    ggml_moe_cache_record_slot(
+                                        moe_cache, moe_layer_idx, moe_bucket, slot, id_m);
+                                }
                             }
                         }
 
-                        // D2D fetch into input_cpy for hits
+                        // D2D fetch into input_cpy for hits — on COMPUTE stream because
+                        // the kernel reads input_cpy. Source slots are guaranteed valid
+                        // by the leading compute_wait_for_copies().
                         for (const auto & h : hit_slots) {
                             const int32_t id_h   = h.first;
                             const int     slot_h = h.second;

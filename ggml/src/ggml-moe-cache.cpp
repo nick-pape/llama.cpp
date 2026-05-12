@@ -549,6 +549,15 @@ bool ggml_moe_cache_compute_wait_for_copies(ggml_backend_t backend) {
     return fn(backend);
 }
 
+bool ggml_moe_cache_copy_stream_wait_for_compute(ggml_backend_t backend) {
+    static moe_wait_fn_t cached_fn = nullptr;
+    static bool          looked_up = false;
+    auto fn = resolve_backend_fn(backend, "ggml_cuda_moe_cache_copy_stream_wait_for_compute",
+                                 cached_fn, looked_up);
+    if (!fn) return false;
+    return fn(backend);
+}
+
 int ggml_moe_cache_n_layers(ggml_moe_cache_t c) {
     return c ? c->n_layers : 0;
 }
