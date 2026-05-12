@@ -5646,6 +5646,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_set_op_offload_min_batch_size") == 0) {
         return (void *)ggml_backend_cuda_set_op_offload_min_batch_size;
     }
+    if (strcmp(name, "ggml_cuda_moe_cache_d2d_copy_async") == 0) {
+        return (void *)ggml_cuda_moe_cache_d2d_copy_async;
+    }
     return nullptr;
 }
 

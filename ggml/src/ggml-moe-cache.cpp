@@ -328,25 +328,42 @@ void * ggml_moe_cache_slot_data(
 }
 
 // -----------------------------------------------------------------------------
-// D2D copy primitive — actual CUDA call lives in ggml-cuda.cu.
+// D2D copy primitive — actual CUDA call lives in ggml-cuda.cu and is looked up
+// at runtime via the backend reg's proc address table. We can't link directly
+// against ggml_cuda_moe_cache_d2d_copy_async because ggml-base and ggml-cuda
+// are separate shared libraries: a strong reference would force ggml-base to
+// link against ggml-cuda (breaking non-CUDA builds) and even with both built
+// the cross-DSO strong symbol may not resolve. The reg proc address table is
+// the standard ggml mechanism for backend-specific entry points.
 // -----------------------------------------------------------------------------
 
-extern "C" {
-bool ggml_cuda_moe_cache_d2d_copy_async(
-    ggml_backend_t backend, void * dst, const void * src, size_t size);
-}
+typedef bool (*moe_d2d_copy_fn_t)(ggml_backend_t, void *, const void *, size_t);
 
-#ifndef GGML_USE_CUDA
-extern "C" __attribute__((weak)) bool ggml_cuda_moe_cache_d2d_copy_async(
-        ggml_backend_t /*backend*/, void * /*dst*/, const void * /*src*/, size_t /*size*/) {
-    return false;
+static moe_d2d_copy_fn_t resolve_d2d_fn(ggml_backend_t backend) {
+    static moe_d2d_copy_fn_t cached_fn = nullptr;
+    static bool              looked_up = false;
+    if (looked_up) return cached_fn;
+
+    auto * dev = ggml_backend_get_device(backend);
+    auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (reg) {
+        cached_fn = (moe_d2d_copy_fn_t) ggml_backend_reg_get_proc_address(
+            reg, "ggml_cuda_moe_cache_d2d_copy_async");
+    }
+    looked_up = true;
+
+    if (!cached_fn) {
+        moe_cache_log("backend reg does not expose ggml_cuda_moe_cache_d2d_copy_async — "
+                      "all copies will fall back to the existing H2D path (cache disabled effectively)");
+    }
+    return cached_fn;
 }
-#endif
 
 bool ggml_moe_cache_copy_d2d_async(
         ggml_backend_t backend, void * dst, const void * src, size_t size) {
-    if (!ggml_cuda_moe_cache_d2d_copy_async) return false;
-    return ggml_cuda_moe_cache_d2d_copy_async(backend, dst, src, size);
+    auto fn = resolve_d2d_fn(backend);
+    if (!fn) return false;
+    return fn(backend, dst, src, size);
 }
 
 int ggml_moe_cache_n_layers(ggml_moe_cache_t c) {
