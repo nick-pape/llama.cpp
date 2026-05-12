@@ -1697,6 +1697,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 hit_slots.emplace_back((int32_t) id_i, slot);
                             } else {
                                 miss_ids.push_back((int32_t) id_i);
+                                // Pool-manager Phase 2: notify cache of the miss.
+                                // The pool manager's maintain() will later use the
+                                // accumulated demand to decide admission. Cheap O(1)
+                                // counter bump; no I/O here.
+                                ggml_moe_cache_hint(moe_cache, moe_layer_idx, moe_bucket,
+                                                    (int32_t) id_i);
                             }
                         }
 
@@ -1708,6 +1714,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         ggml_moe_cache_record_dispatch(
                             moe_cache, moe_layer_idx, moe_bucket,
                             (int) miss_ids.size(), /*on_cpu=*/false);
+
+                        // Pool-manager Phase 2: let the pool manager run after we've
+                        // accumulated hints for this layer+bucket. Phase 1 stub is a
+                        // no-op; Phase 4 implements admission policy with async H2D.
+                        // Until Phase 3 (CPU dispatch) lands, the existing
+                        // populate-on-miss code below still runs to keep correctness.
+                        ggml_moe_cache_maintain(moe_cache);
 
                         // Batched H2D for misses (contiguous runs) — on COMPUTE stream
                         // because the kernel reads input_cpy directly.
