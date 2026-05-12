@@ -92,23 +92,57 @@ and their slot composition is frozen until re-warmed.
 S3 commit will be parked on `moe-expert-cache-pagein-s3-stopgap` for the
 record. The path forward is S4 (below) plus an LFU eviction policy.
 
-### Planned: LFU + S4 hybrid (in progress)
+### LFU → LFRU (in flight)
 
-The principled fix for cache=16/32:
+Pure LFU was a wrong instinct. With cells starting empty, every
+freshly-populated slot enters at `freq=1`. After all slots fill (one
+populate each), every slot has `freq=1`, and the next miss tiebreaks
+by slot index — effectively evicting the just-populated slot every
+time. Measured: cache=16 with naive LFU got 14% hit rate / 18.7 t/s
+vs LRU's 48% / 27.0 t/s. Classic "instant eviction" pathology.
 
-- **LFU eviction** (replacing LRU) — protects the hot working set during
-  the warmup phase, when slot composition is most consequential. LRU
-  thrashes against transient single-touch experts. LFU keeps the
-  genuinely-frequently-used ones.
-- **S4 per-op hybrid + merge kernel** — for any MoE op with cache misses:
-  GPU computes the cached experts' contributions, CPU computes the missed
-  experts' contributions (reading host-pinned weights directly, zero PCIe),
-  and a small CUDA merge kernel sums them into the final output. The async
-  populate from S2 *still happens* on the copy stream so LFU keeps adapting
-  every cell continuously.
+Fix: **LFRU = LFU with LRU tiebreak.** Each slot carries both `freq`
+(hit count since populate) and `last_tick` (monotonic access stamp).
+Eviction picks `min(freq)`; ties resolved by `min(last_tick)` — i.e.,
+LRU among the freq-equals. Newly-populated slots get the highest tick
+so they survive the immediate next miss.
 
-Expected: cache=16/32 climb above baseline without sacrificing cache=64/128
-hit-driven gains.
+This is the design the vLLM PR #37190 author calls "LFRU" and what
+the ExpertFlow paper recommends as the upgrade over plain LFU.
+
+Combined with S3 (cold-cell CPU fallback, restored from the stopgap
+branch on top of LFRU), the page-in branch HEAD is now:
+
+```
+LFRU eviction
++ S3 adaptive CPU/GPU dispatch
++ S2 async cache populate
++ S1 copy stream infrastructure
++ SLRU base (replaced by LFRU)
++ Per-(layer, bucket) buffers
++ Runtime CUDA op_offload_min_batch_size override
+```
+
+Results sweep pending.
+
+### Planned: S4 hybrid + merge kernel
+
+The principled fix for the "even at cache=128 every op has 1-2 misses
+costing PCIe stalls" problem:
+
+For any MoE op with cache misses:
+- GPU computes the cached experts' contributions (existing path, with
+  zero-fill for missed slots so the GPU kernel still runs over the
+  full top_k and contributes 0 for missed positions)
+- CPU computes the missed experts' contributions in parallel (reading
+  host-pinned weights directly, zero PCIe traffic)
+- A small CUDA merge kernel sums them into the final output
+- The async populate from S2 *still happens* on the copy stream so
+  LFRU keeps adapting every cell continuously
+
+Implementation cost is real (~400 LOC across CPU compute path, copy
+stream sync, merge kernel, dispatch logic) so this is a follow-up
+work item.
 
 ## Architectural findings (what we learned)
 
