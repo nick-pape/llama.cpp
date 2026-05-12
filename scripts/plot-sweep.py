@@ -44,8 +44,11 @@ def main():
 
     rows = []
     for path in sorted(in_dir.glob("*.log")):
-        name = path.stem            # e.g. "lru-16" / "lru-s3-128" / "baseline-0"
-        if name.startswith("baseline"):
+        name = path.stem            # e.g. "lru-16" / "lru-s3-128" / "baseline" / "gpu-only"
+        if name == "gpu-only":
+            config = "GPU only (no -ot)"
+            cache = 0
+        elif name.startswith("baseline"):
             config = "baseline"
             cache = 0
         elif name.startswith("lru-s3-"):
@@ -83,9 +86,11 @@ def main():
 
     baseline_tps = next((r['gen_tps'] for r in rows
                         if r['config']=='baseline' and 'gen_tps' in r), None)
+    gpu_only_tps = next((r['gen_tps'] for r in rows
+                        if r['config']=='GPU only (no -ot)' and 'gen_tps' in r), None)
     by_config = {}
     for r in rows:
-        if r['config'] == 'baseline':
+        if r['config'] in ('baseline', 'GPU only (no -ot)'):
             continue
         if 'gen_tps' not in r:
             continue
@@ -103,7 +108,10 @@ def main():
         ax.plot(xs, ys, marker='o', label=cfg, color=colors.get(cfg))
     if baseline_tps:
         ax.axhline(baseline_tps, color='gray', linestyle='--',
-                   label=f'baseline (no cache) = {baseline_tps:.1f} t/s')
+                   label=f'CPU-MoE baseline = {baseline_tps:.1f} t/s')
+    if gpu_only_tps:
+        ax.axhline(gpu_only_tps, color='green', linestyle=':',
+                   label=f'GPU-only ceiling = {gpu_only_tps:.1f} t/s')
     ax.set_xlabel('Cache size (slots per layer per bucket)')
     ax.set_ylabel('Decode tok/s')
     ax.set_title('MoE expert cache: decode throughput vs cache size\n'
@@ -123,7 +131,10 @@ def main():
         ax.plot(xs, ys, marker='o', label=cfg, color=colors.get(cfg))
     if baseline_tps:
         ax.axhline(baseline_tps, color='gray', linestyle='--',
-                   label=f'baseline (no cache) = {baseline_tps:.1f} t/s')
+                   label=f'CPU-MoE baseline = {baseline_tps:.1f} t/s')
+    if gpu_only_tps:
+        ax.axhline(gpu_only_tps, color='green', linestyle=':',
+                   label=f'GPU-only ceiling = {gpu_only_tps:.1f} t/s')
     ax.set_xlabel('Cache VRAM allocated (MiB)')
     ax.set_ylabel('Decode tok/s')
     ax.set_title('MoE expert cache: decode throughput vs cache VRAM\n'
