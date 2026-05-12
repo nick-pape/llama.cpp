@@ -1,6 +1,9 @@
 #include "ggml-cuda.h"
+#include "ggml-moe-cache.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
+
+#include <atomic>
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
@@ -5539,8 +5542,45 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
     }
 }
 
+// S3: process-global active MoE cache pointer. llama-context sets this via
+// ggml_cuda_set_active_moe_cache (looked up through the reg proc-address
+// table) when it creates a cache, and clears it on destruction. We use it
+// in offload_op to decide per-(layer, bucket) whether GPU is the right
+// place for this MoE op, or whether the cache is too cold for the GPU's
+// PCIe-stall cost to beat the CPU's host-pinned compute.
+static std::atomic<ggml_moe_cache_t> g_active_moe_cache{nullptr};
+
+extern "C" void ggml_cuda_set_active_moe_cache(ggml_moe_cache_t cache) {
+    g_active_moe_cache.store(cache, std::memory_order_release);
+}
+
 static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+
+    // S3 hook: for MoE MUL_MAT_ID ops with host-resident expert weights,
+    // ask the active MoE cache whether this (layer, bucket) is warm enough
+    // to make GPU offload worthwhile. If the cache says CPU, return false
+    // so the scheduler routes the op to the CPU backend.
+    ggml_moe_cache_t cache = g_active_moe_cache.load(std::memory_order_acquire);
+    if (cache != nullptr
+            && op->op == GGML_OP_MUL_MAT_ID
+            && op->src[0] != nullptr
+            && op->src[0]->buffer != nullptr
+            && ggml_backend_buffer_is_host(op->src[0]->buffer)
+            && op->src[0]->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        int layer_idx = -1;
+        ggml_moe_bucket bucket = GGML_MOE_BUCKET_INVALID;
+        if (ggml_moe_cache_identify_tensor(cache, op->src[0],
+                ggml_moe_cache_n_layers(cache),
+                &layer_idx, &bucket)) {
+            if (!ggml_moe_cache_should_offload_to_gpu(cache, layer_idx, bucket)) {
+                // S3 telemetry: count this as a CPU dispatch for this cell.
+                ggml_moe_cache_record_dispatch(cache, layer_idx, bucket,
+                                               /*miss_count=*/0, /*on_cpu=*/true);
+                return false;
+            }
+        }
+    }
 
     return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
 }
@@ -5713,6 +5753,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_cuda_moe_cache_copy_stream_wait_for_compute") == 0) {
         return (void *)ggml_cuda_moe_cache_copy_stream_wait_for_compute;
+    }
+    if (strcmp(name, "ggml_cuda_set_active_moe_cache") == 0) {
+        return (void *)ggml_cuda_set_active_moe_cache;
     }
     return nullptr;
 }

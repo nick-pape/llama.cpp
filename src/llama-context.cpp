@@ -405,6 +405,21 @@ llama_context::llama_context(
                             LLAMA_LOG_WARN("%s: GPU backend doesn't expose ggml_backend_cuda_set_op_offload_min_batch_size; cache may not engage during decode on non-CUDA backends or older CUDA builds\n",
                                     __func__);
                         }
+
+                        // S3 hook: register the cache as the process-wide active
+                        // cache so the CUDA offload_op callback can consult it.
+                        // Pointer is stored unmanaged; we clear it in the dtor.
+                        using set_active_cache_t = void (*)(ggml_moe_cache_t);
+                        auto set_active_cache_fn = gpu_reg
+                            ? (set_active_cache_t) ggml_backend_reg_get_proc_address(gpu_reg, "ggml_cuda_set_active_moe_cache")
+                            : nullptr;
+                        if (set_active_cache_fn) {
+                            set_active_cache_fn(moe_cache);
+                            LLAMA_LOG_INFO("%s: MoE cache registered as active for CUDA adaptive offload routing\n", __func__);
+                        } else {
+                            LLAMA_LOG_WARN("%s: GPU backend doesn't expose ggml_cuda_set_active_moe_cache; S3 adaptive routing disabled (all MoE ops will go through GPU + cache path)\n",
+                                    __func__);
+                        }
                     }
                 }
             }
@@ -432,6 +447,20 @@ llama_context::llama_context(
 
 llama_context::~llama_context() {
     if (moe_cache != nullptr) {
+        // Clear the S3 active-cache pointer in CUDA before freeing the cache,
+        // so any concurrent offload_op call sees null and falls back to the
+        // default min_batch_size threshold instead of dereferencing freed memory.
+        for (auto & backend : backends) {
+            auto * dev = ggml_backend_get_device(backend.get());
+            auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            if (!reg) continue;
+            using set_active_cache_t = void (*)(ggml_moe_cache_t);
+            auto fn = (set_active_cache_t) ggml_backend_reg_get_proc_address(reg, "ggml_cuda_set_active_moe_cache");
+            if (fn) {
+                fn(nullptr);
+                break;
+            }
+        }
         ggml_moe_cache_free(moe_cache);
         moe_cache = nullptr;
     }

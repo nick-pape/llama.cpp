@@ -155,6 +155,37 @@ bool ggml_moe_cache_compute_wait_for_copies(ggml_backend_t backend);
 // compute's H2D just filled). Returns false on non-CUDA.
 bool ggml_moe_cache_copy_stream_wait_for_compute(ggml_backend_t backend);
 
+// S3 adaptive routing. Called from the CUDA backend's offload_op callback
+// at scheduler time: returns true if the MoE op for this (layer, bucket)
+// should be offloaded to GPU (current behavior), false if it should stay
+// on the CPU backend.
+//
+// The cache is consulted because only the cache knows whether the cell is
+// (a) warm enough that the GPU+PCIe path beats the CPU path, or
+// (b) cold enough that we'd rather pay CPU compute than PCIe stall.
+//
+// Heuristic for cold→warm transition:
+//   - Cell not yet bound  : true  (let GPU run so cache allocates on first touch)
+//   - Cell still warming  : true  (next_unused < slots_per_bucket — let slots fill)
+//   - Recent hit rate ≥ X : true  (warm)
+//   - Recent hit rate < X : false (CPU avoids the per-op PCIe stall)
+bool ggml_moe_cache_should_offload_to_gpu(ggml_moe_cache_t cache, int layer_idx, enum ggml_moe_bucket bucket);
+
+// S3 telemetry. Called from the scheduler's MoE branch each time it
+// classifies hits/misses for a cell, regardless of whether the op ended
+// up on CPU or GPU. Tracks per-cell dispatch statistics so we can see how
+// often each layer is offloaded vs. retained on CPU and the average
+// number of cache misses per op when on GPU.
+//
+// on_cpu = true means the scheduler routed this op to CPU (offload_op
+// returned false for it). false means the op runs on GPU as normal.
+void ggml_moe_cache_record_dispatch(
+    ggml_moe_cache_t      cache,
+    int                    layer_idx,
+    enum ggml_moe_bucket  bucket,
+    int                    miss_count,
+    bool                   on_cpu);
+
 // Number of layers the cache was sized for. Used by the scheduler to validate
 // that layer_idx parsed from tensor names is in range before dispatch.
 int ggml_moe_cache_n_layers(ggml_moe_cache_t cache);

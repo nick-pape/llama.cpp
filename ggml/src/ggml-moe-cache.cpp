@@ -81,6 +81,21 @@ struct ggml_moe_cache {
         int p_head = -1, p_tail = -1, p_count = 0, p_capacity = 0;
         int m_head = -1, m_tail = -1, m_count = 0, m_capacity = 0;
         int next_unused = 0;                  // slots [0, next_unused) have been touched
+
+        // S3 telemetry + adaptive offload routing.
+        //   - n_lookups / n_hits          : lookup-level statistics for this cell
+        //   - n_dispatches                : how many MUL_MAT_ID ops touched this cell
+        //                                   (one per layer+bucket per token)
+        //   - n_dispatches_to_cpu         : of those, how many were routed to CPU
+        //                                   (the GPU offload was declined for cold cells)
+        //   - misses_in_dispatch_sum      : sum of miss_count across all dispatches;
+        //                                   avg-misses-per-op = .../n_dispatches
+        // These are 64-bit so they don't wrap during a long decode.
+        uint64_t n_lookups               = 0;
+        uint64_t n_hits                  = 0;
+        uint64_t n_dispatches            = 0;
+        uint64_t n_dispatches_to_cpu     = 0;
+        uint64_t misses_in_dispatch_sum  = 0;
     };
     std::vector<cell_state> cells;            // n_layers * GGML_MOE_BUCKET_COUNT
 
@@ -270,7 +285,15 @@ void ggml_moe_cache_free(ggml_moe_cache_t c) {
     if (c->stats.total_lookups > 0) {
         const double hit_rate = (double) c->stats.total_hits / (double) c->stats.total_lookups;
         int bound_cells = 0;
-        for (const auto & cell : c->cells) if (cell.bound) ++bound_cells;
+        uint64_t total_dispatches      = 0;
+        uint64_t total_dispatches_cpu  = 0;
+        uint64_t total_misses_in_disp  = 0;
+        for (const auto & cell : c->cells) {
+            if (cell.bound) ++bound_cells;
+            total_dispatches      += cell.n_dispatches;
+            total_dispatches_cpu  += cell.n_dispatches_to_cpu;
+            total_misses_in_disp  += cell.misses_in_dispatch_sum;
+        }
         moe_cache_log("final stats: %lld lookups, %lld hits, %lld misses (%.1f%% hit rate); %d / %d cells bound; %.2f MiB total",
                       (long long) c->stats.total_lookups,
                       (long long) c->stats.total_hits,
@@ -278,6 +301,18 @@ void ggml_moe_cache_free(ggml_moe_cache_t c) {
                       hit_rate * 100.0,
                       bound_cells, (int) c->cells.size(),
                       c->total_bytes / (1024.0 * 1024.0));
+        if (total_dispatches > 0) {
+            const uint64_t gpu_dispatches = total_dispatches - total_dispatches_cpu;
+            const double cpu_pct = 100.0 * (double) total_dispatches_cpu / (double) total_dispatches;
+            const double avg_misses_when_gpu = gpu_dispatches > 0
+                ? (double) total_misses_in_disp / (double) gpu_dispatches
+                : 0.0;
+            moe_cache_log("dispatch breakdown: %lld total ops, %lld on CPU (%.1f%%), %lld on GPU (%.1f%%); avg misses-per-op when on GPU = %.2f",
+                          (long long) total_dispatches,
+                          (long long) total_dispatches_cpu, cpu_pct,
+                          (long long) gpu_dispatches, 100.0 - cpu_pct,
+                          avg_misses_when_gpu);
+        }
     } else {
         moe_cache_log("final stats: no lookups recorded — cache code path never executed");
     }
@@ -420,9 +455,11 @@ int ggml_moe_cache_lookup(
 
     // Linear scan to locate the expert. With slots_per_bucket <= 128 this is
     // ~1 cache line of data per scan and dwarfs any hashmap overhead.
+    cell.n_lookups++;
     for (int s = 0; s < c->slots_per_bucket; s++) {
         if (cell.slot_map[s] == expert_id) {
             c->stats.total_hits++;
+            cell.n_hits++;
             // Promotion to M-head: first hit moves the slot from P to M; a
             // second-or-later hit moves within M; either way the slot ends up
             // at M-head and (if necessary) one entry demotes from M to P.
@@ -469,6 +506,61 @@ void ggml_moe_cache_record_slot(
     if (!c) return;
     if (slot_idx < 0 || slot_idx >= c->slots_per_bucket) return;
     c->cells[cell_idx(layer_idx, bucket)].slot_map[slot_idx] = expert_id;
+}
+
+// -----------------------------------------------------------------------------
+// S3 adaptive routing
+// -----------------------------------------------------------------------------
+
+bool ggml_moe_cache_should_offload_to_gpu(
+        ggml_moe_cache_t c, int layer_idx, ggml_moe_bucket bucket) {
+    if (!c) return true;  // no cache => normal scheduler behavior
+    if (bucket < 0 || bucket >= GGML_MOE_BUCKET_COUNT) return true;
+    if (layer_idx < 0 || layer_idx >= c->n_layers)     return true;
+
+    const auto & cell = c->cells[cell_idx(layer_idx, bucket)];
+
+    // Not yet bound: let GPU run so the cache code path allocates this cell's
+    // backing buffer on first touch. After that, normal warmup applies.
+    if (!cell.bound) return true;
+
+    // Warming up: slots are still being populated from never-touched. Force
+    // GPU so the cache fills. Once full, fall through to the hit-rate check.
+    if (cell.next_unused < c->slots_per_bucket) return true;
+
+    // Need enough recent data to make a decision. With 8 lookups per dispatch
+    // (top_k=8 routing), a few dispatches' worth of samples is plenty.
+    if (cell.n_lookups < 64) return true;  // default GPU early on
+
+    // Hit-rate threshold (env-tunable for experiments).
+    // Default 0.5: if at least half of expert lookups in this cell are hits,
+    // the cache D2D path beats the CPU path. Below that, CPU wins because it
+    // avoids the per-miss PCIe stall.
+    static const double threshold = []() {
+        const char * env = getenv("GGML_MOE_CACHE_GPU_HIT_THRESHOLD");
+        return env ? std::atof(env) : 0.5;
+    }();
+
+    const double hit_rate = (double) cell.n_hits / (double) cell.n_lookups;
+    return hit_rate >= threshold;
+}
+
+void ggml_moe_cache_record_dispatch(
+        ggml_moe_cache_t c, int layer_idx, ggml_moe_bucket bucket,
+        int miss_count, bool on_cpu) {
+    if (!c) return;
+    if (bucket < 0 || bucket >= GGML_MOE_BUCKET_COUNT) return;
+    if (layer_idx < 0 || layer_idx >= c->n_layers)     return;
+
+    auto & cell = c->cells[cell_idx(layer_idx, bucket)];
+    cell.n_dispatches++;
+    if (on_cpu) {
+        cell.n_dispatches_to_cpu++;
+        // miss_count is N/A for CPU dispatches (we never ran a lookup), so we
+        // don't accumulate it.
+    } else if (miss_count > 0) {
+        cell.misses_in_dispatch_sum += (uint64_t) miss_count;
+    }
 }
 
 // -----------------------------------------------------------------------------
