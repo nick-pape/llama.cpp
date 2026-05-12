@@ -217,7 +217,17 @@ bool ggml_moe_cache_bind_bucket(
         }
         return true;
     }
-    return ensure_cell_allocated(c, cell, expert_size_bytes);
+    bool ok = ensure_cell_allocated(c, cell, expert_size_bytes);
+    if (ok) {
+        // Diagnostic: log the first few cell binds so we can verify the path is hit.
+        static int n_bound = 0;
+        if (n_bound < 8) {
+            moe_cache_log("cell bound (layer=%d, bucket=%d, expert_size=%zu, slot_stride=%zu)",
+                          layer_idx, (int) bucket, cell.expert_size_bytes, cell.slot_stride);
+            ++n_bound;
+        }
+    }
+    return ok;
 }
 
 // -----------------------------------------------------------------------------
