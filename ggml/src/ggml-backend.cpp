@@ -1711,10 +1711,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     if (getenv("MOE_CACHE_FORCE_BYPASS")) use_moe_cache = false;
 
                     if (use_moe_cache) {
+                        // INSTRUMENT: time each phase of the cache hook.
+                        // Limited to first 12 ops total to avoid log spam.
+                        static int dbg_op_count = 0;
+                        const bool dbg = dbg_op_count < 12;
+                        const int64_t t0 = dbg ? ggml_time_us() : 0;
+
                         // Walk used experts; on miss, pick a slot and H2D
                         // the expert's bytes directly into the slot pool.
                         // Record slot_of_expert[] for the ids-remap step.
                         std::vector<int32_t> slot_of_expert(n_expert, -1);
+                        int dbg_n_misses = 0;
                         for (int64_t id_i = 0; id_i < n_expert; ++id_i) {
                             if (!ggml_bitset_get(used_ids.data(), id_i)) continue;
                             int slot = ggml_moe_cache_lookup(
@@ -1740,9 +1747,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                     expert_size);
                                 ggml_moe_cache_record_slot(
                                     moe_cache, moe_layer_idx, moe_bucket, slot, (int32_t) id_i);
+                                ++dbg_n_misses;
                             }
                             slot_of_expert[id_i] = slot;
                         }
+                        const int64_t t1 = dbg ? ggml_time_us() : 0;
 
                         // Build remapped slot_ids on host from the D2H'd
                         // expert ids. ids tensor layout: [top_k, n_tokens]
@@ -1760,9 +1769,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             }
                         }
 
+                        const int64_t t2 = dbg ? ggml_time_us() : 0;
+
                         // H2D slot_ids onto the cache's ids tensor.
                         ggml_moe_cache_set_ids(moe_cache, moe_layer_idx, moe_bucket,
                             split_backend, slot_ids.data(), top_k, n_tokens);
+
+                        const int64_t t3 = dbg ? ggml_time_us() : 0;
 
                         // Repoint the MoE op's src[0] and src[2]. The kernel
                         // will read from the slot pool (smaller tensor with
@@ -1771,6 +1784,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             moe_cache, moe_layer_idx, moe_bucket);
                         node->src[2] = ggml_moe_cache_ids_tensor(
                             moe_cache, moe_layer_idx, moe_bucket);
+
+                        if (dbg) {
+                            const int64_t t4 = ggml_time_us();
+                            fprintf(stderr,
+                                "moe-cache-time [op=%d L=%d B=%d uniq=%d miss=%d tok=%d]: "
+                                "lookup_h2d=%lldus build=%lldus set_ids=%lldus patch=%lldus total=%lldus\n",
+                                dbg_op_count, moe_layer_idx, (int) moe_bucket,
+                                n_unique_used, dbg_n_misses, (int) op_n_tokens,
+                                (long long)(t1 - t0), (long long)(t2 - t1),
+                                (long long)(t3 - t2), (long long)(t4 - t3),
+                                (long long)(t4 - t0));
+                            ++dbg_op_count;
+                        }
                     } else {
                         // Existing contiguous-batch H2D path (cache disabled or
                         // tensor not identifiable as MoE expert weights).
@@ -1815,7 +1841,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         if (!sched->callback_eval) {
+            static int dbg_split_count = 0;
+            const bool dbg_split = dbg_split_count < 8;
+            const int64_t t_split_0 = dbg_split ? ggml_time_us() : 0;
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            if (dbg_split) {
+                // graph_compute_async is itself async — sync to measure real wallclock
+                ggml_backend_synchronize(split_backend);
+                const int64_t t_split_1 = ggml_time_us();
+                fprintf(stderr, "moe-cache-time [split=%d backend=%s nodes=%d]: compute_async+sync=%lldus\n",
+                        dbg_split_count, ggml_backend_name(split_backend), split->graph.n_nodes,
+                        (long long)(t_split_1 - t_split_0));
+                ++dbg_split_count;
+            }
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
