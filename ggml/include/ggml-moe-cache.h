@@ -1,20 +1,17 @@
 // SPDX-License-Identifier: MIT
-// MoE per-expert GPU slot cache — Phase 1 (static slots, no eviction)
+// MoE expert-weight cache for the CUDA backend (issue #20757).
 //
-// Hooks into ggml_backend_sched_compute_splits's MoE expert offload path
-// (ggml/src/ggml-backend.cpp:1576). For each used expert this token:
-//   - HIT  → D2D copy from cache slot to input_cpy at expert offset
-//   - MISS → existing H2D from host (preserves current behavior) + populate cache slot
+// Architecture: persistent backend-owned slot pool per (layer, bucket).
+// The kernel reads expert weights directly from the slot pool — no
+// D2D-into-input_cpy per cache hit. Routing ids are remapped from
+// expert-ids in [0, n_experts) to slot-ids in [0, n_slots); the MoE
+// op's src[0] and src[2] are repointed in compute_splits to the
+// cache's persistent tensors.
 //
-// Phase 1 scope:
-//   - Static slot pool, no LRU (Phase 2 adds eviction)
-//   - Direct cudaMemcpyAsync for D2D hits (Phase 2 may add a proper backend interface)
-//   - Three buckets per layer for Qwen3.5MoE: down_exps, gate_exps, up_exps
-//     (also supports the combined gate_up_exps variant via separate bucket)
-//   - Linear search through slots for lookup (slot count is small, ≤ 32)
+// Reference architectures: vLLM PR #37190, tinyserve, martinalderson's
+// moe-profile PoC, e1n00r's PR #21609. All converge on this pattern.
 //
-// See nick-pape/ai-pape-house:llama-cpp-moe-cache-plan.md for the full design + upstream
-// PR strategy. See DAY1-READING-NOTES.md (in this repo) for architectural deep-dive.
+// See MOE-EXPERT-CACHE-V2-PLAN.md for the architectural plan.
 
 #pragma once
 
@@ -28,13 +25,11 @@
 extern "C" {
 #endif
 
-// Forward-declare; opaque to consumers.
 struct ggml_moe_cache;
 typedef struct ggml_moe_cache * ggml_moe_cache_t;
 
-// Per-bucket layout. For Qwen3.5MoE, each layer has up to four expert
-// weight tensors (down, gate, up, gate_up combined). Each gets its own
-// slot pool. Identification is by tensor-name substring match.
+// Each (layer, bucket) has its own slot pool. Buckets correspond to the
+// MoE expert weight tensors in Qwen3.5-style architectures.
 enum ggml_moe_bucket {
     GGML_MOE_BUCKET_DOWN     = 0,   // ffn_down_exps
     GGML_MOE_BUCKET_GATE     = 1,   // ffn_gate_exps
@@ -44,120 +39,126 @@ enum ggml_moe_bucket {
     GGML_MOE_BUCKET_INVALID  = -1,
 };
 
-// Create a cache for the given backend. Buffer is pre-allocated up front
-// (NOT lazy — avoids any future CUDA graph-capture interaction). Each slot
-// holds one expert's worth of bytes. The buffer is N_LAYERS × N_BUCKETS ×
-// slots_per_bucket × expert_size_bytes, capped by max_bytes if non-zero.
-//
-// Returns NULL on allocation failure.
+// Create a cache. Slot pools and id buffers are allocated lazily on
+// first bind for each (layer, bucket). Returns NULL on failure.
 ggml_moe_cache_t ggml_moe_cache_init(
     ggml_backend_t backend,
     int            n_layers,
     int            slots_per_bucket,    // user param --moe-expert-cache-size
-    size_t         max_bytes);          // 0 = no cap (allocate everything)
+    size_t         max_bytes);          // 0 = no cap; otherwise per-cache VRAM budget
 
 void ggml_moe_cache_free(ggml_moe_cache_t cache);
 
 // Identify which (layer_idx, bucket) a tensor belongs to from its name.
-// Returns true if the tensor is a recognized MoE expert weight tensor
-// AND the cache has slots configured for that bucket.
 // Tensor name pattern: "blk.{layer}.ffn_{down|gate|up|gate_up}_exps.weight"
 bool ggml_moe_cache_identify_tensor(
-    ggml_moe_cache_t        cache,
+    ggml_moe_cache_t           cache,
     const struct ggml_tensor * input,
-    int                       n_layers,    // for bounds check
-    int *                     out_layer_idx,
-    enum ggml_moe_bucket *   out_bucket);
+    int                        n_layers,
+    int *                      out_layer_idx,
+    enum ggml_moe_bucket *     out_bucket);
 
-// Bind the cache to a specific (layer, bucket) for a sequence of operations
-// in compute_splits. Internally records the expert_size_bytes (from input
-// tensor metadata) on first call for this bucket; subsequent calls assert
-// consistency. Returns false if buffer allocation fails or sizes are inconsistent.
+// Bind (lazy-allocate) the slot pool + ids buffer for (layer, bucket).
+// `weight` is the host-resident expert weight tensor (input to the MoE
+// op); the cache reads its dtype/strides + ne[2]=n_experts from it to
+// size the slot pool. `top_k` is the routing top-k (ids[0]); the cache
+// sizes the slot_ids buffer for top_k * max_n_tokens entries.
+// Returns false on allocation failure or shape mismatch.
 bool ggml_moe_cache_bind_bucket(
-    ggml_moe_cache_t        cache,
-    int                      layer_idx,
-    enum ggml_moe_bucket    bucket,
-    size_t                   expert_size_bytes,
-    int64_t                  n_experts_total);
+    ggml_moe_cache_t           cache,
+    int                        layer_idx,
+    enum ggml_moe_bucket       bucket,
+    const struct ggml_tensor * weight,
+    int                        top_k,
+    int                        max_n_tokens);
 
-// Look up an expert in the slot map. Returns slot index (≥ 0) if cached,
-// or -1 if not cached. Phase 1: linear search through slots_per_bucket
-// entries. Phase 2: hash map.
+// Returns slot index >= 0 if expert is currently resident, else -1.
 int ggml_moe_cache_lookup(
     ggml_moe_cache_t        cache,
-    int                      layer_idx,
+    int                     layer_idx,
     enum ggml_moe_bucket    bucket,
-    int32_t                  expert_id);
+    int32_t                 expert_id);
 
-// Phase 1 eviction: round-robin slot selection. Phase 2: LRU.
-// Returns the slot index to write the new expert into. May overwrite a
-// previously-cached expert; caller is responsible for issuing the copy.
+// Select a slot for a missed expert. Picks an empty slot if available,
+// otherwise evicts the LFRU resident expert. Returns the slot index;
+// caller is responsible for H2D'ing the expert's bytes into the slot's
+// memory and then calling record_slot to commit. Returns -1 only on
+// cache misconfiguration.
 int ggml_moe_cache_select_slot_for_miss(
     ggml_moe_cache_t        cache,
-    int                      layer_idx,
+    int                     layer_idx,
     enum ggml_moe_bucket    bucket,
-    int32_t                  expert_id);
+    int32_t                 expert_id);
 
-// Record that an expert now occupies a slot. Called after the H2D copy
-// (or D2D-from-input_cpy) is issued. Updates the slot map atomically
-// for the scheduler (single-threaded at this point, no lock needed).
+// Commit: mark `expert_id` as occupying `slot_idx`. Updates the LFRU
+// freq/last_tick counters for the slot. Called after the caller has
+// completed the H2D into the slot's memory (or fire-and-forget on the
+// compute stream — record_slot is bookkeeping-only).
 void ggml_moe_cache_record_slot(
     ggml_moe_cache_t        cache,
-    int                      layer_idx,
+    int                     layer_idx,
     enum ggml_moe_bucket    bucket,
-    int                      slot_idx,
-    int32_t                  expert_id);
+    int                     slot_idx,
+    int32_t                 expert_id);
 
-// Get the device pointer for a slot in (layer, bucket, slot_idx). Used
-// by the scheduler to issue cudaMemcpyAsync directly from this address.
-// Phase 2 may replace this with a proper ggml_tensor wrapper.
+// Get the device pointer for a slot in (layer, bucket, slot_idx).
+// Caller uses this as the H2D destination on a cache miss. Returns
+// NULL on misconfiguration.
 void * ggml_moe_cache_slot_data(
     ggml_moe_cache_t        cache,
-    int                      layer_idx,
+    int                     layer_idx,
     enum ggml_moe_bucket    bucket,
-    int                      slot_idx);
+    int                     slot_idx);
 
-// Issue an async D2D copy on the given backend's primary stream. The copy
-// is ordered with subsequent compute ops on that backend. Returns false if
-// the backend doesn't support direct D2D (currently CUDA-only — non-CUDA
-// backends should fall back to the contiguous-batch H2D path).
-// Free function (no cache state needed) but lives here because it
-// encapsulates the CUDA-specific cudaMemcpyAsync call.
-bool ggml_moe_cache_copy_d2d_async(
-    ggml_backend_t backend,
-    void *         dst,
-    const void *   src,
-    size_t         size);
+// Returns the persistent ggml_tensor wrapping the slot pool for
+// (layer, bucket). The tensor has shape [K, N, n_slots] (n_slots
+// instead of n_experts) and is backed by the cache's own
+// ggml_backend_buffer (outside ggml_gallocr). The scheduler patches
+// MoE op's src[0] to this tensor before kernel launch.
+struct ggml_tensor * ggml_moe_cache_pool_tensor(
+    ggml_moe_cache_t        cache,
+    int                     layer_idx,
+    enum ggml_moe_bucket    bucket);
 
-// Number of layers the cache was sized for. Used by the scheduler to validate
-// that layer_idx parsed from tensor names is in range before dispatch.
+// Returns the persistent ggml_tensor wrapping the slot_ids buffer for
+// (layer, bucket). Has int32 dtype and shape [top_k, max_n_tokens];
+// the effective shape for any given op is set by ggml_moe_cache_set_ids
+// before kernel launch.
+struct ggml_tensor * ggml_moe_cache_ids_tensor(
+    ggml_moe_cache_t        cache,
+    int                     layer_idx,
+    enum ggml_moe_bucket    bucket);
+
+// Write the remapped slot ids to the cache's ids tensor for this
+// (layer, bucket) and update ne[0] = top_k, ne[1] = n_tokens to
+// match the current op. The data is H2D'd on the given backend's
+// compute stream (typically the GPU backend doing the MoE op).
+// Returns true on success.
+bool ggml_moe_cache_set_ids(
+    ggml_moe_cache_t        cache,
+    int                     layer_idx,
+    enum ggml_moe_bucket    bucket,
+    ggml_backend_t          backend,
+    const int32_t *         slot_ids_host,
+    int                     top_k,
+    int                     n_tokens);
+
+// Number of layers the cache was sized for.
 int ggml_moe_cache_n_layers(ggml_moe_cache_t cache);
 
-// Total bytes allocated for the cache buffer. Useful for VRAM accounting
-// reported to the user.
+// Total VRAM allocated across all slot pools + id buffers.
 size_t ggml_moe_cache_total_bytes(ggml_moe_cache_t cache);
 
-// Per-cell stats, for the diagnostic harness (analogous to wsl2-staging-pool's
-// step-0 and skip-50% ablation commits — see DAY1-READING-NOTES.md).
+// Per-cache stats (aggregated across cells).
 struct ggml_moe_cache_stats {
     int64_t total_hits;
     int64_t total_misses;
     int64_t total_lookups;
-    int64_t total_h2d_bytes;
-    int64_t total_d2d_bytes;
+    int64_t total_h2d_bytes;     // bytes H2D'd to slot pools (misses)
+    int64_t total_bytes_saved;   // hits * expert_size: H2D bytes avoided
 };
-void ggml_moe_cache_get_stats(
-    ggml_moe_cache_t              cache,
-    struct ggml_moe_cache_stats * out);
-
+void ggml_moe_cache_get_stats(ggml_moe_cache_t cache, struct ggml_moe_cache_stats * out);
 void ggml_moe_cache_reset_stats(ggml_moe_cache_t cache);
-
-// Diagnostic mode flags (env var override): set GGML_MOE_CACHE_FORCE_NOOP=1 in
-// the environment to make every lookup return "miss" (preserves vanilla
-// H2D path; measures whether our new code path adds overhead). Set
-// GGML_MOE_CACHE_FORCE_SKIP_EVEN=1 to fake hits on even expert_ids (output
-// will be garbage but timing isolates D2D bandwidth from compute).
-// Both are picked up at cache init.
 
 #ifdef __cplusplus
 }

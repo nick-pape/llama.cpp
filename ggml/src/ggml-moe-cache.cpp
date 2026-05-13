@@ -1,54 +1,94 @@
 // SPDX-License-Identifier: MIT
-// MoE per-expert GPU slot cache — Phase 1 implementation.
-// See ggml-moe-cache.h for the public API + design notes.
+// MoE expert-weight cache — v2 implementation (issue #20757).
+//
+// Architecture: persistent backend-owned slot pool per (layer, bucket).
+// Routing ids are remapped from expert-ids to slot-ids; the scheduler
+// repoints the MoE op's src[0] (expert weights) and src[2] (ids) to
+// the cache's persistent tensors. Kernel reads slot pool directly,
+// no D2D-into-input_cpy per hit.
+//
+// Buffers are allocated via ggml_backend_buft_alloc_buffer (NOT
+// ggml_gallocr), so their device addresses survive graph_compute
+// calls. Tensors set `buffer` so gallocr respects external ownership.
+//
+// See MOE-EXPERT-CACHE-V2-PLAN.md for the architectural plan and
+// reference architectures (vLLM PR #37190, tinyserve, FATE, HOBBIT,
+// martinalderson's moe-profile PoC, e1n00r's PR #21609).
 
 #include "ggml-moe-cache.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <algorithm>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
 #include <vector>
-#include <cstdarg>
 
 // -----------------------------------------------------------------------------
 // Internal types
 // -----------------------------------------------------------------------------
 
 struct ggml_moe_cache {
-    ggml_backend_t backend     = nullptr;
-    ggml_backend_buffer_t buf  = nullptr;   // single contiguous backing buffer
-    uint8_t * base             = nullptr;   // buf base pointer; offsets derived from layout
-    size_t total_bytes         = 0;
+    ggml_backend_t backend = nullptr;
+    int            n_layers = 0;
+    int            slots_per_bucket = 0;  // user param; capped to n_experts at bind time
+    size_t         max_bytes_cap = 0;
+    size_t         total_bytes = 0;
 
-    int n_layers           = 0;
-    int slots_per_bucket   = 0;
-    size_t max_bytes_cap   = 0;
+    // Long-lived ggml_context for the slot-pool + slot-ids tensor wrappers.
+    // no_alloc=true: we attach our own backend buffers manually.
+    void *         tensor_ctx_mem = nullptr;
+    ggml_context * tensor_ctx     = nullptr;
 
-    // Per-bucket state. Filled lazily on first bind_bucket() call for each bucket.
-    struct bucket_state {
-        bool   bound              = false;
-        size_t expert_size_bytes  = 0;
-        size_t per_layer_bytes    = 0;       // slots_per_bucket * expert_size_bytes
-        size_t buf_offset_base    = 0;       // base offset within `buf` for layer 0 of this bucket
-        // slot_map[layer * slots_per_bucket + slot] = expert_id (or -1)
-        std::vector<int32_t> slot_map;
-        // round-robin counter per layer (Phase 1; Phase 2 = LRU)
-        std::vector<int>     next_evict;
-    } buckets[GGML_MOE_BUCKET_COUNT];
+    // One cell per (layer, bucket). Indexed [layer * GGML_MOE_BUCKET_COUNT + bucket].
+    struct cell {
+        bool   bound = false;
+        size_t expert_size = 0;       // bytes per expert in this (layer, bucket)
+        size_t slot_stride = 0;       // padded expert_size, multiple of 512 for MMQ safety
+        int    n_slots = 0;           // min(slots_per_bucket, n_experts)
+        int64_t n_experts = 0;        // weight tensor ne[2]
+        int    top_k = 0;             // routing top-k; sizes slot_ids buffer
+        int    max_n_tokens = 0;      // upper bound on n_tokens, sizes slot_ids buffer
 
-    // Diagnostic env-var flags
-    bool force_noop      = false;   // GGML_MOE_CACHE_FORCE_NOOP
-    bool force_skip_even = false;   // GGML_MOE_CACHE_FORCE_SKIP_EVEN
+        // Slot pool: persistent device buffer + ggml_tensor wrapper.
+        ggml_backend_buffer_t pool_buf    = nullptr;
+        uint8_t *             pool_base   = nullptr;
+        ggml_tensor *         pool_tensor = nullptr;
 
-    // Stats
+        // Slot ids: persistent device buffer + ggml_tensor wrapper.
+        // Sized for top_k * max_n_tokens int32 entries.
+        ggml_backend_buffer_t ids_buf     = nullptr;
+        uint8_t *             ids_base    = nullptr;
+        ggml_tensor *         ids_tensor  = nullptr;
+
+        // Residency.
+        std::vector<int32_t>             slot_to_expert;  // [n_slots], -1 if empty
+        std::unordered_map<int32_t, int> expert_to_slot;  // O(1) lookup
+        int                              next_unused = 0;
+
+        // LFRU eviction state.
+        std::vector<uint32_t> freq;       // [n_slots]: hits since populate
+        std::vector<uint64_t> last_tick;  // [n_slots]: last access tick
+
+        // Per-cell stats.
+        uint64_t n_lookups = 0;
+        uint64_t n_hits    = 0;
+    };
+    std::vector<cell> cells;
+    uint64_t          tick = 0;  // monotonic, for LFRU LRU-tiebreak
+
+    // Aggregate stats.
     ggml_moe_cache_stats stats{};
 };
 
+static_assert(GGML_MOE_BUCKET_COUNT == 4, "ggml_moe_cache assumes 4 buckets");
+
 // -----------------------------------------------------------------------------
-// Logging helper — matches the ggml log conventions; lightweight stderr fprintf.
+// Helpers
 // -----------------------------------------------------------------------------
 
 static void moe_cache_log(const char * fmt, ...) {
@@ -59,10 +99,6 @@ static void moe_cache_log(const char * fmt, ...) {
     fprintf(stderr, "\n");
     va_end(args);
 }
-
-// -----------------------------------------------------------------------------
-// Bucket identification from tensor name
-// -----------------------------------------------------------------------------
 
 static ggml_moe_bucket bucket_from_name(const char * name) {
     if (!name) return GGML_MOE_BUCKET_INVALID;
@@ -76,12 +112,32 @@ static ggml_moe_bucket bucket_from_name(const char * name) {
 
 static int layer_from_name(const char * name) {
     if (!name) return -1;
-    // Pattern: "blk.<N>.ffn_..." — sscanf returns 1 on success
     int layer = -1;
     if (sscanf(name, "blk.%d.", &layer) == 1 && layer >= 0) {
         return layer;
     }
     return -1;
+}
+
+static inline int cell_idx(int layer_idx, ggml_moe_bucket bucket) {
+    return layer_idx * GGML_MOE_BUCKET_COUNT + (int) bucket;
+}
+
+// LFRU evictee: smallest freq, tiebreak on smallest last_tick.
+// Newly-populated slots start with freq=1 + last_tick = ++cache->tick,
+// so they're not immediately evicted in a freq=1 tie.
+static int lfru_pick_evictee(const ggml_moe_cache::cell & c) {
+    int      best  = -1;
+    uint32_t best_f = UINT32_MAX;
+    uint64_t best_t = UINT64_MAX;
+    for (int s = 0; s < c.n_slots; ++s) {
+        if (c.freq[s] < best_f || (c.freq[s] == best_f && c.last_tick[s] < best_t)) {
+            best_f = c.freq[s];
+            best_t = c.last_tick[s];
+            best   = s;
+        }
+    }
+    return best;
 }
 
 // -----------------------------------------------------------------------------
@@ -103,113 +159,76 @@ ggml_moe_cache_t ggml_moe_cache_init(
     c->slots_per_bucket = slots_per_bucket;
     c->max_bytes_cap    = max_bytes;
 
-    c->force_noop      = getenv("GGML_MOE_CACHE_FORCE_NOOP")      != nullptr;
-    c->force_skip_even = getenv("GGML_MOE_CACHE_FORCE_SKIP_EVEN") != nullptr;
-
-    // Initialize per-bucket slot maps & evict counters; buffer alloc deferred to bind_bucket.
-    for (int b = 0; b < GGML_MOE_BUCKET_COUNT; b++) {
-        c->buckets[b].slot_map.assign(n_layers * slots_per_bucket, -1);
-        c->buckets[b].next_evict.assign(n_layers, 0);
+    // Long-lived ggml_context for tensor wrappers. We allocate space for
+    // 2 wrappers per cell (slot pool + slot_ids) plus headroom. Each
+    // ggml_tensor is ~400 bytes; 4 buckets * n_layers * 2 * 400 ≈ 128 KiB
+    // for a 40-layer model. Round up generously.
+    const size_t ctx_mem_size = 512 * 1024;
+    c->tensor_ctx_mem = malloc(ctx_mem_size);
+    if (!c->tensor_ctx_mem) {
+        delete c;
+        return nullptr;
+    }
+    ggml_init_params ip = {
+        /*.mem_size   =*/ ctx_mem_size,
+        /*.mem_buffer =*/ c->tensor_ctx_mem,
+        /*.no_alloc   =*/ true,
+    };
+    c->tensor_ctx = ggml_init(ip);
+    if (!c->tensor_ctx) {
+        free(c->tensor_ctx_mem);
+        delete c;
+        return nullptr;
     }
 
-    if (c->force_noop) {
-        moe_cache_log("GGML_MOE_CACHE_FORCE_NOOP set; cache will return miss on every lookup (diagnostic)");
-    }
-    if (c->force_skip_even) {
-        moe_cache_log("GGML_MOE_CACHE_FORCE_SKIP_EVEN set; faking hits on even expert_ids (output GARBAGE; diagnostic only)");
-    }
+    c->cells.resize((size_t) n_layers * GGML_MOE_BUCKET_COUNT);
+
+    moe_cache_log("v2 init: %d layers x %d buckets, %d slots/bucket (LFRU eviction); buffers allocated lazily per (layer, bucket)",
+                  n_layers, (int) GGML_MOE_BUCKET_COUNT, slots_per_bucket);
 
     return c;
 }
 
 void ggml_moe_cache_free(ggml_moe_cache_t c) {
     if (!c) return;
-    if (c->buf) {
-        ggml_backend_buffer_free(c->buf);
-        c->buf = nullptr;
+
+    // Final stats.
+    if (c->stats.total_lookups > 0) {
+        const double hit_rate = (double) c->stats.total_hits / (double) c->stats.total_lookups;
+        const double saved_mib = c->stats.total_bytes_saved / (1024.0 * 1024.0);
+        int bound_cells = 0;
+        for (const auto & cell : c->cells) if (cell.bound) ++bound_cells;
+        moe_cache_log("final: %lld lookups, %lld hits (%.1f%%), %lld misses; %.1f MiB H2D saved; %d / %d cells bound; %.2f MiB allocated",
+                      (long long) c->stats.total_lookups,
+                      (long long) c->stats.total_hits,
+                      hit_rate * 100.0,
+                      (long long) c->stats.total_misses,
+                      saved_mib,
+                      bound_cells, (int) c->cells.size(),
+                      c->total_bytes / (1024.0 * 1024.0));
+    } else {
+        moe_cache_log("final: cache code path never executed");
     }
+
+    for (auto & cell : c->cells) {
+        if (cell.pool_buf) ggml_backend_buffer_free(cell.pool_buf);
+        if (cell.ids_buf)  ggml_backend_buffer_free(cell.ids_buf);
+    }
+    if (c->tensor_ctx)     ggml_free(c->tensor_ctx);
+    if (c->tensor_ctx_mem) free(c->tensor_ctx_mem);
     delete c;
 }
 
 // -----------------------------------------------------------------------------
-// Buffer allocation — eager, once we know expert_size_bytes from the first bound bucket.
-// All buckets share a single backing buffer; offsets are computed from layout.
-// -----------------------------------------------------------------------------
-
-static bool ensure_buffer_allocated(ggml_moe_cache * c, size_t expert_size_bytes) {
-    if (c->buf) return true;
-
-    // Pad each slot to 512 alignment for MMQ kernel safety (matches existing copy_experts padding).
-    const size_t slot_stride = ((expert_size_bytes + 511) / 512) * 512 + 512;
-    const size_t per_layer   = c->slots_per_bucket * slot_stride;
-    const size_t per_bucket  = c->n_layers * per_layer;
-    const size_t total       = GGML_MOE_BUCKET_COUNT * per_bucket;
-
-    if (c->max_bytes_cap > 0 && total > c->max_bytes_cap) {
-        moe_cache_log("buffer would need %zu bytes, exceeds cap of %zu — failing init",
-                      total, c->max_bytes_cap);
-        return false;
-    }
-
-    auto * buft = ggml_backend_get_default_buffer_type(c->backend);
-    c->buf = ggml_backend_buft_alloc_buffer(buft, total);
-    if (!c->buf) {
-        moe_cache_log("failed to allocate %zu bytes on backend", total);
-        return false;
-    }
-    c->base = (uint8_t *) ggml_backend_buffer_get_base(c->buf);
-    c->total_bytes = total;
-
-    // Lay out bucket base offsets within the single buffer
-    for (int b = 0; b < GGML_MOE_BUCKET_COUNT; b++) {
-        c->buckets[b].buf_offset_base = b * per_bucket;
-        c->buckets[b].per_layer_bytes = per_layer;
-        // expert_size_bytes filled later in bind_bucket for this bucket
-    }
-
-    moe_cache_log("allocated cache buffer: %.2f GB (%d layers x %d buckets x %d slots x ~%.1f MB/slot)",
-                  total / (1024.0 * 1024.0 * 1024.0),
-                  c->n_layers, GGML_MOE_BUCKET_COUNT, c->slots_per_bucket,
-                  slot_stride / (1024.0 * 1024.0));
-    return true;
-}
-
-bool ggml_moe_cache_bind_bucket(
-        ggml_moe_cache_t      c,
-        int                    layer_idx,
-        ggml_moe_bucket       bucket,
-        size_t                 expert_size_bytes,
-        int64_t                /*n_experts_total*/) {
-    if (!c || bucket < 0 || bucket >= GGML_MOE_BUCKET_COUNT) return false;
-    if (layer_idx < 0 || layer_idx >= c->n_layers)            return false;
-    if (expert_size_bytes == 0)                                return false;
-
-    if (!ensure_buffer_allocated(c, expert_size_bytes)) {
-        return false;
-    }
-
-    auto & bs = c->buckets[bucket];
-    if (!bs.bound) {
-        bs.expert_size_bytes = expert_size_bytes;
-        bs.bound = true;
-    } else if (bs.expert_size_bytes != expert_size_bytes) {
-        moe_cache_log("expert size mismatch for bucket %d: bound=%zu, got=%zu",
-                      (int) bucket, bs.expert_size_bytes, expert_size_bytes);
-        return false;
-    }
-    return true;
-}
-
-// -----------------------------------------------------------------------------
-// Tensor identification
+// Identification
 // -----------------------------------------------------------------------------
 
 bool ggml_moe_cache_identify_tensor(
-        ggml_moe_cache_t        c,
+        ggml_moe_cache_t           c,
         const struct ggml_tensor * input,
-        int                       n_layers,
-        int *                     out_layer_idx,
-        ggml_moe_bucket *        out_bucket) {
+        int                        n_layers,
+        int *                      out_layer_idx,
+        ggml_moe_bucket *          out_bucket) {
     if (!c || !input || !out_layer_idx || !out_bucket) return false;
     if (c->slots_per_bucket <= 0)                       return false;
 
@@ -225,112 +244,268 @@ bool ggml_moe_cache_identify_tensor(
 }
 
 // -----------------------------------------------------------------------------
-// Lookup + slot selection — Phase 1: linear scan, round-robin eviction.
-// All callers are inside compute_splits which is single-threaded, so no locking.
+// Lazy allocation: slot pool + slot_ids buffer + tensor wrappers
+// -----------------------------------------------------------------------------
+
+bool ggml_moe_cache_bind_bucket(
+        ggml_moe_cache_t           c,
+        int                        layer_idx,
+        ggml_moe_bucket            bucket,
+        const struct ggml_tensor * weight,
+        int                        top_k,
+        int                        max_n_tokens) {
+    if (!c || !weight || bucket < 0 || bucket >= GGML_MOE_BUCKET_COUNT) return false;
+    if (layer_idx < 0 || layer_idx >= c->n_layers)                       return false;
+    if (top_k <= 0 || max_n_tokens <= 0)                                 return false;
+
+    auto & cell = c->cells[cell_idx(layer_idx, bucket)];
+
+    // Idempotent: subsequent binds re-validate but don't reallocate.
+    const size_t expert_size = ggml_nbytes(weight) / weight->ne[2];
+    if (cell.bound) {
+        if (cell.expert_size != expert_size || cell.n_experts != weight->ne[2]
+            || cell.top_k < top_k || cell.max_n_tokens < max_n_tokens) {
+            moe_cache_log("cell (layer=%d, bucket=%d) shape changed (expert_size %zu->%zu, n_experts %lld->%lld, top_k %d->%d, max_n_tokens %d->%d)",
+                          layer_idx, (int) bucket, cell.expert_size, expert_size,
+                          (long long) cell.n_experts, (long long) weight->ne[2],
+                          cell.top_k, top_k, cell.max_n_tokens, max_n_tokens);
+            return false;
+        }
+        return true;
+    }
+
+    const int64_t n_experts = weight->ne[2];
+    cell.n_experts   = n_experts;
+    cell.n_slots     = std::min<int>(c->slots_per_bucket, (int) n_experts);
+    cell.expert_size = expert_size;
+    cell.slot_stride = ((expert_size + 511) / 512) * 512;   // 512-byte align for MMQ
+    cell.top_k       = top_k;
+    cell.max_n_tokens = max_n_tokens;
+
+    const size_t pool_bytes = (size_t) cell.n_slots * cell.slot_stride;
+    const size_t ids_bytes  = (size_t) top_k * max_n_tokens * sizeof(int32_t);
+
+    if (c->max_bytes_cap > 0 && c->total_bytes + pool_bytes + ids_bytes > c->max_bytes_cap) {
+        moe_cache_log("cell (layer=%d, bucket=%d) alloc would exceed cap (%zu + %zu > %zu)",
+                      layer_idx, (int) bucket, c->total_bytes, pool_bytes + ids_bytes, c->max_bytes_cap);
+        return false;
+    }
+
+    auto * buft = ggml_backend_get_default_buffer_type(c->backend);
+
+    // Allocate the slot pool buffer.
+    cell.pool_buf = ggml_backend_buft_alloc_buffer(buft, pool_bytes);
+    if (!cell.pool_buf) {
+        moe_cache_log("cell (layer=%d, bucket=%d) failed to allocate %zu bytes for slot pool",
+                      layer_idx, (int) bucket, pool_bytes);
+        return false;
+    }
+    cell.pool_base = (uint8_t *) ggml_backend_buffer_get_base(cell.pool_buf);
+
+    // Allocate the slot_ids buffer.
+    cell.ids_buf = ggml_backend_buft_alloc_buffer(buft, ids_bytes);
+    if (!cell.ids_buf) {
+        moe_cache_log("cell (layer=%d, bucket=%d) failed to allocate %zu bytes for slot_ids",
+                      layer_idx, (int) bucket, ids_bytes);
+        ggml_backend_buffer_free(cell.pool_buf);
+        cell.pool_buf = nullptr;
+        return false;
+    }
+    cell.ids_base = (uint8_t *) ggml_backend_buffer_get_base(cell.ids_buf);
+
+    // Build slot pool tensor wrapper: shape [K, N, n_slots] with stride
+    // nb[2] = slot_stride (padded). Manually attach our buffer so
+    // ggml_gallocr leaves it alone.
+    cell.pool_tensor = ggml_new_tensor_3d(
+        c->tensor_ctx, weight->type,
+        weight->ne[0], weight->ne[1], cell.n_slots);
+    if (!cell.pool_tensor) {
+        moe_cache_log("cell (layer=%d, bucket=%d) failed to construct pool tensor wrapper", layer_idx, (int) bucket);
+        ggml_backend_buffer_free(cell.pool_buf); cell.pool_buf = nullptr;
+        ggml_backend_buffer_free(cell.ids_buf);  cell.ids_buf  = nullptr;
+        return false;
+    }
+    cell.pool_tensor->nb[0] = weight->nb[0];
+    cell.pool_tensor->nb[1] = weight->nb[1];
+    cell.pool_tensor->nb[2] = cell.slot_stride;
+    cell.pool_tensor->nb[3] = cell.slot_stride * cell.n_slots;
+    cell.pool_tensor->data   = cell.pool_base;
+    cell.pool_tensor->buffer = cell.pool_buf;
+    snprintf(cell.pool_tensor->name, sizeof(cell.pool_tensor->name),
+             "moe-cache-pool-L%d-B%d", layer_idx, (int) bucket);
+
+    // Build slot_ids tensor wrapper: shape [top_k, max_n_tokens] int32.
+    // ne[1] is rewritten to actual n_tokens in set_ids before each op.
+    cell.ids_tensor = ggml_new_tensor_2d(
+        c->tensor_ctx, GGML_TYPE_I32, top_k, max_n_tokens);
+    if (!cell.ids_tensor) {
+        moe_cache_log("cell (layer=%d, bucket=%d) failed to construct ids tensor wrapper", layer_idx, (int) bucket);
+        ggml_backend_buffer_free(cell.pool_buf); cell.pool_buf = nullptr;
+        ggml_backend_buffer_free(cell.ids_buf);  cell.ids_buf  = nullptr;
+        return false;
+    }
+    cell.ids_tensor->data   = cell.ids_base;
+    cell.ids_tensor->buffer = cell.ids_buf;
+    snprintf(cell.ids_tensor->name, sizeof(cell.ids_tensor->name),
+             "moe-cache-ids-L%d-B%d", layer_idx, (int) bucket);
+
+    cell.slot_to_expert.assign(cell.n_slots, -1);
+    cell.expert_to_slot.reserve((size_t) cell.n_slots);
+    cell.freq.assign(cell.n_slots, 0);
+    cell.last_tick.assign(cell.n_slots, 0);
+    cell.next_unused = 0;
+    cell.bound       = true;
+    c->total_bytes  += pool_bytes + ids_bytes;
+
+    static int n_bound = 0;
+    if (n_bound < 8) {
+        moe_cache_log("cell bound (layer=%d, bucket=%d) expert_size=%zu slot_stride=%zu n_slots=%d top_k=%d max_n_tokens=%d pool=%.2f MiB ids=%zu B",
+                      layer_idx, (int) bucket, cell.expert_size, cell.slot_stride,
+                      cell.n_slots, top_k, max_n_tokens,
+                      pool_bytes / (1024.0 * 1024.0), ids_bytes);
+        ++n_bound;
+    }
+
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// Lookup / select / record
 // -----------------------------------------------------------------------------
 
 int ggml_moe_cache_lookup(
         ggml_moe_cache_t c, int layer_idx, ggml_moe_bucket bucket, int32_t expert_id) {
     if (!c) return -1;
-    auto & bs = c->buckets[bucket];
-    if (!bs.bound) return -1;
+    if (bucket < 0 || bucket >= GGML_MOE_BUCKET_COUNT) return -1;
+    if (layer_idx < 0 || layer_idx >= c->n_layers)     return -1;
 
-    c->stats.total_lookups++;
+    auto & cell = c->cells[cell_idx(layer_idx, bucket)];
+    if (!cell.bound) return -1;
 
-    if (c->force_noop) {
-        c->stats.total_misses++;
+    ++cell.n_lookups;
+    ++c->stats.total_lookups;
+
+    auto it = cell.expert_to_slot.find(expert_id);
+    if (it == cell.expert_to_slot.end()) {
+        ++c->stats.total_misses;
         return -1;
     }
-    if (c->force_skip_even && (expert_id % 2 == 0)) {
-        // Fake a hit on slot 0 of layer 0 — output WILL be garbage, this is timing diagnostic only
-        c->stats.total_hits++;
-        return 0;
-    }
 
-    const int * row = &bs.slot_map[layer_idx * c->slots_per_bucket];
-    for (int s = 0; s < c->slots_per_bucket; s++) {
-        if (row[s] == expert_id) {
-            c->stats.total_hits++;
-            return s;
-        }
-    }
-    c->stats.total_misses++;
-    return -1;
+    const int s = it->second;
+    ++cell.freq[s];
+    cell.last_tick[s] = ++c->tick;
+    ++cell.n_hits;
+    ++c->stats.total_hits;
+    c->stats.total_bytes_saved += (int64_t) cell.expert_size;
+    return s;
 }
 
 int ggml_moe_cache_select_slot_for_miss(
         ggml_moe_cache_t c, int layer_idx, ggml_moe_bucket bucket, int32_t /*expert_id*/) {
     if (!c) return -1;
-    auto & bs = c->buckets[bucket];
-    if (!bs.bound) return -1;
+    if (bucket < 0 || bucket >= GGML_MOE_BUCKET_COUNT) return -1;
+    if (layer_idx < 0 || layer_idx >= c->n_layers)     return -1;
+    auto & cell = c->cells[cell_idx(layer_idx, bucket)];
+    if (!cell.bound || cell.n_slots <= 0) return -1;
 
-    // Phase 1: round-robin per (layer, bucket). Phase 2: LRU.
-    int slot = bs.next_evict[layer_idx];
-    bs.next_evict[layer_idx] = (slot + 1) % c->slots_per_bucket;
-    return slot;
+    // First, use any unused slot.
+    if (cell.next_unused < cell.n_slots) {
+        return cell.next_unused++;
+    }
+    // Otherwise evict LFRU.
+    return lfru_pick_evictee(cell);
 }
 
 void ggml_moe_cache_record_slot(
         ggml_moe_cache_t c, int layer_idx, ggml_moe_bucket bucket, int slot_idx, int32_t expert_id) {
     if (!c) return;
-    if (slot_idx < 0 || slot_idx >= c->slots_per_bucket) return;
-    c->buckets[bucket].slot_map[layer_idx * c->slots_per_bucket + slot_idx] = expert_id;
+    if (bucket < 0 || bucket >= GGML_MOE_BUCKET_COUNT) return;
+    if (layer_idx < 0 || layer_idx >= c->n_layers)     return;
+    auto & cell = c->cells[cell_idx(layer_idx, bucket)];
+    if (!cell.bound || slot_idx < 0 || slot_idx >= cell.n_slots) return;
+
+    // If we're overwriting an existing resident expert, drop its mapping.
+    const int32_t prev = cell.slot_to_expert[slot_idx];
+    if (prev >= 0) {
+        cell.expert_to_slot.erase(prev);
+    }
+    cell.slot_to_expert[slot_idx] = expert_id;
+    cell.expert_to_slot[expert_id] = slot_idx;
+    cell.freq[slot_idx]      = 1;
+    cell.last_tick[slot_idx] = ++c->tick;
+
+    c->stats.total_h2d_bytes += (int64_t) cell.expert_size;
 }
 
 // -----------------------------------------------------------------------------
-// Slot data pointer — used by scheduler to issue copies to/from this address.
-// Layout: buf_offset_base + layer_idx * per_layer_bytes + slot_idx * slot_stride
-// where slot_stride is implicit in per_layer_bytes / slots_per_bucket.
+// Slot data + tensor accessors
 // -----------------------------------------------------------------------------
 
 void * ggml_moe_cache_slot_data(
         ggml_moe_cache_t c, int layer_idx, ggml_moe_bucket bucket, int slot_idx) {
-    if (!c || !c->base) return nullptr;
-    auto & bs = c->buckets[bucket];
-    if (!bs.bound) return nullptr;
+    if (!c) return nullptr;
+    if (bucket < 0 || bucket >= GGML_MOE_BUCKET_COUNT) return nullptr;
+    if (layer_idx < 0 || layer_idx >= c->n_layers)     return nullptr;
+    auto & cell = c->cells[cell_idx(layer_idx, bucket)];
+    if (!cell.bound || slot_idx < 0 || slot_idx >= cell.n_slots) return nullptr;
+    return cell.pool_base + (size_t) slot_idx * cell.slot_stride;
+}
 
-    const size_t slot_stride = bs.per_layer_bytes / c->slots_per_bucket;
-    const size_t offset = bs.buf_offset_base
-                        + (size_t) layer_idx * bs.per_layer_bytes
-                        + (size_t) slot_idx  * slot_stride;
-    return c->base + offset;
+ggml_tensor * ggml_moe_cache_pool_tensor(
+        ggml_moe_cache_t c, int layer_idx, ggml_moe_bucket bucket) {
+    if (!c) return nullptr;
+    if (bucket < 0 || bucket >= GGML_MOE_BUCKET_COUNT) return nullptr;
+    if (layer_idx < 0 || layer_idx >= c->n_layers)     return nullptr;
+    auto & cell = c->cells[cell_idx(layer_idx, bucket)];
+    return cell.bound ? cell.pool_tensor : nullptr;
+}
+
+ggml_tensor * ggml_moe_cache_ids_tensor(
+        ggml_moe_cache_t c, int layer_idx, ggml_moe_bucket bucket) {
+    if (!c) return nullptr;
+    if (bucket < 0 || bucket >= GGML_MOE_BUCKET_COUNT) return nullptr;
+    if (layer_idx < 0 || layer_idx >= c->n_layers)     return nullptr;
+    auto & cell = c->cells[cell_idx(layer_idx, bucket)];
+    return cell.bound ? cell.ids_tensor : nullptr;
+}
+
+bool ggml_moe_cache_set_ids(
+        ggml_moe_cache_t c, int layer_idx, ggml_moe_bucket bucket,
+        ggml_backend_t backend, const int32_t * slot_ids_host, int top_k, int n_tokens) {
+    if (!c || !backend || !slot_ids_host || top_k <= 0 || n_tokens <= 0) return false;
+    if (bucket < 0 || bucket >= GGML_MOE_BUCKET_COUNT) return false;
+    if (layer_idx < 0 || layer_idx >= c->n_layers)     return false;
+    auto & cell = c->cells[cell_idx(layer_idx, bucket)];
+    if (!cell.bound || !cell.ids_tensor) return false;
+    if (top_k > cell.top_k || n_tokens > cell.max_n_tokens) {
+        moe_cache_log("set_ids: out-of-bounds (layer=%d bucket=%d top_k=%d/%d n_tokens=%d/%d)",
+                      layer_idx, (int) bucket, top_k, cell.top_k, n_tokens, cell.max_n_tokens);
+        return false;
+    }
+
+    // Update the tensor's effective shape so the kernel reads only the
+    // relevant portion. nb[0..1] are I32 standard (sizeof(int32)=4).
+    cell.ids_tensor->ne[0] = top_k;
+    cell.ids_tensor->ne[1] = n_tokens;
+    cell.ids_tensor->ne[2] = 1;
+    cell.ids_tensor->ne[3] = 1;
+    cell.ids_tensor->nb[0] = sizeof(int32_t);
+    cell.ids_tensor->nb[1] = (size_t) top_k * sizeof(int32_t);
+    cell.ids_tensor->nb[2] = cell.ids_tensor->nb[1] * n_tokens;
+    cell.ids_tensor->nb[3] = cell.ids_tensor->nb[2];
+
+    const size_t bytes = (size_t) top_k * (size_t) n_tokens * sizeof(int32_t);
+    ggml_backend_tensor_set_async(backend, cell.ids_tensor, slot_ids_host, 0, bytes);
+    return true;
 }
 
 // -----------------------------------------------------------------------------
-// D2D copy primitive — actual CUDA call lives in ggml-cuda.cu so ggml-base
-// doesn't need to include cuda_runtime.h. When CUDA isn't built, the extern
-// symbol is provided as a weak no-op below; non-CUDA returns false and the
-// scheduler falls back to the existing contiguous-batch H2D path.
+// Stats / introspection
 // -----------------------------------------------------------------------------
-
-extern "C" {
-// Provided by ggml-cuda.cu when GGML_USE_CUDA is set; weak no-op otherwise.
-bool ggml_cuda_moe_cache_d2d_copy_async(
-    ggml_backend_t backend, void * dst, const void * src, size_t size);
-}
-
-#ifndef GGML_USE_CUDA
-// Weak fallback when CUDA isn't built — keeps ggml-base linking when ggml-cuda
-// isn't part of the build.
-extern "C" __attribute__((weak)) bool ggml_cuda_moe_cache_d2d_copy_async(
-        ggml_backend_t /*backend*/, void * /*dst*/, const void * /*src*/, size_t /*size*/) {
-    return false;
-}
-#endif
-
-bool ggml_moe_cache_copy_d2d_async(
-        ggml_backend_t backend, void * dst, const void * src, size_t size) {
-    if (!ggml_cuda_moe_cache_d2d_copy_async) return false; // weak symbol may be null
-    return ggml_cuda_moe_cache_d2d_copy_async(backend, dst, src, size);
-}
 
 int ggml_moe_cache_n_layers(ggml_moe_cache_t c) {
     return c ? c->n_layers : 0;
 }
-
-// -----------------------------------------------------------------------------
-// Stats accessors
-// -----------------------------------------------------------------------------
 
 size_t ggml_moe_cache_total_bytes(ggml_moe_cache_t c) {
     return c ? c->total_bytes : 0;
