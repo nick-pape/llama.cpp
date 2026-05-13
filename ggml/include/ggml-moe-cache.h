@@ -194,18 +194,6 @@ void ggml_moe_cache_release_overflow_scratches(
     ggml_moe_cache_t        cache,
     ggml_backend_t          backend);
 
-// H2D into a scratch buffer obtained from acquire_overflow_scratch.
-// Bypasses ggml_backend_tensor_set_async's tensor->buffer requirement
-// because cudaMallocAsync pointers don't have a wrapping
-// ggml_backend_buffer. Stream-ordered with the kernel that will read
-// the scratch. Returns false on non-CUDA backend or failure.
-bool ggml_moe_cache_scratch_h2d_async(
-    ggml_moe_cache_t        cache,
-    ggml_backend_t          backend,
-    void *                  dst_dev_ptr,
-    const void *            src_host_ptr,
-    size_t                  size);
-
 // Number of layers the cache was sized for.
 int ggml_moe_cache_n_layers(ggml_moe_cache_t cache);
 

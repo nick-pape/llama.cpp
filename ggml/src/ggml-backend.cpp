@@ -1763,14 +1763,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     if (use_moe_cache && moe_overflow) {
                         moe_handled = true;
                         // Overflow path: this op uses more unique experts
-                        // than the pool can hold. Acquire a per-op scratch
-                        // buffer (cudaMallocAsync, full expert-tensor size),
-                        // patch node->src[0] to it, run copy_experts to fill
-                        // it from host. Keep src[2] as the ORIGINAL ids
-                        // (resolve via the cache if a prior call patched it).
-                        // Cache slot pool state is NOT touched — this op is
-                        // a one-off; subsequent non-overflow ops still use
-                        // the warm pool.
+                        // than the pool can hold. Acquire a shared scratch
+                        // buffer (full expert-tensor size, real backend
+                        // buffer), patch node->src[0] to it, H2D the used
+                        // experts from host. Keep src[2] as the ORIGINAL
+                        // ids (resolve via the cache if a prior call
+                        // patched it). Cache slot pool state is NOT
+                        // touched — this op is a one-off; subsequent
+                        // non-overflow ops still use the warm pool.
                         ggml_tensor * scratch = ggml_moe_cache_acquire_overflow_scratch(
                             moe_cache, split_backend, moe_layer_idx, moe_bucket, input);
                         if (scratch) {
@@ -1791,13 +1791,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 const size_t sz   = (size_t)(last_id - first_id + 1) * expert_size;
                                 const size_t pad  = std::min<size_t>(expert_size, 512);
                                 const size_t pad_end = last_id < n_expert - 1 ? pad : 0;
-                                // scratch->buffer is NULL (cudaMallocAsync'd),
-                                // so use the cache's raw-H2D helper instead
-                                // of ggml_backend_tensor_set_async.
-                                ggml_moe_cache_scratch_h2d_async(moe_cache, split_backend,
-                                    (uint8_t *) scratch->data + off,
+                                ggml_backend_tensor_set_async(split_backend,
+                                    scratch,
                                     (const uint8_t *) input->data + off,
-                                    sz + pad_end);
+                                    off, sz + pad_end);
                             };
                             for (++id; id < n_expert; ++id) {
                                 if (!ggml_bitset_get(used_ids.data(), id)) continue;
@@ -1945,13 +1942,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
-            }
-            // Release any per-op overflow scratches acquired during this
-            // split's prep loop. cudaFreeAsync is stream-ordered, so the
-            // frees wait for the kernels to finish reading the scratch.
-            if (sched->moe_cache) {
-                ggml_moe_cache_release_overflow_scratches(
-                    (ggml_moe_cache_t) sched->moe_cache, split_backend);
             }
         } else {
             // similar to ggml_backend_compare_graph_backend
