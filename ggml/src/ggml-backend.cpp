@@ -1707,6 +1707,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             use_moe_cache = false;
                         }
                     }
+                    // DEBUG: forced bypass to isolate perf regression
+                    if (getenv("MOE_CACHE_FORCE_BYPASS")) use_moe_cache = false;
 
                     if (use_moe_cache) {
                         // Walk used experts; on miss, pick a slot and H2D
