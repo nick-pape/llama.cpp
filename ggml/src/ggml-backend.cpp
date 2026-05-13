@@ -1383,20 +1383,21 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                                 if (ggml_moe_cache_bind_bucket(cache, layer_idx, bucket,
                                         src, top_k, max_n_tokens)) {
                                     ggml_tensor * pool = ggml_moe_cache_pool_tensor(cache, layer_idx, bucket);
-                                    // Useful-slot floor: empirically the cache
-                                    // costs more than it saves below ~3*top_k
-                                    // slots. Single-op miss-rate dominates,
-                                    // cache mechanics overhead doesn't amortize.
-                                    // At n_slots < N*top_k we leave the original
-                                    // copy_experts path in place (= cache=0
-                                    // baseline t/s) — substitution is skipped,
-                                    // so node->src[0] stays at input_cpy and
-                                    // the cache hit/miss code never executes.
-                                    // Override with MOE_CACHE_MIN_USEFUL_TOPK.
+                                    // Useful-slot floor: empirically (fine
+                                    // sweep, Qwen3.6-A3B-MXFP4) the cache
+                                    // ties baseline at n_slots == 4*top_k
+                                    // (= 32 for top_k=8) and HURTS below it
+                                    // (cache=24 lands 12% below baseline,
+                                    // cache=16 by 24%). At n_slots <
+                                    // 4*top_k we skip substitution; the
+                                    // standard copy_experts path runs and
+                                    // delivers cache=0 baseline. Override
+                                    // with env MOE_CACHE_MIN_USEFUL_TOPK
+                                    // (e.g. =1 to force cache active).
                                     static int min_useful_topk = -1;
                                     if (min_useful_topk < 0) {
                                         const char * e = getenv("MOE_CACHE_MIN_USEFUL_TOPK");
-                                        min_useful_topk = (e && *e) ? atoi(e) : 3;
+                                        min_useful_topk = (e && *e) ? atoi(e) : 4;
                                         if (min_useful_topk < 1) min_useful_topk = 1;
                                     }
                                     const int top_k_local = (int) node->src[2]->ne[0];
@@ -1745,7 +1746,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             &moe_layer_idx, &moe_bucket) &&
                         ggml_moe_cache_bind_bucket(moe_cache, moe_layer_idx, moe_bucket,
                             input, (int) op_top_k, ids_max_n_tokens)) {
-                        use_moe_cache = true;
+                        // Substitution may have been skipped at split_graph
+                        // (e.g. by the small-cache-floor gate). In that case
+                        // node->src[0] points to the standard input_cpy, and
+                        // entering the cache hit/miss path would patch src[2]
+                        // to slot indices while the kernel still reads from
+                        // input_cpy's expert layout — producing garbage.
+                        // Only activate cache when substitution actually
+                        // landed (i.e. node->src[0] is the cache's pool tensor).
+                        ggml_tensor * pool_check = ggml_moe_cache_pool_tensor(
+                            moe_cache, moe_layer_idx, moe_bucket);
+                        if (pool_check && node->src[0] == pool_check) {
+                            use_moe_cache = true;
+                        }
                     }
 
                     // Detect prefill overflow: if this op uses more unique
