@@ -1884,32 +1884,66 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         prof.n_hits   += local_hits;
                         prof.n_misses += (int64_t) miss_slot_pairs.size();
 
-                        // Step 2: H2D misses in contiguous-id+contiguous-slot
-                        // batches. With round-robin slot assignment, miss IDs
-                        // in ascending order get contiguous slot indices, so
-                        // many batches collapse to one H2D.
+                        // Step 2: H2D misses via the pinned staging path.
+                        // Pre-staging into cache-owned pinned host memory
+                        // and issuing cudaMemcpyAsync from pinned avoids
+                        // CUDA's implicit pageable->pinned staging copy
+                        // (which blocked the host for ~99us per miss in
+                        // the original profile).
                         ggml_tensor * pool_h2d = ggml_moe_cache_pool_tensor(
                             moe_cache, moe_layer_idx, moe_bucket);
                         const size_t slot_stride = pool_h2d ? pool_h2d->nb[2] : 0;
+                        bool staged_ok = false;
                         int local_batches = 0;
-                        for (size_t i = 0; i < miss_slot_pairs.size(); ) {
-                            const int32_t first_id   = miss_slot_pairs[i].first;
-                            const int     first_slot = miss_slot_pairs[i].second;
-                            size_t j2 = i + 1;
-                            while (j2 < miss_slot_pairs.size() &&
-                                   miss_slot_pairs[j2].first  == miss_slot_pairs[j2 - 1].first  + 1 &&
-                                   miss_slot_pairs[j2].second == miss_slot_pairs[j2 - 1].second + 1) {
-                                ++j2;
+                        if (!miss_slot_pairs.empty() && slot_stride > 0) {
+                            const size_t need = miss_slot_pairs.size() * slot_stride;
+                            if (ggml_moe_cache_ensure_pinned(moe_cache, split_backend, need)) {
+                                std::vector<int32_t> mids; mids.reserve(miss_slot_pairs.size());
+                                std::vector<int32_t> msl;  msl.reserve(miss_slot_pairs.size());
+                                for (auto & p : miss_slot_pairs) {
+                                    mids.push_back(p.first);
+                                    msl.push_back(p.second);
+                                }
+                                staged_ok = ggml_moe_cache_stage_and_h2d(
+                                    moe_cache, split_backend,
+                                    moe_layer_idx, moe_bucket,
+                                    input->data, expert_size, slot_stride,
+                                    mids.data(), msl.data(), (int) mids.size());
+                                // n_miss_batches counts the number of
+                                // distinct slot-contiguous runs (1-2
+                                // typical with RR + cursor wrap).
+                                if (staged_ok) {
+                                    for (size_t i = 0; i < miss_slot_pairs.size(); ) {
+                                        size_t j = i + 1;
+                                        while (j < miss_slot_pairs.size() &&
+                                               miss_slot_pairs[j].second == miss_slot_pairs[j - 1].second + 1) ++j;
+                                        ++local_batches;
+                                        i = j;
+                                    }
+                                }
                             }
-                            const size_t run_len = j2 - i;
-                            const void * src = (const uint8_t *) input->data
-                                             + (size_t) first_id * expert_size;
-                            ggml_backend_tensor_set_async(split_backend,
-                                pool_h2d, src,
-                                (size_t) first_slot * slot_stride,
-                                run_len * expert_size);
-                            i = j2;
-                            ++local_batches;
+                        }
+                        if (!staged_ok && !miss_slot_pairs.empty()) {
+                            // Fallback: original tensor_set_async loop.
+                            for (size_t i = 0; i < miss_slot_pairs.size(); ) {
+                                const int32_t first_id   = miss_slot_pairs[i].first;
+                                const int     first_slot = miss_slot_pairs[i].second;
+                                size_t j2 = i + 1;
+                                while (j2 < miss_slot_pairs.size() &&
+                                       miss_slot_pairs[j2].first  == miss_slot_pairs[j2 - 1].first  + 1 &&
+                                       miss_slot_pairs[j2].second == miss_slot_pairs[j2 - 1].second + 1) {
+                                    ++j2;
+                                }
+                                const size_t run_len = j2 - i;
+                                const void * src = (const uint8_t *) input->data
+                                                 + (size_t) first_id * expert_size;
+                                ggml_backend_tensor_set_async(split_backend,
+                                    pool_h2d, src,
+                                    (size_t) first_slot * slot_stride,
+                                    run_len * expert_size);
+                                i = j2;
+                                ++local_batches;
+                            }
                         }
                         auto t_c = clk::now();
                         prof.t_miss_h2d_us += std::chrono::duration<double, std::micro>(t_c - t_b).count();

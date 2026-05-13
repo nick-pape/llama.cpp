@@ -4945,6 +4945,26 @@ extern "C" bool ggml_cuda_moe_cache_h2d_async(
     return err == cudaSuccess;
 }
 
+// Pinned (page-locked) host memory allocation. Lets cudaMemcpyAsync
+// from this buffer be TRULY asynchronous: no implicit pageable->pinned
+// staging by the CUDA runtime, the host returns to the caller as soon
+// as the copy is queued on the stream. Used by the MoE cache to stage
+// expert weight bytes for miss H2Ds, eliminating the per-call
+// ~60us synchronous staging cost we measured against pageable model
+// weights.
+extern "C" void * ggml_cuda_moe_cache_pinned_alloc(ggml_backend_t backend, size_t size) {
+    (void) backend;
+    void * p = nullptr;
+    cudaError_t err = cudaHostAlloc(&p, size, cudaHostAllocDefault);
+    return err == cudaSuccess ? p : nullptr;
+}
+
+extern "C" void ggml_cuda_moe_cache_pinned_free(ggml_backend_t backend, void * ptr) {
+    (void) backend;
+    if (!ptr) return;
+    cudaFreeHost(ptr);
+}
+
 static const char * ggml_backend_cuda_device_get_name(ggml_backend_dev_t dev) {
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
     return ctx->name.c_str();
@@ -5686,6 +5706,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_cuda_moe_cache_h2d_async") == 0) {
         return (void *)ggml_cuda_moe_cache_h2d_async;
+    }
+    if (strcmp(name, "ggml_cuda_moe_cache_pinned_alloc") == 0) {
+        return (void *)ggml_cuda_moe_cache_pinned_alloc;
+    }
+    if (strcmp(name, "ggml_cuda_moe_cache_pinned_free") == 0) {
+        return (void *)ggml_cuda_moe_cache_pinned_free;
     }
     return nullptr;
 }

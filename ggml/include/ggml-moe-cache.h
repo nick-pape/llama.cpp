@@ -203,6 +203,37 @@ void ggml_moe_cache_release_overflow_scratches(
     ggml_moe_cache_t        cache,
     ggml_backend_t          backend);
 
+// Stage misses for one MoE op through the cache's pinned host buffer
+// and issue them as a single (or split-on-wrap) async H2D. `src_base`
+// is the host weight tensor's data; `expert_size` and `slot_stride`
+// match the cell's geometry. `miss_pairs` is an array of
+// (expert_id, slot_idx) pairs with at most `n_misses` entries; the
+// pairs MUST already be in the order in which their slot_idx values
+// run (consecutive slot ranges produce single H2Ds). Returns false if
+// the pinned buffer hasn't been allocated (call ggml_moe_cache_ensure_pinned
+// first) or on backend error.
+bool ggml_moe_cache_stage_and_h2d(
+    ggml_moe_cache_t        cache,
+    ggml_backend_t          backend,
+    int                     layer_idx,
+    enum ggml_moe_bucket    bucket,
+    const void *            src_base,
+    size_t                  expert_size,
+    size_t                  slot_stride,
+    const int32_t *         miss_ids,
+    const int32_t *         miss_slots,
+    int                     n_misses);
+
+// Allocate or grow the cache-owned pinned host staging buffer to at
+// least `bytes`. Idempotent; reuses the existing buffer if it's
+// already large enough. Returns false on backend without pinned-alloc
+// support or on allocation failure (in which case the caller should
+// fall back to the unstaged path).
+bool ggml_moe_cache_ensure_pinned(
+    ggml_moe_cache_t        cache,
+    ggml_backend_t          backend,
+    size_t                  bytes);
+
 // Number of layers the cache was sized for.
 int ggml_moe_cache_n_layers(ggml_moe_cache_t cache);
 

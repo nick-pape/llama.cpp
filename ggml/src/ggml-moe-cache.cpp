@@ -118,6 +118,14 @@ struct ggml_moe_cache {
     size_t                scratch_capacity  = 0;
     uint64_t              total_overflow_ops = 0;
 
+    // Pinned host staging buffer for miss H2Ds. Allocated lazily on
+    // first ensure_pinned call. Eliminates the implicit pageable->pinned
+    // staging cost CUDA pays inside cudaMemcpyAsync from pageable host
+    // memory (~60us per call against the model's expert weights at
+    // ~600 KB each).
+    void *                pinned_host       = nullptr;
+    size_t                pinned_capacity   = 0;
+
     // Aggregate stats.
     ggml_moe_cache_stats stats{};
 };
@@ -244,6 +252,16 @@ void ggml_moe_cache_free(ggml_moe_cache_t c) {
         if (cell.ids_buf)  ggml_backend_buffer_free(cell.ids_buf);
     }
     if (c->scratch_buf)    ggml_backend_buffer_free(c->scratch_buf);
+    if (c->pinned_host && c->backend) {
+        auto * dev = ggml_backend_get_device(c->backend);
+        auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (reg) {
+            typedef void (*pinned_free_t)(ggml_backend_t, void *);
+            auto fn = (pinned_free_t) ggml_backend_reg_get_proc_address(
+                reg, "ggml_cuda_moe_cache_pinned_free");
+            if (fn) fn(c->backend, c->pinned_host);
+        }
+    }
     if (c->tensor_ctx)     ggml_free(c->tensor_ctx);
     if (c->tensor_ctx_mem) free(c->tensor_ctx_mem);
     delete c;
@@ -696,4 +714,127 @@ void ggml_moe_cache_get_stats(ggml_moe_cache_t c, ggml_moe_cache_stats * out) {
 void ggml_moe_cache_reset_stats(ggml_moe_cache_t c) {
     if (!c) return;
     c->stats = {};
+}
+
+// -----------------------------------------------------------------------------
+// Pinned-staging miss-H2D path
+// -----------------------------------------------------------------------------
+
+typedef void * (*moe_cuda_pinned_alloc_fn_t)(ggml_backend_t, size_t);
+typedef bool   (*moe_cuda_h2d_async_fn_t)(ggml_backend_t, void *, const void *, size_t);
+
+static moe_cuda_pinned_alloc_fn_t resolve_pinned_alloc(ggml_backend_t backend) {
+    static moe_cuda_pinned_alloc_fn_t cached = nullptr;
+    static bool looked_up = false;
+    if (looked_up) return cached;
+    auto * dev = ggml_backend_get_device(backend);
+    auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (reg) cached = (moe_cuda_pinned_alloc_fn_t) ggml_backend_reg_get_proc_address(
+        reg, "ggml_cuda_moe_cache_pinned_alloc");
+    looked_up = true;
+    return cached;
+}
+
+static moe_cuda_h2d_async_fn_t resolve_h2d_async(ggml_backend_t backend) {
+    static moe_cuda_h2d_async_fn_t cached = nullptr;
+    static bool looked_up = false;
+    if (looked_up) return cached;
+    auto * dev = ggml_backend_get_device(backend);
+    auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (reg) cached = (moe_cuda_h2d_async_fn_t) ggml_backend_reg_get_proc_address(
+        reg, "ggml_cuda_moe_cache_h2d_async");
+    looked_up = true;
+    return cached;
+}
+
+bool ggml_moe_cache_ensure_pinned(
+        ggml_moe_cache_t c, ggml_backend_t backend, size_t bytes) {
+    if (!c || !backend || bytes == 0) return false;
+    if (c->pinned_host && c->pinned_capacity >= bytes) return true;
+
+    auto alloc_fn = resolve_pinned_alloc(backend);
+    if (!alloc_fn) return false;
+
+    // Grow geometrically with a 1 MiB floor to amortize reallocs.
+    size_t want = std::max<size_t>(1 << 20, bytes);
+    if (c->pinned_capacity > 0) want = std::max(want, c->pinned_capacity * 2);
+
+    // Free old, allocate new (we don't realloc pinned memory in place).
+    if (c->pinned_host) {
+        typedef void (*pinned_free_t)(ggml_backend_t, void *);
+        auto * dev = ggml_backend_get_device(backend);
+        auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (reg) {
+            auto free_fn = (pinned_free_t) ggml_backend_reg_get_proc_address(
+                reg, "ggml_cuda_moe_cache_pinned_free");
+            if (free_fn) free_fn(backend, c->pinned_host);
+        }
+        c->pinned_host = nullptr;
+        c->pinned_capacity = 0;
+    }
+
+    void * p = alloc_fn(backend, want);
+    if (!p) {
+        moe_cache_log("ensure_pinned: cudaHostAlloc(%zu) failed", want);
+        return false;
+    }
+    c->pinned_host = p;
+    c->pinned_capacity = want;
+    return true;
+}
+
+bool ggml_moe_cache_stage_and_h2d(
+        ggml_moe_cache_t c, ggml_backend_t backend,
+        int layer_idx, ggml_moe_bucket bucket,
+        const void * src_base, size_t expert_size, size_t slot_stride,
+        const int32_t * miss_ids, const int32_t * miss_slots, int n_misses) {
+    (void) layer_idx; (void) bucket;
+    if (!c || !backend || !src_base || n_misses <= 0) return false;
+    if (!miss_ids || !miss_slots || slot_stride < expert_size) return false;
+    if (!c->pinned_host || c->pinned_capacity == 0) return false;
+
+    auto h2d_fn = resolve_h2d_async(backend);
+    if (!h2d_fn) return false;
+
+    auto * pool_h2d = ggml_moe_cache_pool_tensor(c, layer_idx, bucket);
+    if (!pool_h2d || !pool_h2d->data) return false;
+    uint8_t * pool_base = (uint8_t *) pool_h2d->data;
+
+    // Stage all misses contiguously into pinned host buffer in iteration
+    // order. The destination device slots are processed in consecutive
+    // runs (split at slot-index discontinuities — typically the RR
+    // cursor wrap, so at most 2 runs per op).
+    const size_t need = (size_t) n_misses * slot_stride;
+    if (need > c->pinned_capacity) {
+        moe_cache_log("stage_and_h2d: pinned buffer too small (need %zu, have %zu)",
+                      need, c->pinned_capacity);
+        return false;
+    }
+    uint8_t * stage = (uint8_t *) c->pinned_host;
+    for (int i = 0; i < n_misses; ++i) {
+        const int32_t id = miss_ids[i];
+        memcpy(stage + (size_t) i * slot_stride,
+               (const uint8_t *) src_base + (size_t) id * expert_size,
+               expert_size);
+        // (We don't zero the slot_stride-expert_size tail; the MMQ padding
+        // is provided by the +512 we allocated past the last slot in the
+        // pool buffer, so a tail read past the last slot is still safe.)
+    }
+
+    // Walk consecutive-slot runs and issue one H2D per run.
+    int i = 0;
+    while (i < n_misses) {
+        int j = i + 1;
+        while (j < n_misses && miss_slots[j] == miss_slots[j - 1] + 1) ++j;
+        const size_t run_len = (size_t)(j - i);
+        const int    base_slot = miss_slots[i];
+        if (!h2d_fn(backend,
+                    pool_base + (size_t) base_slot * slot_stride,
+                    stage     + (size_t) i        * slot_stride,
+                    run_len * slot_stride)) {
+            return false;
+        }
+        i = j;
+    }
+    return true;
 }
