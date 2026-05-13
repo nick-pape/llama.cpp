@@ -1715,11 +1715,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 const size_t slot_stride = pool_tensor->nb[2];
                                 const void * src = (const uint8_t *) input->data
                                                  + (size_t) id_i * expert_size;
-                                ggml_backend_tensor_set_async(split_backend,
-                                    pool_tensor,
-                                    src,
-                                    (size_t) slot * slot_stride,
-                                    expert_size);
+                                // SYNC for debugging — switch back to set_async once verified.
+                                ggml_backend_tensor_set(pool_tensor, src,
+                                    (size_t) slot * slot_stride, expert_size);
                                 ggml_moe_cache_record_slot(
                                     moe_cache, moe_layer_idx, moe_bucket, slot, (int32_t) id_i);
                             }
