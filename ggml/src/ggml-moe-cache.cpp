@@ -229,15 +229,29 @@ bool ggml_moe_cache_identify_tensor(
         int                        n_layers,
         int *                      out_layer_idx,
         ggml_moe_bucket *          out_bucket) {
-    if (!c || !input || !out_layer_idx || !out_bucket) return false;
-    if (c->slots_per_bucket <= 0)                       return false;
+    static int dbg = 0;
+    if (!c || !input || !out_layer_idx || !out_bucket) {
+        if (dbg < 4) { moe_cache_log("identify: null arg"); ++dbg; }
+        return false;
+    }
+    if (c->slots_per_bucket <= 0) {
+        if (dbg < 4) { moe_cache_log("identify: slots_per_bucket=%d", c->slots_per_bucket); ++dbg; }
+        return false;
+    }
 
     const auto bucket = bucket_from_name(input->name);
-    if (bucket == GGML_MOE_BUCKET_INVALID) return false;
+    if (bucket == GGML_MOE_BUCKET_INVALID) {
+        if (dbg < 4) { moe_cache_log("identify: bucket=INVALID name='%s'", input->name); ++dbg; }
+        return false;
+    }
 
     const int layer = layer_from_name(input->name);
-    if (layer < 0 || layer >= n_layers) return false;
+    if (layer < 0 || layer >= n_layers) {
+        if (dbg < 4) { moe_cache_log("identify: layer=%d out of range (n_layers=%d) name='%s'", layer, n_layers, input->name); ++dbg; }
+        return false;
+    }
 
+    if (dbg < 4) { moe_cache_log("identify: OK layer=%d bucket=%d name='%s'", layer, (int) bucket, input->name); ++dbg; }
     *out_layer_idx = layer;
     *out_bucket    = bucket;
     return true;
