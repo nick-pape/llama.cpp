@@ -1383,14 +1383,25 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                                 if (ggml_moe_cache_bind_bucket(cache, layer_idx, bucket,
                                         src, top_k, max_n_tokens)) {
                                     ggml_tensor * pool = ggml_moe_cache_pool_tensor(cache, layer_idx, bucket);
-                                    // Substitute when the pool can hold at least
-                                    // top_k experts (decode's per-op minimum).
-                                    // Below top_k the cache can't even cover a
-                                    // single decode op and substitution would
-                                    // overflow on every call. Prefill ops with
-                                    // n_unique > n_slots fall back per-op to
-                                    // cudaMallocAsync scratch via compute_splits.
-                                    if (pool && pool->ne[2] >= node->src[2]->ne[0]) {
+                                    // Useful-slot floor: empirically the cache
+                                    // costs more than it saves below ~3*top_k
+                                    // slots. Single-op miss-rate dominates,
+                                    // cache mechanics overhead doesn't amortize.
+                                    // At n_slots < N*top_k we leave the original
+                                    // copy_experts path in place (= cache=0
+                                    // baseline t/s) — substitution is skipped,
+                                    // so node->src[0] stays at input_cpy and
+                                    // the cache hit/miss code never executes.
+                                    // Override with MOE_CACHE_MIN_USEFUL_TOPK.
+                                    static int min_useful_topk = -1;
+                                    if (min_useful_topk < 0) {
+                                        const char * e = getenv("MOE_CACHE_MIN_USEFUL_TOPK");
+                                        min_useful_topk = (e && *e) ? atoi(e) : 3;
+                                        if (min_useful_topk < 1) min_useful_topk = 1;
+                                    }
+                                    const int top_k_local = (int) node->src[2]->ne[0];
+                                    const bool useful = pool && pool->ne[2] >= (int64_t) min_useful_topk * top_k_local;
+                                    if (useful) {
                                         for (int c = 0; c < sched->n_copies; c++) {
                                             tensor_id_copy(src_id, cur_backend_id, c) = pool;
                                         }
