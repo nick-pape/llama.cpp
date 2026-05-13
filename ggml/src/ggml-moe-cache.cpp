@@ -513,7 +513,9 @@ bool ggml_moe_cache_set_ids(
     cell.ids_tensor->nb[3] = cell.ids_tensor->nb[2];
 
     const size_t bytes = (size_t) top_k * (size_t) n_tokens * sizeof(int32_t);
-    ggml_backend_tensor_set_async(backend, cell.ids_tensor, slot_ids_host, 0, bytes);
+    // SYNC for debugging - switch back to set_async once verified.
+    ggml_backend_tensor_set(cell.ids_tensor, slot_ids_host, 0, bytes);
+    (void) backend;
     return true;
 }
 
