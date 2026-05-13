@@ -506,6 +506,7 @@ ggml_tensor * ggml_moe_cache_ids_tensor(
 
 typedef void * (*moe_cuda_malloc_async_fn_t)(ggml_backend_t, size_t);
 typedef void   (*moe_cuda_free_async_fn_t)(ggml_backend_t, void *);
+typedef bool   (*moe_cuda_h2d_async_fn_t)(ggml_backend_t, void *, const void *, size_t);
 
 static moe_cuda_malloc_async_fn_t moe_cache_resolve_malloc(ggml_backend_t backend) {
     static moe_cuda_malloc_async_fn_t cached = nullptr;
@@ -527,6 +528,26 @@ static moe_cuda_free_async_fn_t moe_cache_resolve_free(ggml_backend_t backend) {
     if (reg) cached = (moe_cuda_free_async_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_cuda_moe_cache_free_async");
     looked_up = true;
     return cached;
+}
+
+static moe_cuda_h2d_async_fn_t moe_cache_resolve_h2d(ggml_backend_t backend) {
+    static moe_cuda_h2d_async_fn_t cached = nullptr;
+    static bool looked_up = false;
+    if (looked_up) return cached;
+    auto * dev = ggml_backend_get_device(backend);
+    auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (reg) cached = (moe_cuda_h2d_async_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_cuda_moe_cache_h2d_async");
+    looked_up = true;
+    return cached;
+}
+
+bool ggml_moe_cache_scratch_h2d_async(
+        ggml_moe_cache_t c, ggml_backend_t backend,
+        void * dst, const void * src, size_t size) {
+    (void) c;
+    if (!backend || !dst || !src || size == 0) return false;
+    auto fn = moe_cache_resolve_h2d(backend);
+    return fn ? fn(backend, dst, src, size) : false;
 }
 
 ggml_tensor * ggml_moe_cache_acquire_overflow_scratch(

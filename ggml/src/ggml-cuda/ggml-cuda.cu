@@ -4931,6 +4931,20 @@ extern "C" void ggml_cuda_moe_cache_free_async(ggml_backend_t backend, void * pt
     cudaFreeAsync(ptr, ctx->stream());
 }
 
+// Raw H2D copy to a device pointer, on the backend's compute stream.
+// Used by the MoE cache's overflow scratch path: cudaMallocAsync gives
+// us a raw device ptr without a wrapping ggml_backend_buffer, so the
+// standard ggml_backend_tensor_set_async (which requires
+// tensor->buffer != NULL) can't be used. This lets us bypass that
+// requirement and write directly.
+extern "C" bool ggml_cuda_moe_cache_h2d_async(
+        ggml_backend_t backend, void * dst, const void * src, size_t size) {
+    if (!ggml_backend_is_cuda(backend) || !dst || !src || size == 0) return false;
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    cudaError_t err = cudaMemcpyAsync(dst, src, size, cudaMemcpyHostToDevice, ctx->stream());
+    return err == cudaSuccess;
+}
+
 static const char * ggml_backend_cuda_device_get_name(ggml_backend_dev_t dev) {
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
     return ctx->name.c_str();
@@ -5669,6 +5683,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_cuda_moe_cache_free_async") == 0) {
         return (void *)ggml_cuda_moe_cache_free_async;
+    }
+    if (strcmp(name, "ggml_cuda_moe_cache_h2d_async") == 0) {
+        return (void *)ggml_cuda_moe_cache_h2d_async;
     }
     return nullptr;
 }

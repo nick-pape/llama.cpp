@@ -1791,10 +1791,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 const size_t sz   = (size_t)(last_id - first_id + 1) * expert_size;
                                 const size_t pad  = std::min<size_t>(expert_size, 512);
                                 const size_t pad_end = last_id < n_expert - 1 ? pad : 0;
-                                ggml_backend_tensor_set_async(split_backend,
-                                    scratch,
+                                // scratch->buffer is NULL (cudaMallocAsync'd),
+                                // so use the cache's raw-H2D helper instead
+                                // of ggml_backend_tensor_set_async.
+                                ggml_moe_cache_scratch_h2d_async(moe_cache, split_backend,
+                                    (uint8_t *) scratch->data + off,
                                     (const uint8_t *) input->data + off,
-                                    off, sz + pad_end);
+                                    sz + pad_end);
                             };
                             for (++id; id < n_expert; ++id) {
                                 if (!ggml_bitset_get(used_ids.data(), id)) continue;
