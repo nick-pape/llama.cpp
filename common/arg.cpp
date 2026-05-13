@@ -2335,19 +2335,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("--moe-expert-cache-size must be >= 0");
             }
             params.moe_expert_cache_size = value;
-            if (value > 0 && getenv("GGML_OP_OFFLOAD_MIN_BATCH") == nullptr) {
-                // Force CUDA to offload MoE MUL_MAT_ID during decode (default threshold is 32,
-                // which keeps the MoE on CPU for ne[2]=1 single-token decode and so never
-                // crosses a host->device split — meaning the cache hook in compute_splits
-                // is dead code). Must be set before ggml_backend_load_all() runs, which
-                // happens lazily on first backend access; doing it here, in the arg handler,
-                // is the earliest sufficient place.
-#ifdef _WIN32
-                _putenv_s("GGML_OP_OFFLOAD_MIN_BATCH", "1");
-#else
-                setenv("GGML_OP_OFFLOAD_MIN_BATCH", "1", 0);
-#endif
-            }
+            // op_offload_min_batch_size is now set via the runtime
+            // setter in llama-context.cpp at cache init time, and ONLY
+            // when the cache will actually activate (slots >= n_experts).
+            // Setting the env var here is unreliable anyway: -ot
+            // parsing triggers ggml_backend_load_all() which reads the
+            // env var BEFORE this handler runs.
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_SIZE"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
