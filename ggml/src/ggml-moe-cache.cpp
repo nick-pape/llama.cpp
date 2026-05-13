@@ -16,15 +16,65 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <vector>
 #include <cstdarg>
 
 // -----------------------------------------------------------------------------
 // Internal types
 // -----------------------------------------------------------------------------
+
+// Pool-manager Phase 3b-B: a single in-flight CPU dispatch.
+//
+// Lifecycle:
+//   1. dispatch_cpu (host thread): builds the job (D2H src1/src2, build mini
+//      graph, build mask), pushes onto the worker queue, records the pointer
+//      in pending_merges, returns immediately. ~tens of µs on host.
+//   2. worker thread: pops the job, calls ggml_backend_graph_compute on the
+//      CPU backend (~440µs of MoE math, parallelizes with GPU + host).
+//      Sets status + done = true and notifies.
+//   3. drain_pending_merges (host thread, end of split): waits for done,
+//      cudaMallocAsync GPU scratch, cudaMemcpyAsync H2D the CPU result and
+//      mask onto the compute stream, launches the select kernel, frees the
+//      job's host buffers + ggml context, cudaFreeAsync the scratches.
+//
+// All host allocations live until drain frees them. Worker only touches the
+// job's CPU-side state (ctx + tensors + dst_host) and is otherwise idle.
+struct cpu_dispatch_job {
+    // CPU compute inputs
+    ggml_backend_t cpu_backend = nullptr;
+    ggml_cgraph *  gf          = nullptr;
+    void *         ctx_buf     = nullptr;
+    ggml_context * ctx         = nullptr;
+    void *         src1_host   = nullptr;
+    void *         src2_host   = nullptr;
+    void *         dst_host    = nullptr;
+    uint8_t *      mask_host   = nullptr;
+    size_t         dst_bytes   = 0;
+    size_t         mask_n      = 0;
+    int64_t        ne01        = 0;
+    int64_t        top_k       = 0;
+    int64_t        n_toks      = 0;
+
+    // GPU merge targets (populated at dispatch time, used at drain time)
+    ggml_backend_t gpu_backend = nullptr;
+    struct ggml_tensor * gpu_dst = nullptr;
+
+    // Completion signal. `done` is the only field the worker writes
+    // after launch; everything else is constant once the job is queued.
+    // Acquire-release semantics so a host thread reading `done == true`
+    // is guaranteed to observe the worker's writes to status / dst_host
+    // / mask_host.
+    std::atomic<bool> done   = {false};
+    enum ggml_status  status = GGML_STATUS_SUCCESS;
+};
 
 struct ggml_moe_cache {
     ggml_backend_t backend     = nullptr;
@@ -106,24 +156,28 @@ struct ggml_moe_cache {
     std::vector<uint32_t> demand;             // [layers * buckets * n_experts]
     uint64_t maintain_calls = 0;              // cadence / decay tracking
 
-    // Phase 3b merge queue.
+    // Phase 3b-B merge queue.
     //
-    // dispatch_cpu produces a float MoE result on the host and stages it
-    // onto the GPU (scratch_dev) along with a per-(token, k) miss bitmask
-    // (mask_dev). The actual merge into gpu_dst is a CUDA select kernel
-    // that must run AFTER the GPU MoE kernel — drain_pending_merges()
-    // launches all queued kernels on the compute stream after the
-    // existing graph_compute_async completes. cudaFreeAsync hands the
-    // scratch back to the stream-ordered pool once consumed.
-    struct pending_merge {
-        void * gpu_dst   = nullptr;   // device ptr inside the GPU MoE dst tensor
-        void * scratch   = nullptr;   // device ptr holding CPU result (float n_embd*top_k*n_tokens)
-        void * mask      = nullptr;   // device ptr holding mask (uint8_t top_k*n_tokens)
-        int    n_embd    = 0;
-        int    top_k     = 0;
-        int    n_tokens  = 0;
-    };
-    std::vector<pending_merge> pending_merges;
+    // Each in-flight CPU dispatch is owned by a cpu_dispatch_job whose
+    // CPU compute runs on a single background worker thread. The host
+    // posts the job from dispatch_cpu and records the pointer here.
+    // drain_pending_merges joins each job, stages the result on the GPU,
+    // launches the select kernel, and deletes the job. Jobs are
+    // heap-allocated to keep their atomic<bool> address stable across
+    // the queue handoff.
+    std::vector<cpu_dispatch_job *> pending_merges;
+
+    // Single worker thread + a FIFO of pending CPU dispatches. One worker
+    // is sufficient: ggml_backend_graph_compute already parallelizes the
+    // matmul across the CPU threadpool internally; multiple workers would
+    // contend for the same threadpool and yield no speedup. The point of
+    // the worker is to overlap the CPU MoE math with host queueing and
+    // GPU compute — not to add CPU parallelism.
+    std::thread             worker;
+    std::mutex              worker_mtx;
+    std::condition_variable worker_cv;
+    std::deque<cpu_dispatch_job *> worker_queue;
+    bool                    worker_shutdown = false;
 
     // Diagnostic env-var flags
     bool force_noop      = false;   // GGML_MOE_CACHE_FORCE_NOOP
@@ -182,6 +236,56 @@ static inline int cell_idx(int layer_idx, ggml_moe_bucket bucket) {
 }
 
 // -----------------------------------------------------------------------------
+// CPU dispatch worker thread
+// -----------------------------------------------------------------------------
+
+// Worker main: pops jobs from the queue and runs ggml_backend_graph_compute
+// on the CPU backend for each. One worker per cache. Stops when the cache's
+// worker_shutdown flag is set AND the queue is drained.
+//
+// Concurrency notes:
+//   - The worker is the SOLE caller of cpu_backend->graph_compute as long
+//     as drain_pending_merges joins all in-flight jobs before
+//     compute_splits hands the cpu_backend off to anyone else. The host
+//     scheduler may also call cpu_backend->graph_compute_async for ops it
+//     routed to CPU (LRU+S3 mode); those calls are sequenced AFTER the
+//     drain in the current compute_splits step, so no concurrent use.
+//   - graph_compute internally fans out across the CPU threadpool, so a
+//     SECOND worker thread here would not yield parallelism — it would
+//     contend with the first for the same threadpool. Hence one worker.
+static void moe_cache_worker_main(ggml_moe_cache_t c) {
+    for (;;) {
+        cpu_dispatch_job * job = nullptr;
+        {
+            std::unique_lock<std::mutex> lk(c->worker_mtx);
+            c->worker_cv.wait(lk, [c]{
+                return c->worker_shutdown || !c->worker_queue.empty();
+            });
+            if (c->worker_queue.empty()) {
+                // shutdown signaled and queue is drained
+                return;
+            }
+            job = c->worker_queue.front();
+            c->worker_queue.pop_front();
+        }
+
+        // Run outside the lock so concurrent dispatch_cpu posts don't block
+        // on the matmul. The job's status / dst_host are published by the
+        // release on `done`; readers must use acquire when reading done.
+        job->status = ggml_backend_graph_compute(job->cpu_backend, job->gf);
+        job->done.store(true, std::memory_order_release);
+
+        // Wake any drain that is waiting on this specific job. We use
+        // notify_all because drain may be holding the queue mutex waiting
+        // on its own predicate; the CV is shared between worker and drain.
+        {
+            std::lock_guard<std::mutex> lk(c->worker_mtx);
+        }
+        c->worker_cv.notify_all();
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Lifecycle
 // -----------------------------------------------------------------------------
 
@@ -229,6 +333,11 @@ ggml_moe_cache_t ggml_moe_cache_init(
         c->policy == GGML_MOE_CACHE_POLICY_LFRU ? "LFRU" : "unknown";
     moe_cache_log("init: %d layers x %d buckets, %d slots/bucket (%s eviction); buffers allocated lazily per (layer, bucket)",
                   n_layers, (int) GGML_MOE_BUCKET_COUNT, slots_per_bucket, policy_name);
+
+    // Spawn the CPU dispatch worker. Pool-manager Phase 3b-B: this thread
+    // services dispatch_cpu jobs asynchronously so the host doesn't block
+    // on ggml_backend_graph_compute(cpu_backend) during compute_splits.
+    c->worker = std::thread(moe_cache_worker_main, c);
 
     return c;
 }
@@ -285,6 +394,33 @@ void ggml_moe_cache_free(ggml_moe_cache_t c) {
     } else {
         moe_cache_log("final stats: no lookups recorded — cache code path never executed");
     }
+
+    // Signal worker shutdown and join. Any pending merges should already
+    // be drained by the time we get here (drain runs at end of each split);
+    // but if some are leaked, we still need to wait so we don't tear down
+    // jobs out from under the worker. Drain anything still pending.
+    {
+        std::lock_guard<std::mutex> lk(c->worker_mtx);
+        c->worker_shutdown = true;
+    }
+    c->worker_cv.notify_all();
+    if (c->worker.joinable()) {
+        c->worker.join();
+    }
+    // Free any unmerged jobs (shouldn't happen on a clean shutdown but
+    // we leak nothing in case of a graph_compute abort path).
+    for (auto * job : c->pending_merges) {
+        if (job) {
+            if (job->ctx)       ggml_free(job->ctx);
+            free(job->ctx_buf);
+            free(job->src1_host);
+            free(job->src2_host);
+            free(job->dst_host);
+            free(job->mask_host);
+            delete job;
+        }
+    }
+    c->pending_merges.clear();
 
     for (auto & cell : c->cells) {
         if (cell.buf) {
@@ -554,55 +690,20 @@ bool ggml_moe_cache_dispatch_cpu(
     }
     (void) layer_idx; (void) bucket;  // reserved for per-cell timing in Phase 4
 
-    // First-call debug: log what we're about to dispatch.
-    static int dbg = 0;
-    if (dbg < 3) {
-        moe_cache_log("cpu dispatch entry [%d]: src0 type=%d ne=[%lld %lld %lld %lld] data=%p, "
-                      "src1 type=%d ne=[%lld %lld %lld %lld] data=%p, "
-                      "src2 type=%d ne=[%lld %lld %lld %lld] data=%p",
-                      dbg,
-                      (int) expert_weights_host->type,
-                      (long long) expert_weights_host->ne[0], (long long) expert_weights_host->ne[1],
-                      (long long) expert_weights_host->ne[2], (long long) expert_weights_host->ne[3],
-                      expert_weights_host->data,
-                      (int) src1_dev->type,
-                      (long long) src1_dev->ne[0], (long long) src1_dev->ne[1],
-                      (long long) src1_dev->ne[2], (long long) src1_dev->ne[3],
-                      src1_dev->data,
-                      (int) src2_dev->type,
-                      (long long) src2_dev->ne[0], (long long) src2_dev->ne[1],
-                      (long long) src2_dev->ne[2], (long long) src2_dev->ne[3],
-                      src2_dev->data);
-        ++dbg;
-    }
-
-    // Stepwise log to bisect crash. First-call only.
-    #define DBG_STEP(s) do { if (dbg <= 1) moe_cache_log("cpu dispatch step: %s", s); } while(0)
-    DBG_STEP("entering body");
-
-    // We construct a mini graph on a dedicated context. Memory needed:
-    //   ~6 * tensor headers (= ~6 * 400 bytes) plus the cgraph's internal
-    //   arrays. Default cgraph size is 2048 nodes which would need >50 KiB
-    //   of arrays alone; we use ggml_new_graph_custom with size=8 below to
-    //   keep this tiny. 32 KiB is conservative.
+    // Build the mini-graph context + host buffers on the HOST thread.
+    // D2H src1/src2 must also happen here because they require a stream
+    // sync with the GPU producer (they read activations produced by the
+    // previous kernel). The expensive `ggml_backend_graph_compute` runs
+    // on the worker thread.
     const size_t ctx_size = 32 * 1024;
     void * ctx_buf = malloc(ctx_size);
-    if (!ctx_buf) {
-        moe_cache_log("cpu dispatch: ctx alloc failed");
-        return false;
-    }
-    DBG_STEP("ctx_buf allocated");
+    if (!ctx_buf) return false;
     ggml_init_params ip = { /*.mem_size=*/ctx_size, /*.mem_buffer=*/ctx_buf, /*.no_alloc=*/true };
     ggml_context * ctx = ggml_init(ip);
-    if (!ctx) {
-        free(ctx_buf);
-        return false;
-    }
-    DBG_STEP("ggml_init done");
+    if (!ctx) { free(ctx_buf); return false; }
 
     const size_t src1_bytes = ggml_nbytes(src1_dev);
     const size_t src2_bytes = ggml_nbytes(src2_dev);
-    DBG_STEP("nbytes computed");
 
     const int64_t ne01    = expert_weights_host->ne[1];
     const int64_t top_k   = src2_dev->ne[0];
@@ -611,95 +712,53 @@ bool ggml_moe_cache_dispatch_cpu(
     void * src1_host = aligned_alloc(64, (src1_bytes + 63) & ~63ULL);
     void * src2_host = aligned_alloc(64, (src2_bytes + 63) & ~63ULL);
     if (!src1_host || !src2_host) {
-        moe_cache_log("cpu dispatch: aligned host alloc failed");
         free(src1_host); free(src2_host);
         ggml_free(ctx); free(ctx_buf);
         return false;
     }
-    DBG_STEP("aligned alloc src1/src2");
 
     ggml_backend_tensor_get(src1_dev, src1_host, 0, src1_bytes);
-    DBG_STEP("d2h src1");
     ggml_backend_tensor_get(src2_dev, src2_host, 0, src2_bytes);
-    DBG_STEP("d2h src2");
 
     ggml_tensor * t_src0 = ggml_new_tensor(ctx, expert_weights_host->type, GGML_MAX_DIMS,
                                            expert_weights_host->ne);
     memcpy(t_src0->nb, expert_weights_host->nb, sizeof(t_src0->nb));
-    DBG_STEP("new_tensor src0");
     t_src0->data = expert_weights_host->data;
 
     ggml_tensor * t_src1 = ggml_new_tensor(ctx, src1_dev->type, GGML_MAX_DIMS, src1_dev->ne);
     memcpy(t_src1->nb, src1_dev->nb, sizeof(t_src1->nb));
-    DBG_STEP("new_tensor src1");
     t_src1->data = src1_host;
 
     ggml_tensor * t_src2 = ggml_new_tensor(ctx, src2_dev->type, GGML_MAX_DIMS, src2_dev->ne);
     memcpy(t_src2->nb, src2_dev->nb, sizeof(t_src2->nb));
-    DBG_STEP("new_tensor src2");
     t_src2->data = src2_host;
 
     const size_t dst_bytes = ne01 * top_k * n_toks * sizeof(float);
     void * dst_host = aligned_alloc(64, (dst_bytes + 63) & ~63ULL);
     if (!dst_host) {
-        moe_cache_log("cpu dispatch: dst alloc failed");
         free(src1_host); free(src2_host);
         ggml_free(ctx); free(ctx_buf);
         return false;
     }
-    DBG_STEP("aligned alloc dst");
 
     int64_t dst_ne[GGML_MAX_DIMS] = { ne01, top_k, n_toks, 1 };
     ggml_tensor * t_dst = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, dst_ne);
-    DBG_STEP("new_tensor dst");
     t_dst->data = dst_host;
     t_dst->op   = GGML_OP_MUL_MAT_ID;
     t_dst->src[0] = t_src0;
     t_dst->src[1] = t_src1;
     t_dst->src[2] = t_src2;
-    DBG_STEP("set dst op + srcs");
 
-    // Custom-size graph: tiny (8 nodes, no grad) instead of the default
-    // 2048-node graph, which would blow our ctx budget.
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, /*size=*/8, /*grads=*/false);
-    DBG_STEP("new_graph");
     ggml_build_forward_expand(gf, t_dst);
-    DBG_STEP("build_forward_expand");
 
-    // Dispatch on CPU backend. The strides-copy above is what makes this
-    // work — ggml_new_tensor() computes default contiguous nb[] which
-    // doesn't always match the original tensor's actual layout in the
-    // backing buffer (mxfp4 / q5_K block strides aren't quite what the
-    // default-stride formula produces in all cases). Without that
-    // memcpy of nb[], graph_compute segfaults inside MUL_MAT_ID's row
-    // walker reading garbage offsets.
-    DBG_STEP("about to graph_compute");
-    const int64_t t0 = ggml_time_us();
-    enum ggml_status st = ggml_backend_graph_compute(cpu_backend, gf);
-    DBG_STEP("graph_compute returned");
-    const int64_t t1 = ggml_time_us();
-
-    static int n_calls   = 0;
-    static int64_t total = 0;
-    n_calls++;
-    total += (t1 - t0);
-    if (n_calls <= 8 || (n_calls % 200) == 0) {
-        moe_cache_log("cpu dispatch [%d]: status=%d, %lldµs (running avg %.0fµs); op=[%lld x %lld x %lld]",
-                      n_calls, (int) st, (long long)(t1 - t0), (double) total / n_calls,
-                      (long long) ne01, (long long) top_k, (long long) n_toks);
-    }
-
-    if (st != GGML_STATUS_SUCCESS) {
-        free(dst_host); free(src1_host); free(src2_host);
-        ggml_free(ctx); free(ctx_buf);
-        return false;
-    }
-
-    // Build per-(token, k) miss mask from the ids tensor we already D2H'd.
-    // mask[t*top_k + k] = 1 iff ids[t, k] is one of the experts the cache
-    // reported as a miss this op — i.e., the GPU MoE kernel computed
-    // garbage at that (token, k_idx) position and we must overwrite it
-    // with the CPU-computed value.
+    // Build the per-(token, k) miss mask. mask[t*top_k + k] = 1 iff
+    // ids[t, k] is one of the missed experts — the GPU MoE kernel
+    // computed garbage at those (t, k) positions and the select kernel
+    // will overwrite them with the CPU-computed values. Linear scan
+    // over miss_ids per id: miss_n is small (~tens), n is small (top_k *
+    // n_tokens, e.g. 8 * 1..2048), and this runs on the host while the
+    // worker does matmul.
     const size_t mask_n = (size_t) top_k * (size_t) n_toks;
     uint8_t * mask_host = (uint8_t *) malloc(mask_n);
     if (!mask_host) {
@@ -719,56 +778,106 @@ bool ggml_moe_cache_dispatch_cpu(
         }
     }
 
-    // Stage on GPU. cudaMallocAsync + cudaMemcpyAsync are issued on the
-    // compute stream so the lifetime is correctly ordered with the
-    // select kernel we enqueue later in drain_pending_merges(). The
-    // H2D from pageable host memory is synchronous w.r.t. the host
-    // (CUDA staging copy), so freeing the host buffers immediately
-    // after the call is safe — the device DMA happens on the stream.
-    void * scratch_dev = moe_cuda_malloc_async(gpu_backend, dst_bytes);
-    void * mask_dev    = moe_cuda_malloc_async(gpu_backend, mask_n);
-    if (!scratch_dev || !mask_dev) {
-        moe_cuda_free_async(gpu_backend, scratch_dev);
-        moe_cuda_free_async(gpu_backend, mask_dev);
-        free(mask_host);
-        free(dst_host); free(src1_host); free(src2_host);
-        ggml_free(ctx); free(ctx_buf);
-        return false;
+    // Heap-allocate the job so its address (and atomic<bool>) stays stable
+    // across the queue handoff. The worker reads inputs and writes status
+    // + done; drain reads everything else.
+    auto * job = new cpu_dispatch_job();
+    job->cpu_backend = cpu_backend;
+    job->gf          = gf;
+    job->ctx_buf     = ctx_buf;
+    job->ctx         = ctx;
+    job->src1_host   = src1_host;
+    job->src2_host   = src2_host;
+    job->dst_host    = dst_host;
+    job->mask_host   = mask_host;
+    job->dst_bytes   = dst_bytes;
+    job->mask_n      = mask_n;
+    job->ne01        = ne01;
+    job->top_k       = top_k;
+    job->n_toks      = n_toks;
+    job->gpu_backend = gpu_backend;
+    job->gpu_dst     = gpu_dst;
+
+    {
+        std::lock_guard<std::mutex> lk(c->worker_mtx);
+        c->worker_queue.push_back(job);
     }
-    ggml_moe_cache_copy_d2d_async(gpu_backend, scratch_dev, dst_host,  dst_bytes);
-    ggml_moe_cache_copy_d2d_async(gpu_backend, mask_dev,    mask_host, mask_n);
+    c->worker_cv.notify_one();
 
-    free(mask_host);
-    free(dst_host);
-    free(src1_host);
-    free(src2_host);
-    ggml_free(ctx);
-    free(ctx_buf);
-
-    ggml_moe_cache::pending_merge pm;
-    pm.gpu_dst  = gpu_dst->data;
-    pm.scratch  = scratch_dev;
-    pm.mask     = mask_dev;
-    pm.n_embd   = (int) ne01;
-    pm.top_k    = (int) top_k;
-    pm.n_tokens = (int) n_toks;
-    c->pending_merges.push_back(pm);
+    // Record the in-flight job. drain_pending_merges joins it at end of
+    // split and does the GPU staging + select kernel.
+    c->pending_merges.push_back(job);
 
     return true;
 }
 
-// Drain the merge queue: launch the select kernel for each pending entry
-// on the GPU compute stream (which already serializes after the GPU MoE
-// kernels enqueued by ggml_backend_graph_compute_async), then return the
-// scratch buffers via cudaFreeAsync. Called once per split after the
-// scheduler's compute_async returns.
+// Drain the merge queue: for each in-flight job, wait for the worker to
+// finish the CPU MoE compute, then stage the result + mask onto GPU
+// scratches, launch the select kernel, and free everything. Called once
+// per split after the scheduler's graph_compute_async returns.
+//
+// The wait is the only synchronization point between host and worker;
+// if the worker is faster than the host gets here, the wait is a
+// no-op. If slower, host blocks — same total cost as the sync
+// dispatch in that case, but the GPU has already had a head start
+// on its kernels in the meantime.
 void ggml_moe_cache_drain_pending_merges(ggml_moe_cache_t c, ggml_backend_t gpu_backend) {
     if (!c || !gpu_backend || c->pending_merges.empty()) return;
-    for (auto & pm : c->pending_merges) {
-        moe_cuda_select_misses_async(gpu_backend, pm.gpu_dst, pm.scratch, pm.mask,
-                                     pm.n_embd, pm.top_k, pm.n_tokens);
-        moe_cuda_free_async(gpu_backend, pm.scratch);
-        moe_cuda_free_async(gpu_backend, pm.mask);
+    for (auto * job : c->pending_merges) {
+        if (!job) continue;
+
+        // Wait for worker to finish this job's graph_compute. We use the
+        // shared worker CV; the predicate inspects the per-job atomic.
+        {
+            std::unique_lock<std::mutex> lk(c->worker_mtx);
+            c->worker_cv.wait(lk, [job]{
+                return job->done.load(std::memory_order_acquire);
+            });
+        }
+
+        if (job->status != GGML_STATUS_SUCCESS) {
+            // CPU compute failed — skip the merge. GPU output at the miss
+            // positions stays as the kernel produced (garbage from stale
+            // weights), but this is best-effort: the existing H2D-for-misses
+            // path in compute_splits handled correctness.
+            if (job->ctx) ggml_free(job->ctx);
+            free(job->ctx_buf);
+            free(job->src1_host); free(job->src2_host);
+            free(job->dst_host);  free(job->mask_host);
+            delete job;
+            continue;
+        }
+
+        // Stage scratch + mask on GPU. cudaMallocAsync on the compute
+        // stream + cudaMemcpyAsync H2D — pageable host source means the
+        // memcpy call is host-synchronous (staging copy), so freeing
+        // job->dst_host / mask_host right after is safe; the device DMA
+        // is queued on the stream and runs in order with the select kernel.
+        void * scratch_dev = moe_cuda_malloc_async(gpu_backend, job->dst_bytes);
+        void * mask_dev    = moe_cuda_malloc_async(gpu_backend, job->mask_n);
+        if (!scratch_dev || !mask_dev) {
+            moe_cuda_free_async(gpu_backend, scratch_dev);
+            moe_cuda_free_async(gpu_backend, mask_dev);
+            if (job->ctx) ggml_free(job->ctx);
+            free(job->ctx_buf);
+            free(job->src1_host); free(job->src2_host);
+            free(job->dst_host);  free(job->mask_host);
+            delete job;
+            continue;
+        }
+        ggml_moe_cache_copy_d2d_async(gpu_backend, scratch_dev, job->dst_host,  job->dst_bytes);
+        ggml_moe_cache_copy_d2d_async(gpu_backend, mask_dev,    job->mask_host, job->mask_n);
+
+        moe_cuda_select_misses_async(gpu_backend, job->gpu_dst->data, scratch_dev, mask_dev,
+                                     (int) job->ne01, (int) job->top_k, (int) job->n_toks);
+        moe_cuda_free_async(gpu_backend, scratch_dev);
+        moe_cuda_free_async(gpu_backend, mask_dev);
+
+        if (job->ctx) ggml_free(job->ctx);
+        free(job->ctx_buf);
+        free(job->src1_host); free(job->src2_host);
+        free(job->dst_host);  free(job->mask_host);
+        delete job;
     }
     c->pending_merges.clear();
 }
