@@ -442,12 +442,17 @@ int ggml_moe_cache_select_slot_for_miss(
     auto & cell = c->cells[cell_idx(layer_idx, bucket)];
     if (!cell.bound || cell.n_slots <= 0) return -1;
 
-    // First, use any unused slot.
-    if (cell.next_unused < cell.n_slots) {
-        return cell.next_unused++;
-    }
-    // Otherwise evict LFRU.
-    return lfru_pick_evictee(cell);
+    // Pure round-robin slot assignment. Empirically beats LFRU on
+    // both decode t/s AND hit rate across cache=8..128 (e.g. cache=64:
+    // 34.7→48.6 t/s, 60.7%→76.9% hit) — likely because LFRU has the
+    // classic LFU "new admission" pathology (freq=1 new entries
+    // tie-break-evicted before they can accumulate hits), and the
+    // workload's drifting working set rewards a cyclic-LRU policy.
+    // LFRU bookkeeping (freq, last_tick) is retained for future
+    // policy experiments but currently unused for eviction.
+    const int slot = cell.next_unused;
+    cell.next_unused = (cell.next_unused + 1) % cell.n_slots;
+    return slot;
 }
 
 void ggml_moe_cache_record_slot(
@@ -616,10 +621,10 @@ bool ggml_moe_cache_set_ids(
     cell.ids_tensor->nb[3] = cell.ids_tensor->nb[2];
 
     const size_t bytes = (size_t) top_k * (size_t) n_tokens * sizeof(int32_t);
-    // DEBUG: sync until verified — host slot_ids buffer must outlive the
-    // async H2D, but our caller's std::vector goes out of scope right
-    // after set_ids returns. Need to either pin our own staging buffer
-    // or use sync. Sync for now.
+    // Sync H2D for now. Async tested (probe #1 follow-up) and was
+    // slightly *slower* across all cache sizes — the host wait being
+    // eliminated by async doesn't shorten the critical path because
+    // the GPU stream-waits for the H2D before the kernel anyway.
     (void) backend;
     ggml_backend_tensor_set(cell.ids_tensor, slot_ids_host, 0, bytes);
     return true;
