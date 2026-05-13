@@ -39,13 +39,22 @@ enum ggml_moe_bucket {
     GGML_MOE_BUCKET_INVALID  = -1,
 };
 
+// Eviction policy selector.
+enum ggml_moe_cache_policy {
+    GGML_MOE_CACHE_POLICY_RR         = 0,  // Round-robin (current default; cyclic next_unused)
+    GGML_MOE_CACHE_POLICY_LRU        = 1,  // Evict slot with oldest last_tick (updated on hit)
+    GGML_MOE_CACHE_POLICY_SLRU       = 2,  // Segmented LRU: probationary -> protected on hit
+    GGML_MOE_CACHE_POLICY_LFRU_DECAY = 3,  // LFU + LRU tiebreak, with periodic frequency halving
+};
+
 // Create a cache. Slot pools and id buffers are allocated lazily on
 // first bind for each (layer, bucket). Returns NULL on failure.
 ggml_moe_cache_t ggml_moe_cache_init(
-    ggml_backend_t backend,
-    int            n_layers,
-    int            slots_per_bucket,    // user param --moe-expert-cache-size
-    size_t         max_bytes);          // 0 = no cap; otherwise per-cache VRAM budget
+    ggml_backend_t              backend,
+    int                         n_layers,
+    int                         slots_per_bucket,    // user param --moe-expert-cache-size
+    size_t                      max_bytes,           // 0 = no cap; otherwise per-cache VRAM budget
+    enum ggml_moe_cache_policy  policy);             // eviction policy
 
 void ggml_moe_cache_free(ggml_moe_cache_t cache);
 

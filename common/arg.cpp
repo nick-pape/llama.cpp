@@ -2343,6 +2343,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             // env var BEFORE this handler runs.
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_SIZE"));
+    add_opt(common_arg(
+        {"--moe-cache-policy"}, "POLICY",
+        "Eviction policy for the MoE expert cache. One of: rr (round-robin, default), "
+        "lru, slru, lfru-decay. Only meaningful when --moe-expert-cache-size > 0.",
+        [](common_params & params, const std::string & value) {
+            int p = -1;
+            if      (value == "rr")         p = 0;
+            else if (value == "lru")        p = 1;
+            else if (value == "slru")       p = 2;
+            else if (value == "lfru-decay" || value == "lfru_decay" || value == "lfru") p = 3;
+            else {
+                throw std::invalid_argument("--moe-cache-policy must be one of: rr, lru, slru, lfru-decay");
+            }
+            params.moe_cache_policy = p;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_POLICY"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",
