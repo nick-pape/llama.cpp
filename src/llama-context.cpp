@@ -366,7 +366,8 @@ llama_context::llama_context(
                 LLAMA_LOG_WARN("%s: --moe-expert-cache-size %d requested but no GPU backend available; disabling\n",
                         __func__, params.moe_expert_cache_size);
             } else {
-                moe_cache = ggml_moe_cache_init(gpu_backend, (int) model.hparams.n_layer, params.moe_expert_cache_size, 0);
+                ggml_moe_cache_policy policy = (ggml_moe_cache_policy) params.moe_cache_policy;
+                moe_cache = ggml_moe_cache_init(gpu_backend, (int) model.hparams.n_layer, params.moe_expert_cache_size, 0, policy);
                 if (moe_cache == nullptr) {
                     LLAMA_LOG_WARN("%s: failed to allocate MoE expert cache (slots=%d, layers=%d); disabling\n",
                             __func__, params.moe_expert_cache_size, (int) model.hparams.n_layer);
@@ -3300,6 +3301,7 @@ llama_context_params llama_context_default_params() {
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.moe_expert_cache_size       =*/ 0,
+        /*.moe_cache_policy            =*/ 0,   // GGML_MOE_CACHE_POLICY_RR
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
         /*.no_perf                     =*/ true,

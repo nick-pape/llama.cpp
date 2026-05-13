@@ -38,6 +38,12 @@ struct ggml_moe_cache {
     int            slots_per_bucket = 0;  // user param; capped to n_experts at bind time
     size_t         max_bytes_cap = 0;
     size_t         total_bytes = 0;
+    ggml_moe_cache_policy policy = GGML_MOE_CACHE_POLICY_RR;
+    // For LFRU_DECAY: how often to halve frequencies. Measured in tick
+    // increments (hits + inserts). Tuned to "couple of full sweeps
+    // through cache" so older hot entries fade gradually.
+    uint64_t       decay_interval = 4096;
+    uint64_t       last_decay_tick = 0;
 
     // Long-lived ggml_context for the slot-pool + slot-ids tensor wrappers.
     // no_alloc=true: we attach our own backend buffers manually.
@@ -84,9 +90,11 @@ struct ggml_moe_cache {
         std::unordered_map<int32_t, int> expert_to_slot;  // O(1) lookup
         int                              next_unused = 0;
 
-        // LFRU eviction state.
-        std::vector<uint32_t> freq;       // [n_slots]: hits since populate
-        std::vector<uint64_t> last_tick;  // [n_slots]: last access tick
+        // Eviction state (shared across policies; updates always done,
+        // policies read only what they need).
+        std::vector<uint32_t> freq;       // [n_slots]: hits + inserts (LFRU_DECAY)
+        std::vector<uint64_t> last_tick;  // [n_slots]: last access tick (LRU / SLRU / tiebreak)
+        std::vector<uint8_t>  tier;       // [n_slots]: 0=probationary, 1=protected (SLRU only)
 
         // Per-cell stats.
         uint64_t n_lookups = 0;
@@ -152,32 +160,16 @@ static inline int cell_idx(int layer_idx, ggml_moe_bucket bucket) {
     return layer_idx * GGML_MOE_BUCKET_COUNT + (int) bucket;
 }
 
-// LFRU evictee: smallest freq, tiebreak on smallest last_tick.
-// Newly-populated slots start with freq=1 + last_tick = ++cache->tick,
-// so they're not immediately evicted in a freq=1 tie.
-static int lfru_pick_evictee(const ggml_moe_cache::cell & c) {
-    int      best  = -1;
-    uint32_t best_f = UINT32_MAX;
-    uint64_t best_t = UINT64_MAX;
-    for (int s = 0; s < c.n_slots; ++s) {
-        if (c.freq[s] < best_f || (c.freq[s] == best_f && c.last_tick[s] < best_t)) {
-            best_f = c.freq[s];
-            best_t = c.last_tick[s];
-            best   = s;
-        }
-    }
-    return best;
-}
-
 // -----------------------------------------------------------------------------
 // Lifecycle
 // -----------------------------------------------------------------------------
 
 ggml_moe_cache_t ggml_moe_cache_init(
-        ggml_backend_t backend,
-        int            n_layers,
-        int            slots_per_bucket,
-        size_t         max_bytes) {
+        ggml_backend_t              backend,
+        int                         n_layers,
+        int                         slots_per_bucket,
+        size_t                      max_bytes,
+        ggml_moe_cache_policy       policy) {
     if (!backend || n_layers <= 0 || slots_per_bucket <= 0) {
         return nullptr;
     }
@@ -187,6 +179,7 @@ ggml_moe_cache_t ggml_moe_cache_init(
     c->n_layers         = n_layers;
     c->slots_per_bucket = slots_per_bucket;
     c->max_bytes_cap    = max_bytes;
+    c->policy           = policy;
 
     // Long-lived ggml_context for tensor wrappers. We allocate space for
     // 2 wrappers per cell (slot pool + slot_ids) plus headroom. Each
@@ -212,8 +205,15 @@ ggml_moe_cache_t ggml_moe_cache_init(
 
     c->cells.resize((size_t) n_layers * GGML_MOE_BUCKET_COUNT);
 
-    moe_cache_log("v2 init: %d layers x %d buckets, %d slots/bucket (LFRU eviction); buffers allocated lazily per (layer, bucket)",
-                  n_layers, (int) GGML_MOE_BUCKET_COUNT, slots_per_bucket);
+    const char * policy_name = "rr";
+    switch (policy) {
+        case GGML_MOE_CACHE_POLICY_RR:         policy_name = "rr";         break;
+        case GGML_MOE_CACHE_POLICY_LRU:        policy_name = "lru";        break;
+        case GGML_MOE_CACHE_POLICY_SLRU:       policy_name = "slru";       break;
+        case GGML_MOE_CACHE_POLICY_LFRU_DECAY: policy_name = "lfru-decay"; break;
+    }
+    moe_cache_log("v2 init: %d layers x %d buckets, %d slots/bucket, policy=%s; buffers allocated lazily per (layer, bucket)",
+                  n_layers, (int) GGML_MOE_BUCKET_COUNT, slots_per_bucket, policy_name);
 
     return c;
 }
@@ -387,6 +387,7 @@ bool ggml_moe_cache_bind_bucket(
     cell.expert_to_slot.reserve((size_t) cell.n_slots);
     cell.freq.assign(cell.n_slots, 0);
     cell.last_tick.assign(cell.n_slots, 0);
+    cell.tier.assign(cell.n_slots, 0);   // probationary
     cell.next_unused = 0;
     cell.bound       = true;
     c->total_bytes  += pool_bytes + ids_bytes;
@@ -428,10 +429,51 @@ int ggml_moe_cache_lookup(
     const int s = it->second;
     ++cell.freq[s];
     cell.last_tick[s] = ++c->tick;
+    cell.tier[s] = 1;   // SLRU promotion on hit (no-op for other policies)
     ++cell.n_hits;
     ++c->stats.total_hits;
     c->stats.total_bytes_saved += (int64_t) cell.expert_size;
     return s;
+}
+
+// LRU: evict slot with smallest last_tick.
+static int evict_lru(const ggml_moe_cache::cell & cell) {
+    int best = -1; uint64_t best_t = UINT64_MAX;
+    for (int s = 0; s < cell.n_slots; ++s) {
+        if (cell.last_tick[s] < best_t) { best_t = cell.last_tick[s]; best = s; }
+    }
+    return best;
+}
+
+// SLRU: evict LRU among probationary (tier=0); fall back to LRU among
+// protected (tier=1) only if no probationary slots exist. New entries
+// always enter probationary (set in record_slot).
+static int evict_slru(const ggml_moe_cache::cell & cell) {
+    int best = -1; uint64_t best_t = UINT64_MAX;
+    for (int s = 0; s < cell.n_slots; ++s) {
+        if (cell.tier[s] == 0 && cell.last_tick[s] < best_t) {
+            best_t = cell.last_tick[s]; best = s;
+        }
+    }
+    if (best >= 0) return best;
+    return evict_lru(cell);
+}
+
+// LFRU with periodic frequency halving: classic LFU pathology fix.
+// Halving once every decay_interval ticks lets stale "once-hot"
+// entries age out instead of clogging the cache forever.
+static int evict_lfru_decay(ggml_moe_cache & c, ggml_moe_cache::cell & cell) {
+    if (c.tick - c.last_decay_tick >= c.decay_interval) {
+        for (auto & f : cell.freq) f = f / 2;
+        c.last_decay_tick = c.tick;
+    }
+    int best = -1; uint32_t best_f = UINT32_MAX; uint64_t best_t = UINT64_MAX;
+    for (int s = 0; s < cell.n_slots; ++s) {
+        if (cell.freq[s] < best_f || (cell.freq[s] == best_f && cell.last_tick[s] < best_t)) {
+            best_f = cell.freq[s]; best_t = cell.last_tick[s]; best = s;
+        }
+    }
+    return best;
 }
 
 int ggml_moe_cache_select_slot_for_miss(
@@ -442,17 +484,20 @@ int ggml_moe_cache_select_slot_for_miss(
     auto & cell = c->cells[cell_idx(layer_idx, bucket)];
     if (!cell.bound || cell.n_slots <= 0) return -1;
 
-    // Pure round-robin slot assignment. Empirically beats LFRU on
-    // both decode t/s AND hit rate across cache=8..128 (e.g. cache=64:
-    // 34.7→48.6 t/s, 60.7%→76.9% hit) — likely because LFRU has the
-    // classic LFU "new admission" pathology (freq=1 new entries
-    // tie-break-evicted before they can accumulate hits), and the
-    // workload's drifting working set rewards a cyclic-LRU policy.
-    // LFRU bookkeeping (freq, last_tick) is retained for future
-    // policy experiments but currently unused for eviction.
-    const int slot = cell.next_unused;
-    cell.next_unused = (cell.next_unused + 1) % cell.n_slots;
-    return slot;
+    switch (c->policy) {
+        case GGML_MOE_CACHE_POLICY_RR: {
+            // Round-robin: empirically beats classic LFRU on both
+            // decode t/s and hit rate (probably because LFU's "new
+            // admission" pathology hurts more than RR's no-smarts).
+            const int slot = cell.next_unused;
+            cell.next_unused = (cell.next_unused + 1) % cell.n_slots;
+            return slot;
+        }
+        case GGML_MOE_CACHE_POLICY_LRU:        return evict_lru(cell);
+        case GGML_MOE_CACHE_POLICY_SLRU:       return evict_slru(cell);
+        case GGML_MOE_CACHE_POLICY_LFRU_DECAY: return evict_lfru_decay(*c, cell);
+    }
+    return -1;
 }
 
 void ggml_moe_cache_record_slot(
@@ -472,6 +517,7 @@ void ggml_moe_cache_record_slot(
     cell.expert_to_slot[expert_id] = slot_idx;
     cell.freq[slot_idx]      = 1;
     cell.last_tick[slot_idx] = ++c->tick;
+    cell.tier[slot_idx]      = 0;   // new entry starts probationary (SLRU)
 
     c->stats.total_h2d_bytes += (int64_t) cell.expert_size;
 }

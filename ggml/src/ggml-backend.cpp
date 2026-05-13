@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <chrono>
 #include <vector>
 
 #ifdef __APPLE__
@@ -1811,12 +1812,57 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                     if (use_moe_cache && !moe_overflow && !moe_handled) {
                         moe_handled = true;
+
+                        // PROFILING: aggregated timings across all MoE
+                        // cache ops in this process. Printed on cache
+                        // free. Per-section breakdown to localize
+                        // bottlenecks.
+                        struct moe_prof {
+                            double t_classify_us       = 0;
+                            double t_miss_h2d_us       = 0;
+                            double t_slot_ids_build_us = 0;
+                            double t_set_ids_us        = 0;
+                            double t_record_patch_us   = 0;
+                            int64_t n_ops              = 0;
+                            int64_t n_miss_batches     = 0;
+                            int64_t n_misses           = 0;
+                            int64_t n_hits             = 0;
+                            void dump(const char * tag) const {
+                                if (n_ops == 0) return;
+                                const double total_us = t_classify_us + t_miss_h2d_us +
+                                    t_slot_ids_build_us + t_set_ids_us + t_record_patch_us;
+                                fprintf(stderr,
+                                    "moe-cache-profile [%s]: %lld ops, %lld misses (%lld batches, %.2f miss/batch), %lld hits\n"
+                                    "  total host-side cache prep: %.1fms\n"
+                                    "  classify (lookup/miss):    %.1fms (%.2fus/op)\n"
+                                    "  miss H2D (set_async loop): %.1fms (%.2fus/op)\n"
+                                    "  slot_ids build (host):     %.1fms (%.2fus/op)\n"
+                                    "  set_ids (sync H2D):        %.1fms (%.2fus/op)\n"
+                                    "  record+patch:              %.1fms (%.2fus/op)\n",
+                                    tag, (long long) n_ops, (long long) n_misses,
+                                    (long long) n_miss_batches,
+                                    n_miss_batches > 0 ? (double) n_misses / n_miss_batches : 0.0,
+                                    (long long) n_hits,
+                                    total_us / 1000.0,
+                                    t_classify_us / 1000.0,       t_classify_us / std::max<int64_t>(1, n_ops),
+                                    t_miss_h2d_us / 1000.0,       t_miss_h2d_us / std::max<int64_t>(1, n_ops),
+                                    t_slot_ids_build_us / 1000.0, t_slot_ids_build_us / std::max<int64_t>(1, n_ops),
+                                    t_set_ids_us / 1000.0,        t_set_ids_us / std::max<int64_t>(1, n_ops),
+                                    t_record_patch_us / 1000.0,   t_record_patch_us / std::max<int64_t>(1, n_ops));
+                            }
+                        };
+                        static moe_prof prof;
+
+                        using clk = std::chrono::high_resolution_clock;
+                        auto t_a = clk::now();
+
                         // Step 1: classify experts as hit/miss; record
                         // (expert_id, slot) pairs for misses so we can batch
                         // contiguous-id H2Ds in step 2.
                         std::vector<int32_t> slot_of_expert(n_expert, -1);
                         std::vector<std::pair<int32_t,int>> miss_slot_pairs;
                         miss_slot_pairs.reserve(n_expert);
+                        int local_hits = 0;
                         for (int64_t id_i = 0; id_i < n_expert; ++id_i) {
                             if (!ggml_bitset_get(used_ids.data(), id_i)) continue;
                             int slot = ggml_moe_cache_lookup(
@@ -1828,20 +1874,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 miss_slot_pairs.emplace_back((int32_t) id_i, slot);
                                 ggml_moe_cache_record_slot(
                                     moe_cache, moe_layer_idx, moe_bucket, slot, (int32_t) id_i);
+                            } else {
+                                ++local_hits;
                             }
                             slot_of_expert[id_i] = slot;
                         }
+                        auto t_b = clk::now();
+                        prof.t_classify_us += std::chrono::duration<double, std::micro>(t_b - t_a).count();
+                        prof.n_hits   += local_hits;
+                        prof.n_misses += (int64_t) miss_slot_pairs.size();
 
                         // Step 2: H2D misses in contiguous-id+contiguous-slot
-                        // batches. When the cache is warming (slots 0..N-1
-                        // empty), select_slot_for_miss returns next_unused++
-                        // monotonically, so contiguous miss IDs map to
-                        // contiguous slots → ONE cudaMemcpyAsync covers the
-                        // whole run instead of N small ones. Cuts per-miss
-                        // pageable-staging overhead from ~57us to amortized.
+                        // batches. With round-robin slot assignment, miss IDs
+                        // in ascending order get contiguous slot indices, so
+                        // many batches collapse to one H2D.
                         ggml_tensor * pool_h2d = ggml_moe_cache_pool_tensor(
                             moe_cache, moe_layer_idx, moe_bucket);
                         const size_t slot_stride = pool_h2d ? pool_h2d->nb[2] : 0;
+                        int local_batches = 0;
                         for (size_t i = 0; i < miss_slot_pairs.size(); ) {
                             const int32_t first_id   = miss_slot_pairs[i].first;
                             const int     first_slot = miss_slot_pairs[i].second;
@@ -1859,12 +1909,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 (size_t) first_slot * slot_stride,
                                 run_len * expert_size);
                             i = j2;
+                            ++local_batches;
                         }
+                        auto t_c = clk::now();
+                        prof.t_miss_h2d_us += std::chrono::duration<double, std::micro>(t_c - t_b).count();
+                        prof.n_miss_batches += local_batches;
 
-                        // Build remapped slot_ids on host from the D2H'd
-                        // expert ids. ids tensor layout: [top_k, n_tokens]
-                        // with nb[0] = sizeof(int32), nb[1] = top_k * sizeof(int32).
-                        // We assume contiguous int32 layout (standard).
+                        // Build remapped slot_ids on host.
                         const int top_k    = (int) op_top_k;
                         const int n_tokens = (int) op_n_tokens;
                         std::vector<int32_t> slot_ids((size_t) top_k * n_tokens);
@@ -1876,23 +1927,28 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 slot_ids[(size_t) t * top_k + k] = slot_of_expert[eid];
                             }
                         }
+                        auto t_d = clk::now();
+                        prof.t_slot_ids_build_us += std::chrono::duration<double, std::micro>(t_d - t_c).count();
 
                         // H2D slot_ids onto the cache's ids tensor.
                         ggml_moe_cache_set_ids(moe_cache, moe_layer_idx, moe_bucket,
                             split_backend, slot_ids.data(), top_k, n_tokens);
+                        auto t_e = clk::now();
+                        prof.t_set_ids_us += std::chrono::duration<double, std::micro>(t_e - t_d).count();
 
-                        // Record the original src[2] BEFORE patching so
-                        // that next call's D2H (which sees the patched
-                        // value if the graph was reused) can resolve back.
+                        // Record the original src[2] BEFORE patching.
                         ggml_moe_cache_record_original_ids(
                             moe_cache, moe_layer_idx, moe_bucket, ids_tensor);
-
-                        // Repoint src[2] to our remapped ids tensor.
-                        // node->src[0] is set by split_graph to pool_tensor
-                        // (only when n_slots >= n_experts — otherwise the
-                        // cache stays inactive for this graph).
                         node->src[2] = ggml_moe_cache_ids_tensor(
                             moe_cache, moe_layer_idx, moe_bucket);
+                        auto t_f = clk::now();
+                        prof.t_record_patch_us += std::chrono::duration<double, std::micro>(t_f - t_e).count();
+                        ++prof.n_ops;
+                        if ((prof.n_ops % 5000) == 0) {
+                            char tag[32];
+                            snprintf(tag, sizeof(tag), "@%lld", (long long) prof.n_ops);
+                            prof.dump(tag);
+                        }
                     }
 
                     if (!moe_handled) {
