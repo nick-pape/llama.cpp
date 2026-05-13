@@ -1359,16 +1359,52 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
                     // create a copy of the input in the split's backend
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
-                        ggml_backend_t backend = sched->backends[cur_backend_id];
-                        for (int c = 0; c < sched->n_copies; c++) {
-                            struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
-                            ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
-                            if (sched->n_copies > 1) {
-                                ggml_set_input(tensor_copy);
-                                ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
+                        // MoE expert cache substitution: when src is an MoE
+                        // expert weight tensor identified by the cache, and
+                        // this node is the consuming MUL_MAT_ID, register the
+                        // cache's persistent slot-pool tensor as the canonical
+                        // input copy. The kernel then reads expert weights
+                        // directly from our backend-owned slot pool — no
+                        // gallocr-managed input_cpy, no D2D-on-hit.
+                        //
+                        // Stable across calls: the pool tensor's address is
+                        // set at cache init and never changes, so graph reuse
+                        // and CUDA-graph capture observe consistent pointers.
+                        bool cache_substituted = false;
+                        if (sched->moe_cache && node->op == GGML_OP_MUL_MAT_ID && j == 0 && node->src[2]) {
+                            ggml_moe_cache_t cache = (ggml_moe_cache_t) sched->moe_cache;
+                            int layer_idx = -1;
+                            enum ggml_moe_bucket bucket = GGML_MOE_BUCKET_INVALID;
+                            if (ggml_moe_cache_identify_tensor(cache, src,
+                                    ggml_moe_cache_n_layers(cache), &layer_idx, &bucket)) {
+                                const int top_k = (int) node->src[2]->ne[0];
+                                const int max_n_tokens = (int) std::max<int64_t>(8192, node->src[2]->ne[1]);
+                                if (ggml_moe_cache_bind_bucket(cache, layer_idx, bucket,
+                                        src, top_k, max_n_tokens)) {
+                                    ggml_tensor * pool = ggml_moe_cache_pool_tensor(cache, layer_idx, bucket);
+                                    if (pool) {
+                                        for (int c = 0; c < sched->n_copies; c++) {
+                                            tensor_id_copy(src_id, cur_backend_id, c) = pool;
+                                        }
+                                        SET_CAUSE(pool, "4.cpy.moe-cache");
+                                        cache_substituted = true;
+                                    }
+                                }
                             }
-                            tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
-                            SET_CAUSE(tensor_copy, "4.cpy");
+                        }
+
+                        if (!cache_substituted) {
+                            ggml_backend_t backend = sched->backends[cur_backend_id];
+                            for (int c = 0; c < sched->n_copies; c++) {
+                                struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
+                                ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
+                                if (sched->n_copies > 1) {
+                                    ggml_set_input(tensor_copy);
+                                    ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
+                                }
+                                tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
+                                SET_CAUSE(tensor_copy, "4.cpy");
+                            }
                         }
                         int n_inputs = split->n_inputs++;
                         GGML_ASSERT(n_inputs < GGML_SCHED_MAX_SPLIT_INPUTS);
@@ -1717,11 +1753,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         const bool dbg = dbg_op_count < 12;
                         const int64_t t0 = dbg ? ggml_time_us() : 0;
 
-                        // Walk used experts; on miss, pick a slot and H2D
-                        // the expert's bytes directly into the slot pool.
-                        // Record slot_of_expert[] for the ids-remap step.
+                        // Step 1: classify experts as hit/miss; record
+                        // (expert_id, slot) pairs for misses so we can batch
+                        // contiguous-id H2Ds in step 2.
                         std::vector<int32_t> slot_of_expert(n_expert, -1);
-                        int dbg_n_misses = 0;
+                        std::vector<std::pair<int32_t,int>> miss_slot_pairs;
+                        miss_slot_pairs.reserve(n_expert);
                         for (int64_t id_i = 0; id_i < n_expert; ++id_i) {
                             if (!ggml_bitset_get(used_ids.data(), id_i)) continue;
                             int slot = ggml_moe_cache_lookup(
@@ -1730,26 +1767,42 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 slot = ggml_moe_cache_select_slot_for_miss(
                                     moe_cache, moe_layer_idx, moe_bucket, (int32_t) id_i);
                                 if (slot < 0) continue;
-                                // H2D this expert into its new slot. Source
-                                // is the host expert weight tensor at
-                                // input->data + id_i * expert_size. The
-                                // tensor_set_async writes into pool_tensor
-                                // at offset slot * slot_stride.
-                                ggml_tensor * pool_tensor = ggml_moe_cache_pool_tensor(
-                                    moe_cache, moe_layer_idx, moe_bucket);
-                                const size_t slot_stride = pool_tensor->nb[2];
-                                const void * src = (const uint8_t *) input->data
-                                                 + (size_t) id_i * expert_size;
-                                ggml_backend_tensor_set_async(split_backend,
-                                    pool_tensor,
-                                    src,
-                                    (size_t) slot * slot_stride,
-                                    expert_size);
+                                miss_slot_pairs.emplace_back((int32_t) id_i, slot);
                                 ggml_moe_cache_record_slot(
                                     moe_cache, moe_layer_idx, moe_bucket, slot, (int32_t) id_i);
-                                ++dbg_n_misses;
                             }
                             slot_of_expert[id_i] = slot;
+                        }
+                        const int dbg_n_misses = (int) miss_slot_pairs.size();
+                        const int64_t t1_classify = dbg ? ggml_time_us() : 0;
+
+                        // Step 2: H2D misses in contiguous-id+contiguous-slot
+                        // batches. When the cache is warming (slots 0..N-1
+                        // empty), select_slot_for_miss returns next_unused++
+                        // monotonically, so contiguous miss IDs map to
+                        // contiguous slots → ONE cudaMemcpyAsync covers the
+                        // whole run instead of N small ones. Cuts per-miss
+                        // pageable-staging overhead from ~57us to amortized.
+                        ggml_tensor * pool_h2d = ggml_moe_cache_pool_tensor(
+                            moe_cache, moe_layer_idx, moe_bucket);
+                        const size_t slot_stride = pool_h2d ? pool_h2d->nb[2] : 0;
+                        for (size_t i = 0; i < miss_slot_pairs.size(); ) {
+                            const int32_t first_id   = miss_slot_pairs[i].first;
+                            const int     first_slot = miss_slot_pairs[i].second;
+                            size_t j2 = i + 1;
+                            while (j2 < miss_slot_pairs.size() &&
+                                   miss_slot_pairs[j2].first  == miss_slot_pairs[j2 - 1].first  + 1 &&
+                                   miss_slot_pairs[j2].second == miss_slot_pairs[j2 - 1].second + 1) {
+                                ++j2;
+                            }
+                            const size_t run_len = j2 - i;
+                            const void * src = (const uint8_t *) input->data
+                                             + (size_t) first_id * expert_size;
+                            ggml_backend_tensor_set_async(split_backend,
+                                pool_h2d, src,
+                                (size_t) first_slot * slot_stride,
+                                run_len * expert_size);
+                            i = j2;
                         }
                         const int64_t t1 = dbg ? ggml_time_us() : 0;
 
@@ -1775,13 +1828,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         ggml_moe_cache_set_ids(moe_cache, moe_layer_idx, moe_bucket,
                             split_backend, slot_ids.data(), top_k, n_tokens);
 
-                        const int64_t t3 = dbg ? ggml_time_us() : 0;
-
-                        // Repoint the MoE op's src[0] and src[2]. The kernel
-                        // will read from the slot pool (smaller tensor with
-                        // ne[2] = n_slots) using slot indices in [0, n_slots).
-                        node->src[0] = ggml_moe_cache_pool_tensor(
-                            moe_cache, moe_layer_idx, moe_bucket);
+                        // Repoint the MoE op's src[2] to the cache's ids
+                        // tensor. node->src[0] is already pool_tensor —
+                        // set by split_graph via tensor_id_copy registration.
                         node->src[2] = ggml_moe_cache_ids_tensor(
                             moe_cache, moe_layer_idx, moe_bucket);
 
@@ -1789,11 +1838,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             const int64_t t4 = ggml_time_us();
                             fprintf(stderr,
                                 "moe-cache-time [op=%d L=%d B=%d uniq=%d miss=%d tok=%d]: "
-                                "lookup_h2d=%lldus build=%lldus set_ids=%lldus patch=%lldus total=%lldus\n",
+                                "classify=%lldus h2d=%lldus build=%lldus set_ids+patch=%lldus total=%lldus\n",
                                 dbg_op_count, moe_layer_idx, (int) moe_bucket,
                                 n_unique_used, dbg_n_misses, (int) op_n_tokens,
-                                (long long)(t1 - t0), (long long)(t2 - t1),
-                                (long long)(t3 - t2), (long long)(t4 - t3),
+                                (long long)(t1_classify - t0), (long long)(t1 - t1_classify),
+                                (long long)(t2 - t1), (long long)(t4 - t2),
                                 (long long)(t4 - t0));
                             ++dbg_op_count;
                         }
