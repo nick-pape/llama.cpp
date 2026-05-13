@@ -1747,9 +1747,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         for (int64_t id_i = 0; id_i < n_expert; ++id_i) {
                             if (ggml_bitset_get(used_ids.data(), id_i)) ++n_unique_used;
                         }
-                        ggml_tensor * pool_tensor = ggml_moe_cache_pool_tensor(
-                            moe_cache, moe_layer_idx, moe_bucket);
-                        const int n_slots = pool_tensor ? (int) pool_tensor->ne[2] : 0;
+                        // Use the bookkeeping n_slots (not pool_tensor->ne[2]),
+                        // which may be larger than n_slots in PROBE #3.
+                        const int n_slots = ggml_moe_cache_n_slots(moe_cache, moe_layer_idx, moe_bucket);
                         moe_overflow = n_unique_used > n_slots;
                     }
 

@@ -197,6 +197,11 @@ void ggml_moe_cache_release_overflow_scratches(
 // Number of layers the cache was sized for.
 int ggml_moe_cache_n_layers(ggml_moe_cache_t cache);
 
+// Actual eviction-managed slot count for (layer, bucket). May differ
+// from pool_tensor->ne[2] when the pool tensor is over-allocated for
+// kernel-dispatch reasons (PROBE #3).
+int ggml_moe_cache_n_slots(ggml_moe_cache_t cache, int layer_idx, enum ggml_moe_bucket bucket);
+
 // Total VRAM allocated across all slot pools + id buffers.
 size_t ggml_moe_cache_total_bytes(ggml_moe_cache_t cache);
 

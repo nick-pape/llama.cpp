@@ -312,11 +312,19 @@ bool ggml_moe_cache_bind_bucket(
     cell.top_k       = top_k;
     cell.max_n_tokens = max_n_tokens;
 
+    // PROBE #3 (kernel-dispatch test): allocate pool with ne[2]=n_experts
+    // (instead of n_slots). The kernel iterates 0..ne[2] and skips slots
+    // with no tokens; this probe tests whether smaller ne[2] picks a
+    // slower MMQ kernel path. Bookkeeping (eviction, lookups) still
+    // uses cell.n_slots, but the kernel-facing tensor pretends to be
+    // full-size. Slots [n_slots, n_experts) are uninitialized garbage
+    // never referenced by slot_ids.
+    const int pool_kernel_n = (int) n_experts;
     // +512 bytes of MMQ-safety padding past the last slot. The CUDA MMQ
     // kernel reads slightly past expert boundaries; the original
     // copy_experts H2D path adds the same padding to input_cpy. Without
     // it, the last slot's kernel read crashes on illegal memory access.
-    const size_t pool_bytes = (size_t) cell.n_slots * cell.slot_stride + 512;
+    const size_t pool_bytes = (size_t) pool_kernel_n * cell.slot_stride + 512;
     const size_t ids_bytes  = (size_t) top_k * max_n_tokens * sizeof(int32_t);
 
     if (c->max_bytes_cap > 0 && c->total_bytes + pool_bytes + ids_bytes > c->max_bytes_cap) {
@@ -352,7 +360,7 @@ bool ggml_moe_cache_bind_bucket(
     // ggml_gallocr leaves it alone.
     cell.pool_tensor = ggml_new_tensor_3d(
         c->tensor_ctx, weight->type,
-        weight->ne[0], weight->ne[1], cell.n_slots);
+        weight->ne[0], weight->ne[1], pool_kernel_n);
     if (!cell.pool_tensor) {
         moe_cache_log("cell (layer=%d, bucket=%d) failed to construct pool tensor wrapper", layer_idx, (int) bucket);
         ggml_backend_buffer_free(cell.pool_buf); cell.pool_buf = nullptr;
@@ -362,7 +370,7 @@ bool ggml_moe_cache_bind_bucket(
     cell.pool_tensor->nb[0] = weight->nb[0];
     cell.pool_tensor->nb[1] = weight->nb[1];
     cell.pool_tensor->nb[2] = cell.slot_stride;
-    cell.pool_tensor->nb[3] = cell.slot_stride * cell.n_slots;
+    cell.pool_tensor->nb[3] = cell.slot_stride * pool_kernel_n;
     cell.pool_tensor->data   = cell.pool_base;
     cell.pool_tensor->buffer = cell.pool_buf;
     snprintf(cell.pool_tensor->name, sizeof(cell.pool_tensor->name),
@@ -631,6 +639,14 @@ bool ggml_moe_cache_set_ids(
 
 int ggml_moe_cache_n_layers(ggml_moe_cache_t c) {
     return c ? c->n_layers : 0;
+}
+
+int ggml_moe_cache_n_slots(ggml_moe_cache_t c, int layer_idx, ggml_moe_bucket bucket) {
+    if (!c) return 0;
+    if (bucket < 0 || bucket >= GGML_MOE_BUCKET_COUNT) return 0;
+    if (layer_idx < 0 || layer_idx >= c->n_layers)     return 0;
+    auto & cell = c->cells[cell_idx(layer_idx, bucket)];
+    return cell.bound ? cell.n_slots : 0;
 }
 
 size_t ggml_moe_cache_total_bytes(ggml_moe_cache_t c) {
