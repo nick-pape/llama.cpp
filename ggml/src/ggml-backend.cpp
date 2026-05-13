@@ -1382,7 +1382,14 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                                 if (ggml_moe_cache_bind_bucket(cache, layer_idx, bucket,
                                         src, top_k, max_n_tokens)) {
                                     ggml_tensor * pool = ggml_moe_cache_pool_tensor(cache, layer_idx, bucket);
-                                    if (pool) {
+                                    // Only substitute when the pool can hold ALL experts
+                                    // (n_slots >= n_experts). For smaller caches, the
+                                    // compute_splits prefill-overflow fallback would
+                                    // try to write to input_cpy at expert_id * expert_size
+                                    // offsets that don't fit in the pool buffer —
+                                    // ggml_backend_tensor_set asserts OOB. Skip
+                                    // substitution; cache stays inactive for this op.
+                                    if (pool && pool->ne[2] >= src->ne[2]) {
                                         for (int c = 0; c < sched->n_copies; c++) {
                                             tensor_id_copy(src_id, cur_backend_id, c) = pool;
                                         }
@@ -1843,11 +1850,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         ggml_moe_cache_record_original_ids(
                             moe_cache, moe_layer_idx, moe_bucket, ids_tensor);
 
-                        // Repoint the MoE op's src[2] to the cache's ids
-                        // tensor. node->src[0] is already pool_tensor —
-                        // set by split_graph via tensor_id_copy registration.
+                        // Repoint src[2] to our remapped ids tensor.
                         node->src[2] = ggml_moe_cache_ids_tensor(
                             moe_cache, moe_layer_idx, moe_bucket);
+
+                        // node->src[0] is set by split_graph to pool_tensor
+                        // ONLY when n_slots >= n_experts (so the fallback
+                        // path can safely write to input_cpy). For smaller
+                        // caches we need to patch here so the kernel reads
+                        // the slot pool. This is the slower path (breaks
+                        // CUDA-graph capture stability) but correctness-first.
+                        ggml_tensor * pool = ggml_moe_cache_pool_tensor(
+                            moe_cache, moe_layer_idx, moe_bucket);
+                        if (pool && node->src[0] != pool) {
+                            node->src[0] = pool;
+                        }
 
                         if (dbg) {
                             const int64_t t4 = ggml_time_us();
