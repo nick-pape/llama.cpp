@@ -4945,6 +4945,145 @@ extern "C" bool ggml_cuda_moe_cache_h2d_async(
     return err == cudaSuccess;
 }
 
+// GPU-resident expert->slot mapping + gather kernel.
+//
+// Replaces the per-op host loop that builds slot_ids and the
+// subsequent sync H2D. The mapping table is a tiny device buffer of
+// n_experts int32 entries (1 KB for Qwen3.6 with 256 experts). Each
+// op launches a small gather: slot_ids[i] = mapping[expert_ids[i]].
+// Mapping is updated incrementally via 4-byte H2Ds when slot
+// reassignments happen (on miss).
+extern "C" void * ggml_cuda_moe_cache_mapping_alloc(ggml_backend_t backend, size_t n_int32) {
+    if (!ggml_backend_is_cuda(backend) || n_int32 == 0) return nullptr;
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    void * p = nullptr;
+    // Synchronous cudaMalloc, not the pool-backed Async variant —
+    // prior experiments showed cudaMallocAsync'd memory could be
+    // unreachable from our kernel launches in some contexts. Plain
+    // cudaMalloc returns a stable device pointer in the default
+    // address space.
+    cudaError_t err = cudaMalloc(&p, n_int32 * sizeof(int32_t));
+    if (err != cudaSuccess) return nullptr;
+    // Init to 0xffffffff so unmapped entries read as -1 in int32.
+    cudaMemsetAsync(p, 0xff, n_int32 * sizeof(int32_t), ctx->stream());
+    return p;
+}
+
+extern "C" void ggml_cuda_moe_cache_mapping_free(ggml_backend_t backend, void * mapping) {
+    if (!ggml_backend_is_cuda(backend) || !mapping) return;
+    (void) backend;
+    cudaFree(mapping);
+}
+
+extern "C" bool ggml_cuda_moe_cache_mapping_set(
+        ggml_backend_t backend, void * mapping, int32_t expert_id, int32_t slot_id) {
+    if (!ggml_backend_is_cuda(backend) || !mapping || expert_id < 0) return false;
+    (void) backend;
+    int32_t * dst = (int32_t *) mapping + expert_id;
+    // Synchronous cudaMemcpy: small pageable-source async copies have
+    // undefined stream-ordering wrt the kernel that reads mapping[]
+    // later. Using sync guarantees the write lands before we return,
+    // and the kernel's launch-on-stream-after-return ordering is
+    // unambiguous.
+    cudaError_t err = cudaMemcpy(dst, &slot_id, sizeof(int32_t), cudaMemcpyHostToDevice);
+    return err == cudaSuccess;
+}
+
+__global__ void moe_remap_kernel(
+        const int32_t * __restrict__ expert_ids,
+        const int32_t * __restrict__ mapping,
+        int32_t *       __restrict__ slot_ids,
+        int                          n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        // Stage 2b: read mapping (cudaMallocAsync'd by us) — tests if
+        // our own allocation is reachable.
+        slot_ids[i] = mapping[i];   // valid since n <= n_experts
+        (void) expert_ids;
+    }
+}
+
+extern "C" bool ggml_cuda_moe_cache_remap_ids(
+        ggml_backend_t backend,
+        const void * expert_ids, const void * mapping,
+        void * slot_ids_out, int n) {
+    if (!ggml_backend_is_cuda(backend) || !expert_ids || !mapping || !slot_ids_out || n <= 0) {
+        return false;
+    }
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    static int call_n = 0;
+    if (call_n < 3) { fprintf(stderr, "remap_ids#%d enter (ids=%p map=%p dst=%p n=%d)\n", call_n, expert_ids, mapping, slot_ids_out, n); fflush(stderr); }
+
+    // SELF-TEST PROBE: allocate a brand-new device buffer, populate
+    // it via cudaMemcpy, launch the kernel reading from it. If this
+    // crashes too, the kernel context itself is broken. If it works,
+    // the issue is with the pointers we're passing in.
+    static bool selftest_done = false;
+    if (!selftest_done) {
+        selftest_done = true;
+        int32_t host_src[16];
+        for (int i = 0; i < 16; ++i) host_src[i] = i * 10;
+        int32_t * dev_src  = nullptr;
+        int32_t * dev_map  = nullptr;
+        int32_t * dev_dst  = nullptr;
+        cudaError_t e1 = cudaMalloc((void**)&dev_src, 16 * sizeof(int32_t));
+        cudaError_t e2 = cudaMalloc((void**)&dev_map, 16 * sizeof(int32_t));
+        cudaError_t e3 = cudaMalloc((void**)&dev_dst, 16 * sizeof(int32_t));
+        fprintf(stderr, "selftest: malloc results %d %d %d\n", e1, e2, e3);
+        cudaMemcpy(dev_src, host_src, 16 * sizeof(int32_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(dev_map, host_src, 16 * sizeof(int32_t), cudaMemcpyHostToDevice);
+        moe_remap_kernel<<<1, 256, 0, ctx->stream()>>>(dev_src, dev_map, dev_dst, 16);
+        cudaError_t e4 = cudaStreamSynchronize(ctx->stream());
+        fprintf(stderr, "selftest: launch+sync result %d (%s)\n", e4, cudaGetErrorString(e4));
+        if (e4 == cudaSuccess) {
+            int32_t host_dst[16];
+            cudaMemcpy(host_dst, dev_dst, 16 * sizeof(int32_t), cudaMemcpyDeviceToHost);
+            fprintf(stderr, "selftest: dst[0..3] = %d %d %d %d\n", host_dst[0], host_dst[1], host_dst[2], host_dst[3]);
+        }
+        cudaFree(dev_src); cudaFree(dev_map); cudaFree(dev_dst);
+    }
+
+    static int probe_count = 0;
+    if (probe_count < 3) {
+        cudaPointerAttributes a1, a2, a3;
+        cudaError_t r1 = cudaPointerGetAttributes(&a1, expert_ids);
+        cudaError_t r2 = cudaPointerGetAttributes(&a2, mapping);
+        cudaError_t r3 = cudaPointerGetAttributes(&a3, slot_ids_out);
+        fprintf(stderr, "ptrcheck: ids=%p type=%d dev=%d (err %d)  map=%p type=%d dev=%d (err %d)  dst=%p type=%d dev=%d (err %d)  ctx_dev=%d\n",
+            expert_ids, (int)a1.type, a1.device, (int)r1,
+            mapping, (int)a2.type, a2.device, (int)r2,
+            slot_ids_out, (int)a3.type, a3.device, (int)r3,
+            ctx->device);
+        ++probe_count;
+    }
+
+    cudaGetLastError();   // clear sticky
+    cudaError_t pre_sync = cudaStreamSynchronize(ctx->stream());
+    if (call_n < 3) { fprintf(stderr, "remap_ids#%d pre-sync=%d\n", call_n, pre_sync); fflush(stderr); }
+
+    const int block = 256;
+    const int grid  = (n + block - 1) / block;
+    moe_remap_kernel<<<grid, block, 0, ctx->stream()>>>(
+        (const int32_t *) expert_ids, (const int32_t *) mapping,
+        (int32_t *) slot_ids_out, n);
+    cudaError_t launch_err = cudaGetLastError();
+    if (call_n < 3) { fprintf(stderr, "remap_ids#%d launch=%d\n", call_n, launch_err); fflush(stderr); }
+    if (launch_err != cudaSuccess) { ++call_n; return false; }
+    cudaError_t sync_err = cudaStreamSynchronize(ctx->stream());
+    if (call_n < 3) {
+        // Read back slot_ids to verify gather output.
+        int32_t host_check[16];
+        const int read_n = n < 16 ? n : 16;
+        cudaMemcpy(host_check, slot_ids_out, read_n * sizeof(int32_t), cudaMemcpyDeviceToHost);
+        fprintf(stderr, "remap_ids#%d post-sync=%d slot_ids=[", call_n, sync_err);
+        for (int i = 0; i < read_n; ++i) fprintf(stderr, "%d,", host_check[i]);
+        fprintf(stderr, "]\n"); fflush(stderr);
+    }
+    ++call_n;
+    return sync_err == cudaSuccess;
+}
+
 static const char * ggml_backend_cuda_device_get_name(ggml_backend_dev_t dev) {
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
     return ctx->name.c_str();
@@ -5686,6 +5825,18 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_cuda_moe_cache_h2d_async") == 0) {
         return (void *)ggml_cuda_moe_cache_h2d_async;
+    }
+    if (strcmp(name, "ggml_cuda_moe_cache_mapping_alloc") == 0) {
+        return (void *)ggml_cuda_moe_cache_mapping_alloc;
+    }
+    if (strcmp(name, "ggml_cuda_moe_cache_mapping_free") == 0) {
+        return (void *)ggml_cuda_moe_cache_mapping_free;
+    }
+    if (strcmp(name, "ggml_cuda_moe_cache_mapping_set") == 0) {
+        return (void *)ggml_cuda_moe_cache_mapping_set;
+    }
+    if (strcmp(name, "ggml_cuda_moe_cache_remap_ids") == 0) {
+        return (void *)ggml_cuda_moe_cache_remap_ids;
     }
     return nullptr;
 }

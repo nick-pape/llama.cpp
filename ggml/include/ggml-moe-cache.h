@@ -203,6 +203,21 @@ void ggml_moe_cache_release_overflow_scratches(
     ggml_moe_cache_t        cache,
     ggml_backend_t          backend);
 
+// Launch the GPU-side gather kernel:
+//   slot_ids[i] = mapping[expert_ids[i]] for i in [0, n_elements).
+// `expert_ids_data` and `slot_ids_data` are device pointers (e.g.
+// from ggml_tensor->data). The mapping table is allocated lazily on
+// first call. Returns false on non-CUDA backend or launch failure;
+// caller should fall back to host build + set_ids.
+bool ggml_moe_cache_remap_ids_on_device(
+    ggml_moe_cache_t        cache,
+    ggml_backend_t          backend,
+    int                     layer_idx,
+    enum ggml_moe_bucket    bucket,
+    const void *            expert_ids_data,
+    void *                  slot_ids_data,
+    int                     n_elements);
+
 // Number of layers the cache was sized for.
 int ggml_moe_cache_n_layers(ggml_moe_cache_t cache);
 

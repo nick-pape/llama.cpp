@@ -1939,24 +1939,74 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         prof.t_miss_h2d_us += std::chrono::duration<double, std::micro>(t_c - t_b).count();
                         prof.n_miss_batches += local_batches;
 
-                        // Build remapped slot_ids on host.
+                        // Slot_ids built on GPU by the gather kernel:
+                        //   slot_ids[i] = mapping[expert_ids[i]]
+                        // No host-side build loop, no sync H2D.
+                        // ids_tensor->ne shape is updated to (top_k,
+                        // n_tokens) before the launch; the model's
+                        // selected_experts (= node->src[2] before our
+                        // patch, recorded in ids_tensor here) provides
+                        // expert_ids on-device.
                         const int top_k    = (int) op_top_k;
                         const int n_tokens = (int) op_n_tokens;
-                        std::vector<int32_t> slot_ids((size_t) top_k * n_tokens);
-                        const size_t stride0 = ids_tensor->nb[0] / sizeof(int32_t);
-                        const size_t stride1 = ids_tensor->nb[1] / sizeof(int32_t);
-                        for (int t = 0; t < n_tokens; ++t) {
-                            for (int k = 0; k < top_k; ++k) {
-                                const int32_t eid = ids[t * stride1 + k * stride0];
-                                slot_ids[(size_t) t * top_k + k] = slot_of_expert[eid];
-                            }
-                        }
                         auto t_d = clk::now();
                         prof.t_slot_ids_build_us += std::chrono::duration<double, std::micro>(t_d - t_c).count();
 
-                        // H2D slot_ids onto the cache's ids tensor.
-                        ggml_moe_cache_set_ids(moe_cache, moe_layer_idx, moe_bucket,
-                            split_backend, slot_ids.data(), top_k, n_tokens);
+                        ggml_tensor * dst_ids = ggml_moe_cache_ids_tensor(
+                            moe_cache, moe_layer_idx, moe_bucket);
+                        // Update dst_ids effective shape (kernel reads this).
+                        if (dst_ids) {
+                            dst_ids->ne[0] = top_k;
+                            dst_ids->ne[1] = n_tokens;
+                            dst_ids->ne[2] = 1;
+                            dst_ids->ne[3] = 1;
+                            dst_ids->nb[0] = sizeof(int32_t);
+                            dst_ids->nb[1] = (size_t) top_k * sizeof(int32_t);
+                            dst_ids->nb[2] = dst_ids->nb[1] * n_tokens;
+                            dst_ids->nb[3] = dst_ids->nb[2];
+                        }
+                        const int n_elements = top_k * n_tokens;
+                        // Only safe when expert_ids live in device-readable
+                        // memory matching split_backend. ids_tensor can be
+                        // reassigned earlier in this function to an
+                        // unpatched original (potentially host-resident)
+                        // when the tensor is a future input of the same
+                        // split — that case must fall back to host build.
+                        const bool ids_on_gpu = ids_tensor && ids_tensor->buffer &&
+                            !ggml_backend_buffer_is_host(ids_tensor->buffer) &&
+                            ids_backend == split_backend;
+                        // TEMP: force fallback to verify the rest works.
+                        const char * dbg_force_host = getenv("MOE_REMAP_FORCE_HOST");
+                        const bool force_host = dbg_force_host && *dbg_force_host && *dbg_force_host != '0';
+                        const bool gpu_remapped = !force_host && ids_on_gpu && ids_tensor->data && dst_ids && dst_ids->data &&
+                            ggml_moe_cache_remap_ids_on_device(
+                                moe_cache, split_backend, moe_layer_idx, moe_bucket,
+                                ids_tensor->data, dst_ids->data, n_elements);
+                        static int dbg = 0;
+                        if (dbg < 3) {
+                            fprintf(stderr, "moe-remap-dbg: ids_on_gpu=%d gpu_remapped=%d ids_name=%s ids_data=%p dst_data=%p n=%d\n",
+                                ids_on_gpu ? 1 : 0, gpu_remapped ? 1 : 0,
+                                ids_tensor ? ids_tensor->name : "(null)",
+                                ids_tensor ? ids_tensor->data : nullptr,
+                                dst_ids ? dst_ids->data : nullptr, n_elements);
+                            ++dbg;
+                        }
+                        if (!gpu_remapped) {
+                            // Fallback: host build + sync H2D (original
+                            // path). Triggers on non-CUDA backend or if
+                            // mapping_alloc / remap reg-proc isn't there.
+                            std::vector<int32_t> slot_ids((size_t) n_elements);
+                            const size_t stride0 = ids_tensor->nb[0] / sizeof(int32_t);
+                            const size_t stride1 = ids_tensor->nb[1] / sizeof(int32_t);
+                            for (int t = 0; t < n_tokens; ++t) {
+                                for (int k = 0; k < top_k; ++k) {
+                                    const int32_t eid = ids[t * stride1 + k * stride0];
+                                    slot_ids[(size_t) t * top_k + k] = slot_of_expert[eid];
+                                }
+                            }
+                            ggml_moe_cache_set_ids(moe_cache, moe_layer_idx, moe_bucket,
+                                split_backend, slot_ids.data(), top_k, n_tokens);
+                        }
                         auto t_e = clk::now();
                         prof.t_set_ids_us += std::chrono::duration<double, std::micro>(t_e - t_d).count();
 

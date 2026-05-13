@@ -96,6 +96,19 @@ struct ggml_moe_cache {
         std::vector<uint64_t> last_tick;  // [n_slots]: last access tick (LRU / SLRU / tiebreak)
         std::vector<uint8_t>  tier;       // [n_slots]: 0=probationary, 1=protected (SLRU only)
 
+        // GPU-resident expert->slot mapping (allocated via the regular
+        // ggml backend buffer path so the kernel can address it).
+        // mapping[expert_id] = slot_id if resident, -1 if not.
+        ggml_backend_buffer_t mapping_buf = nullptr;
+        void *                mapping_dev = nullptr;
+        // Expert ids whose mapping[] entry needs a 4-byte H2D before
+        // the next remap kernel (set in record_slot when a slot is
+        // reassigned). Flushed by ggml_moe_cache_remap_ids_on_device.
+        std::vector<int32_t> dirty_mapping_experts;
+        // Host shadow of the GPU mapping; lets us compute the value
+        // we need to flush without re-querying the device.
+        std::vector<int32_t> mapping_host;
+
         // Per-cell stats.
         uint64_t n_lookups = 0;
         uint64_t n_hits    = 0;
@@ -240,8 +253,9 @@ void ggml_moe_cache_free(ggml_moe_cache_t c) {
     }
 
     for (auto & cell : c->cells) {
-        if (cell.pool_buf) ggml_backend_buffer_free(cell.pool_buf);
-        if (cell.ids_buf)  ggml_backend_buffer_free(cell.ids_buf);
+        if (cell.pool_buf)    ggml_backend_buffer_free(cell.pool_buf);
+        if (cell.ids_buf)     ggml_backend_buffer_free(cell.ids_buf);
+        if (cell.mapping_buf) ggml_backend_buffer_free(cell.mapping_buf);
     }
     if (c->scratch_buf)    ggml_backend_buffer_free(c->scratch_buf);
     if (c->tensor_ctx)     ggml_free(c->tensor_ctx);
@@ -512,12 +526,24 @@ void ggml_moe_cache_record_slot(
     const int32_t prev = cell.slot_to_expert[slot_idx];
     if (prev >= 0) {
         cell.expert_to_slot.erase(prev);
+        // Mark prev as no-longer-resident in the GPU mapping.
+        if (!cell.mapping_host.empty()) {
+            cell.mapping_host[prev] = -1;
+            cell.dirty_mapping_experts.push_back(prev);
+        }
     }
     cell.slot_to_expert[slot_idx] = expert_id;
     cell.expert_to_slot[expert_id] = slot_idx;
     cell.freq[slot_idx]      = 1;
     cell.last_tick[slot_idx] = ++c->tick;
     cell.tier[slot_idx]      = 0;   // new entry starts probationary (SLRU)
+
+    // Update GPU mapping shadow + dirty list so the next remap kernel
+    // sees the new slot for this expert.
+    if (!cell.mapping_host.empty() && expert_id < (int32_t) cell.mapping_host.size()) {
+        cell.mapping_host[expert_id] = slot_idx;
+        cell.dirty_mapping_experts.push_back(expert_id);
+    }
 
     c->stats.total_h2d_bytes += (int64_t) cell.expert_size;
 }
@@ -696,4 +722,142 @@ void ggml_moe_cache_get_stats(ggml_moe_cache_t c, ggml_moe_cache_stats * out) {
 void ggml_moe_cache_reset_stats(ggml_moe_cache_t c) {
     if (!c) return;
     c->stats = {};
+}
+
+// -----------------------------------------------------------------------------
+// GPU-side expert -> slot remap (per-op gather kernel)
+// -----------------------------------------------------------------------------
+
+typedef void * (*moe_mapping_alloc_fn_t)(ggml_backend_t, size_t);
+typedef void   (*moe_mapping_free_fn_t)(ggml_backend_t, void *);
+typedef bool   (*moe_mapping_set_fn_t)(ggml_backend_t, void *, int32_t, int32_t);
+typedef bool   (*moe_remap_fn_t)(ggml_backend_t, const void *, const void *, void *, int);
+
+static moe_mapping_alloc_fn_t resolve_mapping_alloc(ggml_backend_t backend) {
+    static moe_mapping_alloc_fn_t cached = nullptr;
+    static bool looked_up = false;
+    if (looked_up) return cached;
+    auto * dev = ggml_backend_get_device(backend);
+    auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (reg) cached = (moe_mapping_alloc_fn_t) ggml_backend_reg_get_proc_address(
+        reg, "ggml_cuda_moe_cache_mapping_alloc");
+    looked_up = true;
+    return cached;
+}
+
+static moe_mapping_free_fn_t resolve_mapping_free(ggml_backend_t backend) {
+    static moe_mapping_free_fn_t cached = nullptr;
+    static bool looked_up = false;
+    if (looked_up) return cached;
+    auto * dev = ggml_backend_get_device(backend);
+    auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (reg) cached = (moe_mapping_free_fn_t) ggml_backend_reg_get_proc_address(
+        reg, "ggml_cuda_moe_cache_mapping_free");
+    looked_up = true;
+    return cached;
+}
+
+static moe_mapping_set_fn_t resolve_mapping_set(ggml_backend_t backend) {
+    static moe_mapping_set_fn_t cached = nullptr;
+    static bool looked_up = false;
+    if (looked_up) return cached;
+    auto * dev = ggml_backend_get_device(backend);
+    auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (reg) cached = (moe_mapping_set_fn_t) ggml_backend_reg_get_proc_address(
+        reg, "ggml_cuda_moe_cache_mapping_set");
+    looked_up = true;
+    return cached;
+}
+
+static moe_remap_fn_t resolve_remap(ggml_backend_t backend) {
+    static moe_remap_fn_t cached = nullptr;
+    static bool looked_up = false;
+    if (looked_up) return cached;
+    auto * dev = ggml_backend_get_device(backend);
+    auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (reg) cached = (moe_remap_fn_t) ggml_backend_reg_get_proc_address(
+        reg, "ggml_cuda_moe_cache_remap_ids");
+    looked_up = true;
+    return cached;
+}
+
+bool ggml_moe_cache_remap_ids_on_device(
+        ggml_moe_cache_t c, ggml_backend_t backend,
+        int layer_idx, ggml_moe_bucket bucket,
+        const void * expert_ids_data, void * slot_ids_data, int n_elements) {
+    if (!c || !backend || !expert_ids_data || !slot_ids_data || n_elements <= 0) return false;
+    if (bucket < 0 || bucket >= GGML_MOE_BUCKET_COUNT) return false;
+    if (layer_idx < 0 || layer_idx >= c->n_layers)     return false;
+    auto & cell = c->cells[cell_idx(layer_idx, bucket)];
+    if (!cell.bound) return false;
+
+    // Lazy-init mapping table + host shadow.
+    if (!cell.mapping_dev) {
+        // Use the ggml backend's regular buffer allocator, same path
+        // as the slot pool and ids tensor. cudaMalloc / cudaMallocAsync
+        // returned device pointers that the gather kernel couldn't
+        // read from in our context (verified via staged-probe kernel).
+        auto * buft = ggml_backend_get_default_buffer_type(c->backend);
+        const size_t bytes = (size_t) cell.n_experts * sizeof(int32_t);
+        cell.mapping_buf = ggml_backend_buft_alloc_buffer(buft, bytes);
+        if (!cell.mapping_buf) {
+            moe_cache_log("remap_ids: mapping buft_alloc(%zu) failed", bytes);
+            return false;
+        }
+        cell.mapping_dev = ggml_backend_buffer_get_base(cell.mapping_buf);
+        cell.mapping_host.assign((size_t) cell.n_experts, -1);
+        // Initialize device memory to -1. ggml_backend_tensor_memset
+        // isn't readily available for raw buffers; do a small H2D of
+        // the host shadow instead.
+        // Use a temporary ggml_tensor view of the buffer for the H2D.
+        ggml_init_params ip = { /*.mem_size=*/ 1024, /*.mem_buffer=*/ nullptr, /*.no_alloc=*/ true };
+        ggml_context * tmp_ctx = ggml_init(ip);
+        if (tmp_ctx) {
+            ggml_tensor * t = ggml_new_tensor_1d(tmp_ctx, GGML_TYPE_I32, cell.n_experts);
+            if (t) {
+                t->buffer = cell.mapping_buf;
+                t->data = cell.mapping_dev;
+                ggml_backend_tensor_set(t, cell.mapping_host.data(), 0, bytes);
+            }
+            ggml_free(tmp_ctx);
+        }
+        // Re-stage already-resident entries (cache may have been
+        // warmed before the first remap call).
+        for (int s = 0; s < cell.n_slots; ++s) {
+            const int32_t e = cell.slot_to_expert[s];
+            if (e >= 0 && e < (int32_t) cell.mapping_host.size()) {
+                cell.mapping_host[e] = s;
+                cell.dirty_mapping_experts.push_back(e);
+            }
+        }
+    }
+
+    // Flush dirty entries to device.
+    if (!cell.dirty_mapping_experts.empty()) {
+        auto set_fn = resolve_mapping_set(backend);
+        if (!set_fn) return false;
+        // Dedupe so we issue at most one H2D per expert per call.
+        std::sort(cell.dirty_mapping_experts.begin(), cell.dirty_mapping_experts.end());
+        auto last = std::unique(cell.dirty_mapping_experts.begin(), cell.dirty_mapping_experts.end());
+        cell.dirty_mapping_experts.erase(last, cell.dirty_mapping_experts.end());
+        static int dbg_flush = 0;
+        if (dbg_flush < 3) {
+            fprintf(stderr, "remap_flush#%d L=%d B=%d dirty_n=%zu (first few: ", dbg_flush, layer_idx, (int)bucket, cell.dirty_mapping_experts.size());
+            for (size_t i = 0; i < cell.dirty_mapping_experts.size() && i < 8; ++i) {
+                int32_t e = cell.dirty_mapping_experts[i];
+                fprintf(stderr, "[e=%d s=%d] ", e, cell.mapping_host[e]);
+            }
+            fprintf(stderr, ")\n"); fflush(stderr);
+            ++dbg_flush;
+        }
+        for (int32_t e : cell.dirty_mapping_experts) {
+            if (e < 0 || e >= (int32_t) cell.mapping_host.size()) continue;
+            set_fn(backend, cell.mapping_dev, e, cell.mapping_host[e]);
+        }
+        cell.dirty_mapping_experts.clear();
+    }
+
+    auto remap_fn = resolve_remap(backend);
+    if (!remap_fn) return false;
+    return remap_fn(backend, expert_ids_data, cell.mapping_dev, slot_ids_data, n_elements);
 }
