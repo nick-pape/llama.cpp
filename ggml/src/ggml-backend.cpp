@@ -1382,14 +1382,13 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                                 if (ggml_moe_cache_bind_bucket(cache, layer_idx, bucket,
                                         src, top_k, max_n_tokens)) {
                                     ggml_tensor * pool = ggml_moe_cache_pool_tensor(cache, layer_idx, bucket);
-                                    // Only substitute when the pool can hold ALL experts
-                                    // (n_slots >= n_experts). For smaller caches, the
-                                    // compute_splits prefill-overflow fallback would
-                                    // try to write to input_cpy at expert_id * expert_size
-                                    // offsets that don't fit in the pool buffer —
-                                    // ggml_backend_tensor_set asserts OOB. Skip
-                                    // substitution; cache stays inactive for this op.
-                                    if (pool && pool->ne[2] >= src->ne[2]) {
+                                    if (pool) {
+                                        // Substitute always: pool becomes the kernel's
+                                        // input_cpy. For ops that fit (n_unique <= n_slots),
+                                        // the kernel reads cached experts directly. For
+                                        // overflow ops, compute_splits acquires a per-op
+                                        // cudaMallocAsync scratch buffer and patches src[0]
+                                        // to it just-in-time.
                                         for (int c = 0; c < sched->n_copies; c++) {
                                             tensor_id_copy(src_id, cur_backend_id, c) = pool;
                                         }
@@ -1733,45 +1732,84 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             &moe_layer_idx, &moe_bucket) &&
                         ggml_moe_cache_bind_bucket(moe_cache, moe_layer_idx, moe_bucket,
                             input, (int) op_top_k, ids_max_n_tokens)) {
-                        // The cache is only ACTIVE when split_graph
-                        // substituted our pool tensor as input_cpy.
-                        // That only happens when n_slots >= n_experts —
-                        // i.e., the cache can hold every expert for
-                        // every op. For smaller caches the pool exists
-                        // but isn't wired into the kernel; we fall
-                        // through to the standard copy_experts H2D path.
-                        ggml_tensor * pool_tensor = ggml_moe_cache_pool_tensor(
-                            moe_cache, moe_layer_idx, moe_bucket);
-                        if (pool_tensor && node->src[0] == pool_tensor) {
-                            use_moe_cache = true;
-                        }
+                        use_moe_cache = true;
                     }
 
-                    // Prefill-overflow detection: if this op uses more unique
-                    // experts than the slot pool can hold, two experts would
-                    // have to share a slot. The CUDA MMQ kernel's mm_ids_helper
-                    // coalesces duplicate slot_ids and leaves ids_src1
-                    // partially uninitialized, which crashes the downstream
-                    // quantize kernel with an illegal memory access. Fall
-                    // back to the no-cache full-H2D path for this op.
-                    int n_unique_used = 0;
+                    // Detect prefill overflow: if this op uses more unique
+                    // experts than the pool has slots, route through a
+                    // per-op cudaMallocAsync scratch buffer (full-size,
+                    // freed at end of compute_splits). Lets cache<full
+                    // work for both prefill (overflow) and decode (fits).
+                    bool   moe_overflow    = false;
+                    int    n_unique_used   = 0;
                     if (use_moe_cache) {
                         for (int64_t id_i = 0; id_i < n_expert; ++id_i) {
                             if (ggml_bitset_get(used_ids.data(), id_i)) ++n_unique_used;
                         }
-                        // The slot pool is sized as min(--moe-expert-cache-size, n_experts);
-                        // n_slots is encoded in the pool tensor's ne[2].
                         ggml_tensor * pool_tensor = ggml_moe_cache_pool_tensor(
                             moe_cache, moe_layer_idx, moe_bucket);
                         const int n_slots = pool_tensor ? (int) pool_tensor->ne[2] : 0;
-                        if (n_unique_used > n_slots) {
-                            // Fall back: existing per-expert H2D into input_cpy.
-                            // No cache state change; next op gets to try again.
+                        moe_overflow = n_unique_used > n_slots;
+                    }
+
+                    // Three-way dispatch: overflow uses cudaMallocAsync
+                    // scratch, fitting ops use the slot pool, no-cache falls
+                    // through to standard copy_experts. The 3 branches are
+                    // mutually exclusive via the use_moe_cache + moe_overflow
+                    // pair (the lone `if` below + 2 `else if`s in the
+                    // original `} else {` block that follows).
+                    bool moe_handled = false;
+                    if (use_moe_cache && moe_overflow) {
+                        moe_handled = true;
+                        // Overflow path: this op uses more unique experts
+                        // than the pool can hold. Acquire a per-op scratch
+                        // buffer (cudaMallocAsync, full expert-tensor size),
+                        // patch node->src[0] to it, run copy_experts to fill
+                        // it from host. Keep src[2] as the ORIGINAL ids
+                        // (resolve via the cache if a prior call patched it).
+                        // Cache slot pool state is NOT touched — this op is
+                        // a one-off; subsequent non-overflow ops still use
+                        // the warm pool.
+                        ggml_tensor * scratch = ggml_moe_cache_acquire_overflow_scratch(
+                            moe_cache, split_backend, moe_layer_idx, moe_bucket, input);
+                        if (scratch) {
+                            node->src[0] = scratch;
+                            // Restore src[2] to the original ids tensor if
+                            // a prior call patched it to our cache.ids_tensor.
+                            ggml_tensor * orig = ggml_moe_cache_resolve_original_ids(
+                                moe_cache, node->src[2]);
+                            if (orig) node->src[2] = orig;
+
+                            // Standard contiguous-batch H2D into scratch.
+                            int id = 0;
+                            while (!ggml_bitset_get(used_ids.data(), id)) id++;
+                            int32_t first_id = id;
+                            int32_t last_id  = first_id;
+                            auto flush = [&]() {
+                                const size_t off  = (size_t) first_id * expert_size;
+                                const size_t sz   = (size_t)(last_id - first_id + 1) * expert_size;
+                                const size_t pad  = std::min<size_t>(expert_size, 512);
+                                const size_t pad_end = last_id < n_expert - 1 ? pad : 0;
+                                ggml_backend_tensor_set_async(split_backend,
+                                    scratch,
+                                    (const uint8_t *) input->data + off,
+                                    off, sz + pad_end);
+                            };
+                            for (++id; id < n_expert; ++id) {
+                                if (!ggml_bitset_get(used_ids.data(), id)) continue;
+                                if (id == last_id + 1) { last_id = id; continue; }
+                                flush();
+                                first_id = id; last_id = id;
+                            }
+                            flush();
+                        } else {
+                            // Scratch alloc failed — fall back to baseline.
                             use_moe_cache = false;
                         }
                     }
 
-                    if (use_moe_cache) {
+                    if (use_moe_cache && !moe_overflow && !moe_handled) {
+                        moe_handled = true;
                         // Step 1: classify experts as hit/miss; record
                         // (expert_id, slot) pairs for misses so we can batch
                         // contiguous-id H2Ds in step 2.
@@ -1854,7 +1892,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         // cache stays inactive for this graph).
                         node->src[2] = ggml_moe_cache_ids_tensor(
                             moe_cache, moe_layer_idx, moe_bucket);
-                    } else {
+                    }
+
+                    if (!moe_handled) {
                         // Existing contiguous-batch H2D path (cache disabled or
                         // tensor not identifiable as MoE expert weights).
                         int id = 0;
@@ -1901,6 +1941,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
+            }
+            // Release any per-op overflow scratches acquired during this
+            // split's prep loop. cudaFreeAsync is stream-ordered, so the
+            // frees wait for the kernels to finish reading the scratch.
+            if (sched->moe_cache) {
+                ggml_moe_cache_release_overflow_scratches(
+                    (ggml_moe_cache_t) sched->moe_cache, split_backend);
             }
         } else {
             // similar to ggml_backend_compare_graph_backend

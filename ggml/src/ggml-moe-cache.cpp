@@ -72,6 +72,13 @@ struct ggml_moe_cache {
         // need this original to D2H the actual expert ids.
         ggml_tensor *         original_ids_tensor = nullptr;
 
+        // Persistent ggml_tensor wrapper for the overflow scratch. Built
+        // once per cell on first overflow; reused for subsequent
+        // overflows (only ONE op per cell per compute_splits). The data
+        // pointer is reassigned each acquire to point at the latest
+        // cudaMallocAsync'd scratch.
+        ggml_tensor *         overflow_wrapper = nullptr;
+
         // Residency.
         std::vector<int32_t>             slot_to_expert;  // [n_slots], -1 if empty
         std::unordered_map<int32_t, int> expert_to_slot;  // O(1) lookup
@@ -87,6 +94,16 @@ struct ggml_moe_cache {
     };
     std::vector<cell> cells;
     uint64_t          tick = 0;  // monotonic, for LFRU LRU-tiebreak
+
+    // Per-op overflow scratch buffers. Each entry is a tuple of
+    // (device-pointer-allocated-via-cudaMallocAsync, ggml_tensor*).
+    // Released stream-ordered at end of compute_splits.
+    struct overflow_scratch {
+        void *        dev_ptr;
+        ggml_tensor * wrapper;
+    };
+    std::vector<overflow_scratch> active_scratches;
+    uint64_t total_overflow_ops = 0;
 
     // Aggregate stats.
     ggml_moe_cache_stats stats{};
@@ -478,6 +495,99 @@ ggml_tensor * ggml_moe_cache_ids_tensor(
     if (layer_idx < 0 || layer_idx >= c->n_layers)     return nullptr;
     auto & cell = c->cells[cell_idx(layer_idx, bucket)];
     return cell.bound ? cell.ids_tensor : nullptr;
+}
+
+// -----------------------------------------------------------------------------
+// Per-op overflow scratch (small-cache prefill fallback)
+// -----------------------------------------------------------------------------
+//
+// Resolve cuda's pool-backed malloc/free via reg proc-address. Cached after
+// first lookup so we don't pay the reg traversal cost on every op.
+
+typedef void * (*moe_cuda_malloc_async_fn_t)(ggml_backend_t, size_t);
+typedef void   (*moe_cuda_free_async_fn_t)(ggml_backend_t, void *);
+
+static moe_cuda_malloc_async_fn_t moe_cache_resolve_malloc(ggml_backend_t backend) {
+    static moe_cuda_malloc_async_fn_t cached = nullptr;
+    static bool looked_up = false;
+    if (looked_up) return cached;
+    auto * dev = ggml_backend_get_device(backend);
+    auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (reg) cached = (moe_cuda_malloc_async_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_cuda_moe_cache_malloc_async");
+    looked_up = true;
+    return cached;
+}
+
+static moe_cuda_free_async_fn_t moe_cache_resolve_free(ggml_backend_t backend) {
+    static moe_cuda_free_async_fn_t cached = nullptr;
+    static bool looked_up = false;
+    if (looked_up) return cached;
+    auto * dev = ggml_backend_get_device(backend);
+    auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (reg) cached = (moe_cuda_free_async_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_cuda_moe_cache_free_async");
+    looked_up = true;
+    return cached;
+}
+
+ggml_tensor * ggml_moe_cache_acquire_overflow_scratch(
+        ggml_moe_cache_t c, ggml_backend_t backend,
+        int layer_idx, ggml_moe_bucket bucket,
+        const ggml_tensor * weight) {
+    if (!c || !backend || !weight) return nullptr;
+    if (bucket < 0 || bucket >= GGML_MOE_BUCKET_COUNT) return nullptr;
+    if (layer_idx < 0 || layer_idx >= c->n_layers)     return nullptr;
+
+    auto malloc_fn = moe_cache_resolve_malloc(backend);
+    if (!malloc_fn) return nullptr;
+
+    auto & cell = c->cells[cell_idx(layer_idx, bucket)];
+
+    // Lazy-construct the per-cell wrapper on first overflow. Subsequent
+    // calls reuse the same ggml_tensor object and just rewire its
+    // data pointer — tensor_ctx is a bump allocator with no free, so
+    // recycling avoids exhausting it.
+    if (!cell.overflow_wrapper) {
+        cell.overflow_wrapper = ggml_new_tensor(c->tensor_ctx, weight->type,
+            GGML_MAX_DIMS, weight->ne);
+        if (!cell.overflow_wrapper) {
+            moe_cache_log("acquire_overflow_scratch: ggml_new_tensor failed");
+            return nullptr;
+        }
+        memcpy(cell.overflow_wrapper->nb, weight->nb, sizeof(cell.overflow_wrapper->nb));
+        snprintf(cell.overflow_wrapper->name, sizeof(cell.overflow_wrapper->name),
+                 "moe-cache-overflow-L%d-B%d", layer_idx, (int) bucket);
+    }
+
+    const size_t bytes = ggml_nbytes(weight);
+    void * dev = malloc_fn(backend, bytes);
+    if (!dev) {
+        moe_cache_log("acquire_overflow_scratch: cudaMallocAsync(%zu) failed", bytes);
+        return nullptr;
+    }
+    cell.overflow_wrapper->data = dev;
+
+    c->active_scratches.push_back({dev, cell.overflow_wrapper});
+    ++c->total_overflow_ops;
+    return cell.overflow_wrapper;
+}
+
+void ggml_moe_cache_release_overflow_scratches(
+        ggml_moe_cache_t c, ggml_backend_t backend) {
+    if (!c || !backend || c->active_scratches.empty()) return;
+    auto free_fn = moe_cache_resolve_free(backend);
+    if (!free_fn) return;
+    for (auto & s : c->active_scratches) {
+        if (s.dev_ptr) free_fn(backend, s.dev_ptr);
+        // Note: the ggml_tensor wrapper t lives in tensor_ctx and isn't
+        // explicitly freeable; tensor_ctx has finite space, so we rely
+        // on the fact that ggml_new_tensor recycles from the same arena
+        // each compute_splits call... wait, actually ggml_init_params
+        // with no_alloc=true makes ggml_new_tensor allocate from the
+        // ctx's bump-allocator. We'll run out of ctx space after enough
+        // calls. TODO: reset the ctx, or pre-allocate a pool of
+        // wrappers and recycle.
+    }
+    c->active_scratches.clear();
 }
 
 void ggml_moe_cache_record_original_ids(

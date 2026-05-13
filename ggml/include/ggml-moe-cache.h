@@ -162,6 +162,38 @@ struct ggml_tensor * ggml_moe_cache_resolve_original_ids(
     ggml_moe_cache_t        cache,
     struct ggml_tensor *    maybe_ids);
 
+// Per-op prefill-overflow fallback: when an op uses more unique
+// experts than the cache pool's n_slots, allocate a scratch buffer
+// of the full expert tensor's size, return a ggml_tensor wrapper
+// suitable for use as MUL_MAT_ID's src[0]. The wrapper is
+// constructed in the cache's long-lived ggml_context and reuses
+// nb[]/type from `weight`. Caller patches node->src[0] = returned
+// tensor, runs copy_experts to fill it, and the scratch is freed
+// via ggml_moe_cache_release_overflow_scratch (called by the
+// scheduler at end of compute_splits, after graph_compute_async
+// returns so the kernel has finished reading it).
+//
+// CUDA memory pool reuses the same VRAM across stream-ordered
+// allocs/frees, so peak live scratch across all overflow ops in
+// one graph_compute is bounded by one cell's worth (~140-220 MiB
+// on Qwen3.6).
+//
+// Returns NULL on failure (non-CUDA backend, OOM, etc).
+struct ggml_tensor * ggml_moe_cache_acquire_overflow_scratch(
+    ggml_moe_cache_t        cache,
+    ggml_backend_t          backend,
+    int                     layer_idx,
+    enum ggml_moe_bucket    bucket,
+    const struct ggml_tensor * weight);
+
+// Release every scratch buffer acquired since the last call. Stream-
+// ordered: the cudaFreeAsync runs after the kernels that consumed
+// the scratches, so it's safe to release immediately after
+// graph_compute_async returns.
+void ggml_moe_cache_release_overflow_scratches(
+    ggml_moe_cache_t        cache,
+    ggml_backend_t          backend);
+
 // Number of layers the cache was sized for.
 int ggml_moe_cache_n_layers(ggml_moe_cache_t cache);
 

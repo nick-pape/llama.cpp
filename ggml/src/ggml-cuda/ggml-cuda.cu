@@ -4908,6 +4908,29 @@ bool ggml_backend_cuda_set_op_offload_min_batch_size(int device, int min_batch_s
     return true;
 }
 
+// Stream-ordered GPU alloc/free, exported via reg proc-address so the
+// MoE cache (lives in ggml-base) can allocate temporary scratch buffers
+// without linking against ggml-cuda. Used for the per-op prefill-
+// overflow fallback: when an op uses more unique experts than the
+// cache pool holds, we cudaMallocAsync a scratch buffer of the full
+// expert tensor's size, copy_experts H2D's into it, kernel reads it,
+// and cudaFreeAsync returns the memory after kernel completion. The
+// CUDA memory pool reuses the same VRAM across stream-ordered
+// alloc/free pairs, so peak live scratch is one cell's worth.
+extern "C" void * ggml_cuda_moe_cache_malloc_async(ggml_backend_t backend, size_t size) {
+    if (!ggml_backend_is_cuda(backend)) return nullptr;
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    void * p = nullptr;
+    cudaError_t err = cudaMallocAsync(&p, size, ctx->stream());
+    return err == cudaSuccess ? p : nullptr;
+}
+
+extern "C" void ggml_cuda_moe_cache_free_async(ggml_backend_t backend, void * ptr) {
+    if (!ggml_backend_is_cuda(backend) || !ptr) return;
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    cudaFreeAsync(ptr, ctx->stream());
+}
+
 static const char * ggml_backend_cuda_device_get_name(ggml_backend_dev_t dev) {
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
     return ctx->name.c_str();
@@ -5640,6 +5663,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_set_op_offload_min_batch_size") == 0) {
         return (void *)ggml_backend_cuda_set_op_offload_min_batch_size;
+    }
+    if (strcmp(name, "ggml_cuda_moe_cache_malloc_async") == 0) {
+        return (void *)ggml_cuda_moe_cache_malloc_async;
+    }
+    if (strcmp(name, "ggml_cuda_moe_cache_free_async") == 0) {
+        return (void *)ggml_cuda_moe_cache_free_async;
     }
     return nullptr;
 }

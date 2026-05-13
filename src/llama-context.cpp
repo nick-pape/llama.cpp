@@ -348,20 +348,12 @@ llama_context::llama_context(
         }
 
         // initialize MoE per-expert slot cache (if requested) before sched_reserve so it gets attached.
-        // Cache only "activates" (wires into compute_splits via split_graph substitution)
-        // when slots >= n_experts. For smaller caches the pool exists but is dead weight,
-        // and the op_offload_min_batch_size=1 setter side-effect would slow decode without
-        // benefit. So skip cache entirely when cache_size < n_experts.
-        const int requested_cache_size = params.moe_expert_cache_size;
-        const int model_n_experts      = (int) model.hparams.n_expert;
-        const bool cache_can_activate  = requested_cache_size > 0
-            && model_n_experts > 0
-            && requested_cache_size >= model_n_experts;
-        if (requested_cache_size > 0 && !cache_can_activate) {
-            LLAMA_LOG_WARN("%s: --moe-expert-cache-size %d < model n_experts (%d); cache disabled (would not engage during decode)\n",
-                    __func__, requested_cache_size, model_n_experts);
-        }
-        if (cache_can_activate) {
+        // v2 supports any cache_size in [0, n_experts]:
+        //   - cache_size == 0 → no cache (baseline)
+        //   - cache_size == n_experts → fast path, no overflow ever
+        //   - 0 < cache_size < n_experts → cache used for ops that fit, overflow ops
+        //     route through a per-op cudaMallocAsync scratch buffer
+        if (params.moe_expert_cache_size > 0) {
             ggml_backend_t gpu_backend = nullptr;
             for (auto & backend : backends) {
                 auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
