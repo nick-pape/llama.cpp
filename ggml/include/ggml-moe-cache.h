@@ -143,6 +143,25 @@ bool ggml_moe_cache_set_ids(
     int                     top_k,
     int                     n_tokens);
 
+// Record the "original" ids tensor (e.g. selected_experts) for this
+// (layer, bucket) so that the scheduler can recover it after our
+// node->src[2] patch from a previous call has persisted via graph
+// reuse. Pass the tensor pointer the caller observed BEFORE patching.
+void ggml_moe_cache_record_original_ids(
+    ggml_moe_cache_t        cache,
+    int                     layer_idx,
+    enum ggml_moe_bucket    bucket,
+    struct ggml_tensor *    original_ids);
+
+// If `maybe_ids` matches any cell's ids tensor (i.e. it's our cache
+// tensor from a prior patch), return the cell's stored original.
+// Otherwise return `maybe_ids` unchanged. O(n_cells) linear scan;
+// n_cells = 4 * n_layers, fine on every host. Returns NULL on bad
+// cache pointer.
+struct ggml_tensor * ggml_moe_cache_resolve_original_ids(
+    ggml_moe_cache_t        cache,
+    struct ggml_tensor *    maybe_ids);
+
 // Number of layers the cache was sized for.
 int ggml_moe_cache_n_layers(ggml_moe_cache_t cache);
 

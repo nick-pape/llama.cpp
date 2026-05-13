@@ -65,6 +65,13 @@ struct ggml_moe_cache {
         uint8_t *             ids_base    = nullptr;
         ggml_tensor *         ids_tensor  = nullptr;
 
+        // Original src[2] (e.g. selected_experts) recorded by the
+        // scheduler. compute_splits patches node->src[2] to ids_tensor
+        // (above) so the kernel reads remapped slot indices; across
+        // graph reuse that patch persists, so on the next call we
+        // need this original to D2H the actual expert ids.
+        ggml_tensor *         original_ids_tensor = nullptr;
+
         // Residency.
         std::vector<int32_t>             slot_to_expert;  // [n_slots], -1 if empty
         std::unordered_map<int32_t, int> expert_to_slot;  // O(1) lookup
@@ -471,6 +478,30 @@ ggml_tensor * ggml_moe_cache_ids_tensor(
     if (layer_idx < 0 || layer_idx >= c->n_layers)     return nullptr;
     auto & cell = c->cells[cell_idx(layer_idx, bucket)];
     return cell.bound ? cell.ids_tensor : nullptr;
+}
+
+void ggml_moe_cache_record_original_ids(
+        ggml_moe_cache_t c, int layer_idx, ggml_moe_bucket bucket,
+        ggml_tensor * original_ids) {
+    if (!c || !original_ids) return;
+    if (bucket < 0 || bucket >= GGML_MOE_BUCKET_COUNT) return;
+    if (layer_idx < 0 || layer_idx >= c->n_layers)     return;
+    auto & cell = c->cells[cell_idx(layer_idx, bucket)];
+    cell.original_ids_tensor = original_ids;
+}
+
+ggml_tensor * ggml_moe_cache_resolve_original_ids(
+        ggml_moe_cache_t c, ggml_tensor * maybe_ids) {
+    if (!c) return maybe_ids;
+    if (!maybe_ids) return nullptr;
+    // Linear scan: 4 * n_layers cells. With n_layers=40 that's 160
+    // pointer comparisons — fine, runs once per MoE op's D2H setup.
+    for (const auto & cell : c->cells) {
+        if (cell.bound && cell.ids_tensor == maybe_ids) {
+            return cell.original_ids_tensor ? cell.original_ids_tensor : maybe_ids;
+        }
+    }
+    return maybe_ids;
 }
 
 bool ggml_moe_cache_set_ids(

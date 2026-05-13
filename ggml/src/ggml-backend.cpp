@@ -1630,8 +1630,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                     ggml_backend_synchronize(input_backend);
 
-                    // get the ids
+                    // get the ids. If node->src[2] is one of our cache
+                    // ids tensors (i.e. patched in a previous call and
+                    // persisted via graph reuse), resolve back to the
+                    // ORIGINAL selected_experts so the D2H below reads
+                    // real expert ids, not stale slot ids.
                     ggml_tensor * ids_tensor = node->src[2];
+                    if (sched->moe_cache) {
+                        ggml_tensor * resolved = ggml_moe_cache_resolve_original_ids(
+                            (ggml_moe_cache_t) sched->moe_cache, ids_tensor);
+                        if (resolved) ids_tensor = resolved;
+                    }
                     ggml_backend_t ids_backend = split_backend;
 
                     // if the ids tensor is also an input of the split, it may not have been copied yet to the split backend
@@ -1827,6 +1836,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         // H2D slot_ids onto the cache's ids tensor.
                         ggml_moe_cache_set_ids(moe_cache, moe_layer_idx, moe_bucket,
                             split_backend, slot_ids.data(), top_k, n_tokens);
+
+                        // Record the original src[2] BEFORE patching so
+                        // that next call's D2H (which sees the patched
+                        // value if the graph was reused) can resolve back.
+                        ggml_moe_cache_record_original_ids(
+                            moe_cache, moe_layer_idx, moe_bucket, ids_tensor);
 
                         // Repoint the MoE op's src[2] to the cache's ids
                         // tensor. node->src[0] is already pool_tensor —
