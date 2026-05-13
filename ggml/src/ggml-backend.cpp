@@ -1662,54 +1662,92 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
 
                     if (use_moe_cache) {
-                        // Cache-aware MoE path, residency model.
+                        // Cache-aware MoE path. Pipeline:
                         //
-                        // The cache tracks which experts currently have valid
-                        // bytes in `input_cpy` — the GPU-side mirror of the
-                        // (host-resident) expert weights tensor. `input_cpy`
-                        // is allocated by the scheduler at full size
-                        // (n_experts × expert_size) and persists across
-                        // graph_compute calls, so a prior token's H2D into
-                        // `input_cpy[id*expert_size]` stays valid until
-                        // something overwrites that region.
+                        //   compute stream (primary):   wait <- copy_stream (prev token's populates done)
+                        //                               H2D batch -> input_cpy (for missed experts)
+                        //   compute stream:             D2D fetch <- cache slots -> input_cpy (for hits)
+                        //                               MUL_MAT_ID kernel
                         //
-                        // Pipeline per op:
-                        //   for each used expert id:
-                        //     if cache reports resident (hit) → do nothing,
-                        //         the kernel will read input_cpy[id*ES] which
-                        //         already holds expert id's weights.
-                        //     else (miss) → H2D from host to input_cpy[id*ES]
-                        //         and mark resident.
-                        //   GPU MoE kernel reads input_cpy.
+                        //   copy stream (S2):           wait <- compute_stream (after H2D, before reading input_cpy)
+                        //                               D2D populate -> cache slots (fire-and-forget;
+                        //                                                            benefits NEXT token only)
                         //
-                        // No separate cache buffer, no D2D for hits, no
-                        // copy-stream populate. This is the clean version
-                        // of the design — the kernel reads experts directly
-                        // from the buffer they already live in.
+                        // The populate is moved off the compute stream so it doesn't
+                        // block this token's kernel. Correctness for THIS token only
+                        // depends on the H2D and the hit-fetches, both still on the
+                        // compute stream and serialized normally.
+                        //
+                        // The leading "wait <- copy_stream" handles cross-token
+                        // ordering: if NEXT token's hit-fetch reads a slot that THIS
+                        // token's populate is still copying, we must wait for the
+                        // populate before fetching.
+                        ggml_moe_cache_compute_wait_for_copies(split_backend);
 
-                        std::vector<int32_t> miss_ids;
+                        std::vector<int32_t>                miss_ids;
+                        std::vector<std::pair<int32_t,int>> hit_slots; // (expert_id, slot)
                         miss_ids.reserve(n_expert);
+                        hit_slots.reserve(n_expert);
 
                         for (int64_t id_i = 0; id_i < n_expert; id_i++) {
                             if (!ggml_bitset_get(used_ids.data(), id_i)) continue;
                             const int slot = ggml_moe_cache_lookup(
                                 moe_cache, moe_layer_idx, moe_bucket, (int32_t) id_i);
-                            if (slot < 0) {
+                            if (slot >= 0) {
+                                hit_slots.emplace_back((int32_t) id_i, slot);
+                            } else {
                                 miss_ids.push_back((int32_t) id_i);
+                                // Pool-manager Phase 2: notify cache of the miss.
+                                // The pool manager's maintain() will later use the
+                                // accumulated demand to decide admission. Cheap O(1)
+                                // counter bump; no I/O here.
+                                ggml_moe_cache_hint(moe_cache, moe_layer_idx, moe_bucket,
+                                                    (int32_t) id_i);
                             }
-                            // Hit → no-op; input_cpy already holds these bytes.
                         }
 
-                        // S3 telemetry: how many ops dispatched on GPU and
-                        // how many misses each had.
+                        // S3 telemetry: record that this (layer, bucket) dispatched
+                        // on GPU (we wouldn't be in this branch otherwise — offload_op
+                        // returned true), and how many of its experts missed. CPU
+                        // dispatches are recorded by ggml_moe_cache_should_offload_to_gpu
+                        // returning false elsewhere; they don't reach this branch.
                         ggml_moe_cache_record_dispatch(
                             moe_cache, moe_layer_idx, moe_bucket,
                             (int) miss_ids.size(), /*on_cpu=*/false);
 
-                        // Batched H2D for misses (contiguous runs). Same
-                        // copy_experts lambda as the no-cache path —
-                        // includes the 512-byte tail padding that MMQ
-                        // needs to safely read past expert boundaries.
+                        // Pool-manager Phase 2: let the pool manager run after we've
+                        // accumulated hints for this layer+bucket. Phase 1 stub is a
+                        // no-op; Phase 4 implements admission policy with async H2D.
+                        // Until Phase 3 (CPU dispatch) lands, the existing
+                        // populate-on-miss code below still runs to keep correctness.
+                        ggml_moe_cache_maintain(moe_cache);
+
+                        // Pool-manager Phase 3b: when there are misses, dispatch
+                        // the MoE op on the CPU backend and stage the result as
+                        // a pending merge. The select kernel launched in
+                        // drain_pending_merges() (after graph_compute_async) will
+                        // overwrite the missed (token, k_idx) positions in node's
+                        // output with the CPU-computed values. The H2D-for-misses
+                        // path below still runs (redundant but correct); a future
+                        // optimization will skip those H2Ds when the merge is
+                        // staged, since the GPU kernel's output at those
+                        // positions is going to be overwritten anyway.
+                        // CPU backend is conventionally the last entry in
+                        // sched->backends.
+                        if (!miss_ids.empty() && sched->n_backends > 0) {
+                            ggml_backend_t cpu_backend = sched->backends[sched->n_backends - 1];
+                            ggml_moe_cache_dispatch_cpu(
+                                moe_cache, cpu_backend, split_backend,
+                                /*expert_weights_host=*/input,
+                                /*src1_dev=*/node->src[1],
+                                /*src2_dev=*/node->src[2],
+                                /*gpu_dst=*/node,
+                                miss_ids.data(), (int) miss_ids.size(),
+                                moe_layer_idx, moe_bucket);
+                        }
+
+                        // Batched H2D for misses (contiguous runs) — on COMPUTE stream
+                        // because the kernel reads input_cpy directly.
                         for (size_t i = 0; i < miss_ids.size(); ) {
                             int32_t first = miss_ids[i];
                             int32_t last  = first;
@@ -1722,19 +1760,45 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             i = j;
                         }
 
-                        // Mark each missed expert as resident. This calls
-                        // into the eviction policy (LRU/LFRU) to maintain
-                        // at most slots_per_bucket resident entries; the
-                        // evicted entry's bytes remain in input_cpy but
-                        // we forget about them and a future use will
-                        // pay another H2D.
-                        for (int32_t id_m : miss_ids) {
-                            const int slot = ggml_moe_cache_select_slot_for_miss(
-                                moe_cache, moe_layer_idx, moe_bucket, id_m);
-                            if (slot >= 0) {
-                                ggml_moe_cache_record_slot(
-                                    moe_cache, moe_layer_idx, moe_bucket, slot, id_m);
+                        // Populate cache slots for misses — on the COPY stream so it
+                        // doesn't block this token's kernel. The populate reads from
+                        // input_cpy which compute just wrote, so we have to order the
+                        // copy stream after the compute stream first.
+                        if (!miss_ids.empty()) {
+                            ggml_moe_cache_copy_stream_wait_for_compute(split_backend);
+                            for (int32_t id_m : miss_ids) {
+                                const int slot = ggml_moe_cache_select_slot_for_miss(
+                                    moe_cache, moe_layer_idx, moe_bucket, id_m);
+                                if (slot < 0) continue;
+                                void * dst = ggml_moe_cache_slot_data(
+                                    moe_cache, moe_layer_idx, moe_bucket, slot);
+                                const void * src = (const uint8_t *) input_cpy->data
+                                                 + (size_t) id_m * expert_size;
+                                if (ggml_moe_cache_copy_async_on_copy_stream(
+                                        split_backend, dst, src, expert_size)) {
+                                    // record_slot is bookkeeping-only; the actual
+                                    // D2D is in flight on copy stream. Next token's
+                                    // compute_wait_for_copies (at top of this branch)
+                                    // ensures the copy finishes before any hit-fetch
+                                    // tries to read the slot.
+                                    ggml_moe_cache_record_slot(
+                                        moe_cache, moe_layer_idx, moe_bucket, slot, id_m);
+                                }
                             }
+                        }
+
+                        // D2D fetch into input_cpy for hits — on COMPUTE stream because
+                        // the kernel reads input_cpy. Source slots are guaranteed valid
+                        // by the leading compute_wait_for_copies().
+                        for (const auto & h : hit_slots) {
+                            const int32_t id_h   = h.first;
+                            const int     slot_h = h.second;
+                            const void * src = ggml_moe_cache_slot_data(
+                                moe_cache, moe_layer_idx, moe_bucket, slot_h);
+                            void * dst = (uint8_t *) input_cpy->data
+                                       + (size_t) id_h * expert_size;
+                            ggml_moe_cache_copy_d2d_async(
+                                split_backend, dst, src, expert_size);
                         }
                     } else {
                         // Existing contiguous-batch H2D path (cache disabled or

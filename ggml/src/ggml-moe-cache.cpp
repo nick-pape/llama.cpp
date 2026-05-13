@@ -112,30 +112,15 @@ struct ggml_moe_cache {
     // cache-line walk. A bucket-indexed structure could give O(1) but would
     // be more code and harder to validate; revisit if profiles flag this loop.
     struct cell_state {
-        // Residency model: this cell tracks which experts currently
-        // have valid bytes in the scheduler's `input_cpy` device buffer.
-        // There is NO separate cache buffer — `input_cpy` is sized for
-        // all n_experts of this bucket and persists across graph_compute
-        // calls (with n_copies=1), so the H2D that the scheduler issues
-        // on first access stays valid until something overwrites it.
-        //
-        // `slot_map` is a fixed-capacity set of resident expert IDs
-        // (capacity = slots_per_bucket). Eviction (when we exceed the
-        // residency budget) just marks an entry as "not resident" so a
-        // future access pays the H2D again. The bytes in input_cpy
-        // remain until the next miss for some other expert overwrites
-        // them — but the kernel can't reach them because the scheduler
-        // routes the H2D for the new miss to the same input_cpy
-        // location only when that *expert_id* is missed; collisions
-        // can't happen because each expert has its own offset.
-        //
-        // No slot data pointers, no slot_stride, no per-cell buffer.
         bool   bound              = false;
         size_t expert_size_bytes  = 0;        // size of one expert weight in this cell
-        std::vector<int32_t>  slot_map;       // [slots]: resident expert_id (-1 if empty)
+        size_t slot_stride        = 0;        // padded expert size, slot-aligned
+        ggml_backend_buffer_t buf = nullptr;  // own backing buffer for this cell's slots
+        uint8_t * base            = nullptr;  // buf base pointer
+        std::vector<int32_t>  slot_map;       // [slots]: expert_id resident in each slot
         std::vector<uint32_t> freq;           // [slots]: hit count since populate
         std::vector<uint64_t> last_tick;      // [slots]: tick of last access (LRU tiebreak)
-        int next_unused = 0;                  // slots [0, next_unused) have been populated
+        int next_unused = 0;                  // slots [0, next_unused) have been touched
 
         // S3 telemetry + adaptive offload routing.
         //   - n_lookups / n_hits          : lookup-level statistics for this cell
@@ -437,14 +422,47 @@ void ggml_moe_cache_free(ggml_moe_cache_t c) {
     }
     c->pending_merges.clear();
 
-    // Residency model has no per-cell buffer to free; cells own only
-    // bookkeeping vectors which std::vector cleans up.
+    for (auto & cell : c->cells) {
+        if (cell.buf) {
+            ggml_backend_buffer_free(cell.buf);
+            cell.buf = nullptr;
+        }
+    }
     delete c;
 }
 
 // -----------------------------------------------------------------------------
-// Bind (residency model — no per-cell GPU buffer)
+// Lazy per-cell buffer allocation
 // -----------------------------------------------------------------------------
+
+static bool ensure_cell_allocated(ggml_moe_cache * c, ggml_moe_cache::cell_state & cell, size_t expert_size_bytes) {
+    if (cell.bound) return true;
+
+    // Pad each slot to 512 alignment for MMQ kernel safety (matches the existing
+    // copy_experts padding in ggml-backend.cpp).
+    const size_t slot_stride = ((expert_size_bytes + 511) / 512) * 512 + 512;
+    const size_t total       = (size_t) c->slots_per_bucket * slot_stride;
+
+    if (c->max_bytes_cap > 0 && c->total_bytes + total > c->max_bytes_cap) {
+        moe_cache_log("cell alloc would push total to %zu bytes, exceeds cap of %zu",
+                      c->total_bytes + total, c->max_bytes_cap);
+        return false;
+    }
+
+    auto * buft = ggml_backend_get_default_buffer_type(c->backend);
+    cell.buf = ggml_backend_buft_alloc_buffer(buft, total);
+    if (!cell.buf) {
+        moe_cache_log("failed to allocate %zu bytes for cell on backend", total);
+        return false;
+    }
+    cell.base              = (uint8_t *) ggml_backend_buffer_get_base(cell.buf);
+    cell.expert_size_bytes = expert_size_bytes;
+    cell.slot_stride       = slot_stride;
+    cell.bound             = true;
+    c->total_bytes        += total;
+
+    return true;
+}
 
 bool ggml_moe_cache_bind_bucket(
         ggml_moe_cache_t      c,
@@ -470,21 +488,25 @@ bool ggml_moe_cache_bind_bucket(
     auto & cell = c->cells[cell_idx(layer_idx, bucket)];
     if (cell.bound) {
         if (cell.expert_size_bytes != expert_size_bytes) {
+            // Same (layer, bucket) cell observed at two different sizes —
+            // shouldn't happen because tensor shape is fixed at load time.
             moe_cache_log("cell (layer=%d, bucket=%d) expert size changed: bound=%zu, got=%zu",
                           layer_idx, (int) bucket, cell.expert_size_bytes, expert_size_bytes);
             return false;
         }
         return true;
     }
-    cell.expert_size_bytes = expert_size_bytes;
-    cell.bound             = true;
-    static int n_bound = 0;
-    if (n_bound < 8) {
-        moe_cache_log("cell bound (layer=%d, bucket=%d, expert_size=%zu, residency-only)",
-                      layer_idx, (int) bucket, cell.expert_size_bytes);
-        ++n_bound;
+    bool ok = ensure_cell_allocated(c, cell, expert_size_bytes);
+    if (ok) {
+        // Diagnostic: log the first few cell binds so we can verify the path is hit.
+        static int n_bound = 0;
+        if (n_bound < 8) {
+            moe_cache_log("cell bound (layer=%d, bucket=%d, expert_size=%zu, slot_stride=%zu)",
+                          layer_idx, (int) bucket, cell.expert_size_bytes, cell.slot_stride);
+            ++n_bound;
+        }
     }
-    return true;
+    return ok;
 }
 
 // -----------------------------------------------------------------------------
@@ -916,15 +938,15 @@ void ggml_moe_cache_record_dispatch(
 }
 
 // -----------------------------------------------------------------------------
-// Slot data pointer — vestigial in the residency model (no per-cell buffer).
-// Returns nullptr; callers in compute_splits no longer issue D2D from slots,
-// they treat hits as no-ops. Retained as a stable ABI symbol for now.
+// Slot data pointer — layout is just (cell.base + slot * stride).
 // -----------------------------------------------------------------------------
 
 void * ggml_moe_cache_slot_data(
         ggml_moe_cache_t c, int layer_idx, ggml_moe_bucket bucket, int slot_idx) {
-    (void) c; (void) layer_idx; (void) bucket; (void) slot_idx;
-    return nullptr;
+    if (!c) return nullptr;
+    auto & cell = c->cells[cell_idx(layer_idx, bucket)];
+    if (!cell.bound || !cell.base) return nullptr;
+    return cell.base + (size_t) slot_idx * cell.slot_stride;
 }
 
 // -----------------------------------------------------------------------------
