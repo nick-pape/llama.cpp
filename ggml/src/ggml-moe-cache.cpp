@@ -296,7 +296,11 @@ bool ggml_moe_cache_bind_bucket(
     cell.top_k       = top_k;
     cell.max_n_tokens = max_n_tokens;
 
-    const size_t pool_bytes = (size_t) cell.n_slots * cell.slot_stride;
+    // +512 bytes of MMQ-safety padding past the last slot. The CUDA MMQ
+    // kernel reads slightly past expert boundaries; the original
+    // copy_experts H2D path adds the same padding to input_cpy. Without
+    // it, the last slot's kernel read crashes on illegal memory access.
+    const size_t pool_bytes = (size_t) cell.n_slots * cell.slot_stride + 512;
     const size_t ids_bytes  = (size_t) top_k * max_n_tokens * sizeof(int32_t);
 
     if (c->max_bytes_cap > 0 && c->total_bytes + pool_bytes + ids_bytes > c->max_bytes_cap) {
