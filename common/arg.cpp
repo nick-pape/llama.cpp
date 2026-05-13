@@ -2335,7 +2335,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("--moe-expert-cache-size must be >= 0");
             }
             params.moe_expert_cache_size = value;
-            fprintf(stderr, "[moe-cache arg-handler] value=%d existing_env='%s'\n", value, getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? getenv("GGML_OP_OFFLOAD_MIN_BATCH") : "<unset>");
             if (value > 0 && getenv("GGML_OP_OFFLOAD_MIN_BATCH") == nullptr) {
                 // Force CUDA to offload MoE MUL_MAT_ID during decode (default threshold is 32,
                 // which keeps the MoE on CPU for ne[2]=1 single-token decode and so never

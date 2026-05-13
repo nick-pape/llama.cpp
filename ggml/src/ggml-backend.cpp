@@ -1670,15 +1670,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     bool use_moe_cache = false;
                     const int64_t op_top_k    = node->src[2]->ne[0];
                     const int64_t op_n_tokens = node->src[2]->ne[1];
-                    {
-                        static int dbg_outer = 0;
-                        if (dbg_outer < 4) {
-                            fprintf(stderr, "moe-outer: input.name='%s' node.op=%d moe_cache=%p top_k=%lld n_tokens=%lld\n",
-                                    input->name, (int) node->op, (void*) moe_cache, (long long) op_top_k, (long long) op_n_tokens);
-                            ++dbg_outer;
-                        }
-                    }
-                    // Generous upper bound on n_tokens we'll ever see in this
+// Generous upper bound on n_tokens we'll ever see in this
                     // session — sizes the slot_ids buffer. 8192 covers the
                     // largest ubatch sizes in practice; the buffer is small
                     // (top_k * 8192 * 4B per cell ≈ 256 KiB).
@@ -1690,6 +1682,30 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         ggml_moe_cache_bind_bucket(moe_cache, moe_layer_idx, moe_bucket,
                             input, (int) op_top_k, ids_max_n_tokens)) {
                         use_moe_cache = true;
+                    }
+
+                    // Prefill-overflow detection: if this op uses more unique
+                    // experts than the slot pool can hold, two experts would
+                    // have to share a slot. The CUDA MMQ kernel's mm_ids_helper
+                    // coalesces duplicate slot_ids and leaves ids_src1
+                    // partially uninitialized, which crashes the downstream
+                    // quantize kernel with an illegal memory access. Fall
+                    // back to the no-cache full-H2D path for this op.
+                    int n_unique_used = 0;
+                    if (use_moe_cache) {
+                        for (int64_t id_i = 0; id_i < n_expert; ++id_i) {
+                            if (ggml_bitset_get(used_ids.data(), id_i)) ++n_unique_used;
+                        }
+                        // The slot pool is sized as min(--moe-expert-cache-size, n_experts);
+                        // n_slots is encoded in the pool tensor's ne[2].
+                        ggml_tensor * pool_tensor = ggml_moe_cache_pool_tensor(
+                            moe_cache, moe_layer_idx, moe_bucket);
+                        const int n_slots = pool_tensor ? (int) pool_tensor->ne[2] : 0;
+                        if (n_unique_used > n_slots) {
+                            // Fall back: existing per-expert H2D into input_cpy.
+                            // No cache state change; next op gets to try again.
+                            use_moe_cache = false;
+                        }
                     }
 
                     if (use_moe_cache) {
@@ -1715,9 +1731,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 const size_t slot_stride = pool_tensor->nb[2];
                                 const void * src = (const uint8_t *) input->data
                                                  + (size_t) id_i * expert_size;
-                                // SYNC for debugging — switch back to set_async once verified.
-                                ggml_backend_tensor_set(pool_tensor, src,
-                                    (size_t) slot * slot_stride, expert_size);
+                                ggml_backend_tensor_set_async(split_backend,
+                                    pool_tensor,
+                                    src,
+                                    (size_t) slot * slot_stride,
+                                    expert_size);
                                 ggml_moe_cache_record_slot(
                                     moe_cache, moe_layer_idx, moe_bucket, slot, (int32_t) id_i);
                             }
