@@ -1670,6 +1670,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     bool use_moe_cache = false;
                     const int64_t op_top_k    = node->src[2]->ne[0];
                     const int64_t op_n_tokens = node->src[2]->ne[1];
+                    {
+                        static int dbg_outer = 0;
+                        if (dbg_outer < 4) {
+                            fprintf(stderr, "moe-outer: input.name='%s' node.op=%d moe_cache=%p top_k=%lld n_tokens=%lld\n",
+                                    input->name, (int) node->op, (void*) moe_cache, (long long) op_top_k, (long long) op_n_tokens);
+                            ++dbg_outer;
+                        }
+                    }
                     // Generous upper bound on n_tokens we'll ever see in this
                     // session — sizes the slot_ids buffer. 8192 covers the
                     // largest ubatch sizes in practice; the buffer is small
