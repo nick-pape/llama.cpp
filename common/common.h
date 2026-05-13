@@ -486,7 +486,7 @@ struct common_params {
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
 
     int32_t moe_expert_cache_size = 0; // # of GPU expert slots per (layer, bucket) — see --moe-expert-cache-size
-    int32_t moe_cache_policy      = 0; // ggml_moe_cache_policy enum: 0=rr (default), 1=lru, 2=slru, 3=lfru-decay
+    int32_t moe_cache_policy      = 1; // ggml_moe_cache_policy enum: 0=rr, 1=lru (default), 2=slru, 3=lfru-decay
 
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale

@@ -3301,7 +3301,7 @@ llama_context_params llama_context_default_params() {
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.moe_expert_cache_size       =*/ 0,
-        /*.moe_cache_policy            =*/ 0,   // GGML_MOE_CACHE_POLICY_RR
+        /*.moe_cache_policy            =*/ 1,   // GGML_MOE_CACHE_POLICY_LRU (winner of policy sweep)
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
         /*.no_perf                     =*/ true,
