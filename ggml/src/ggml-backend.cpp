@@ -1382,13 +1382,14 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                                 if (ggml_moe_cache_bind_bucket(cache, layer_idx, bucket,
                                         src, top_k, max_n_tokens)) {
                                     ggml_tensor * pool = ggml_moe_cache_pool_tensor(cache, layer_idx, bucket);
-                                    if (pool) {
-                                        // Substitute always: pool becomes the kernel's
-                                        // input_cpy. For ops that fit (n_unique <= n_slots),
-                                        // the kernel reads cached experts directly. For
-                                        // overflow ops, compute_splits acquires a per-op
-                                        // cudaMallocAsync scratch buffer and patches src[0]
-                                        // to it just-in-time.
+                                    // Substitute when the pool can hold at least
+                                    // top_k experts (decode's per-op minimum).
+                                    // Below top_k the cache can't even cover a
+                                    // single decode op and substitution would
+                                    // overflow on every call. Prefill ops with
+                                    // n_unique > n_slots fall back per-op to
+                                    // cudaMallocAsync scratch via compute_splits.
+                                    if (pool && pool->ne[2] >= node->src[2]->ne[0]) {
                                         for (int c = 0; c < sched->n_copies; c++) {
                                             tensor_id_copy(src_id, cur_backend_id, c) = pool;
                                         }
