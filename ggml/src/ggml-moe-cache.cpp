@@ -499,7 +499,12 @@ bool ggml_moe_cache_set_ids(
     cell.ids_tensor->nb[3] = cell.ids_tensor->nb[2];
 
     const size_t bytes = (size_t) top_k * (size_t) n_tokens * sizeof(int32_t);
-    ggml_backend_tensor_set_async(backend, cell.ids_tensor, slot_ids_host, 0, bytes);
+    // DEBUG: sync until verified — host slot_ids buffer must outlive the
+    // async H2D, but our caller's std::vector goes out of scope right
+    // after set_ids returns. Need to either pin our own staging buffer
+    // or use sync. Sync for now.
+    (void) backend;
+    ggml_backend_tensor_set(cell.ids_tensor, slot_ids_host, 0, bytes);
     return true;
 }
 
