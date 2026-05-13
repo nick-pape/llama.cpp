@@ -1727,18 +1727,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         // a pending merge. The select kernel launched in
                         // drain_pending_merges() (after graph_compute_async) will
                         // overwrite the missed (token, k_idx) positions in node's
-                        // output with the CPU-computed values. When dispatch
-                        // succeeds we SKIP the compute-stream H2D for missed
-                        // experts (the kernel reads stale data at those expert
-                        // offsets; the merge overwrites the affected output
-                        // positions anyway). This is the win: PCIe is removed
-                        // from the critical compute path on miss-heavy ops.
+                        // output with the CPU-computed values. The H2D-for-misses
+                        // path below still runs (redundant but correct); a future
+                        // optimization will skip those H2Ds when the merge is
+                        // staged, since the GPU kernel's output at those
+                        // positions is going to be overwritten anyway.
                         // CPU backend is conventionally the last entry in
                         // sched->backends.
-                        bool dispatch_cpu_ok = false;
                         if (!miss_ids.empty() && sched->n_backends > 0) {
                             ggml_backend_t cpu_backend = sched->backends[sched->n_backends - 1];
-                            dispatch_cpu_ok = ggml_moe_cache_dispatch_cpu(
+                            ggml_moe_cache_dispatch_cpu(
                                 moe_cache, cpu_backend, split_backend,
                                 /*expert_weights_host=*/input,
                                 /*src1_dev=*/node->src[1],
@@ -1748,46 +1746,38 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 moe_layer_idx, moe_bucket);
                         }
 
-                        // Batched H2D for misses (contiguous runs) — on COMPUTE
-                        // stream. Only runs when the CPU dispatch did NOT stage
-                        // a merge for this op (e.g. non-CUDA backend, allocation
-                        // failure). On the merge path the kernel can read stale
-                        // data at miss expert offsets — the select kernel
-                        // overwrites the corresponding output positions.
-                        if (!dispatch_cpu_ok) {
-                            for (size_t i = 0; i < miss_ids.size(); ) {
-                                int32_t first = miss_ids[i];
-                                int32_t last  = first;
-                                size_t  j     = i + 1;
-                                while (j < miss_ids.size() && miss_ids[j] == last + 1) {
-                                    last = miss_ids[j];
-                                    j++;
-                                }
-                                copy_experts(first, last);
-                                i = j;
+                        // Batched H2D for misses (contiguous runs) — on COMPUTE stream
+                        // because the kernel reads input_cpy directly.
+                        for (size_t i = 0; i < miss_ids.size(); ) {
+                            int32_t first = miss_ids[i];
+                            int32_t last  = first;
+                            size_t  j     = i + 1;
+                            while (j < miss_ids.size() && miss_ids[j] == last + 1) {
+                                last = miss_ids[j];
+                                j++;
                             }
+                            copy_experts(first, last);
+                            i = j;
                         }
 
-                        // Populate cache slots for misses — on the COPY stream
-                        // so it doesn't block this token's kernel. Source is
-                        // input->data (the original host weights) rather than
-                        // input_cpy: that drops the wait-for-compute and lets
-                        // the populate overlap with the GPU kernel; it also
-                        // means the populate is correct on the merge path where
-                        // input_cpy was never populated for miss IDs.
+                        // Populate cache slots for misses — on the COPY stream so it
+                        // doesn't block this token's kernel. The populate reads from
+                        // input_cpy which compute just wrote, so we have to order the
+                        // copy stream after the compute stream first.
                         if (!miss_ids.empty()) {
+                            ggml_moe_cache_copy_stream_wait_for_compute(split_backend);
                             for (int32_t id_m : miss_ids) {
                                 const int slot = ggml_moe_cache_select_slot_for_miss(
                                     moe_cache, moe_layer_idx, moe_bucket, id_m);
                                 if (slot < 0) continue;
                                 void * dst = ggml_moe_cache_slot_data(
                                     moe_cache, moe_layer_idx, moe_bucket, slot);
-                                const void * src = (const uint8_t *) input->data
+                                const void * src = (const uint8_t *) input_cpy->data
                                                  + (size_t) id_m * expert_size;
                                 if (ggml_moe_cache_copy_async_on_copy_stream(
                                         split_backend, dst, src, expert_size)) {
                                     // record_slot is bookkeeping-only; the actual
-                                    // H2D is in flight on copy stream. Next token's
+                                    // D2D is in flight on copy stream. Next token's
                                     // compute_wait_for_copies (at top of this branch)
                                     // ensures the copy finishes before any hit-fetch
                                     // tries to read the slot.
