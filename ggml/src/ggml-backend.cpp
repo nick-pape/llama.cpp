@@ -2103,8 +2103,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ++j1;
                 }
 
+                static int dbg_w = 0;
+                const bool dbg_on = dbg_w < 20;
                 // Compute the non-cache prefix [j0, j1).
                 if (j1 > j0) {
+                    if (dbg_on) { fprintf(stderr, "DBG walk: prefix [%d,%d) compute...\n", j0, j1); }
                     struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1);
                     enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
                     if (ec != GGML_STATUS_SUCCESS) {
@@ -2112,13 +2115,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                 }
                 if (j1 >= split->graph.n_nodes) {
+                    if (dbg_on) { fprintf(stderr, "DBG walk: split done (no more cache ops)\n"); ++dbg_w; }
                     break;
                 }
 
                 // Intercept the cache mul_mat_id at j1. Its inputs (incl.
                 // argsort -> src[2]) are computed; wait, then read the
                 // live ids.
+                if (dbg_on) { fprintf(stderr, "DBG walk: intercept j1=%d sync...\n", j1); }
                 ggml_backend_synchronize(split_backend);
+                if (dbg_on) { fprintf(stderr, "DBG walk: synced, handle_op_miss L%d B%d...\n", moe_layer, (int) moe_bucket); ++dbg_w; }
                 ggml_tensor * node = split->graph.nodes[j1];
                 ggml_tensor * ids_t = node->src[2];
                 // On graph reuse src[2] was patched to the cache ids
@@ -2132,6 +2138,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 moe_topk_host.resize(n_ids);
                 ggml_backend_tensor_get(ids_t, moe_topk_host.data(), 0,
                                         n_ids * sizeof(int32_t));
+                if (dbg_on) { fprintf(stderr, "DBG walk: ids_t='%s' ne=[%d,%d] -> handle_op_miss\n",
+                                      ids_t->name, op_top_k, op_n_tokens); }
                 ggml_moe_cache_handle_op_miss(cache, moe_layer, moe_bucket, split_backend,
                                               moe_topk_host.data(), op_top_k, op_n_tokens);
                 // Patch src[2] to the cache ids tensor (set_ids just
@@ -2141,6 +2149,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 node->src[2] = ggml_moe_cache_ids_tensor(cache, moe_layer, moe_bucket);
 
                 // Compute the cache mul_mat_id node itself.
+                if (dbg_on) { fprintf(stderr, "DBG walk: compute op [%d] '%s'...\n", j1, node->name); }
                 struct ggml_cgraph gv1 = ggml_graph_view(&split->graph, j1, j1 + 1);
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv1);
                 if (ec != GGML_STATUS_SUCCESS) {
