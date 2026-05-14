@@ -2142,6 +2142,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                       ids_t->name, op_top_k, op_n_tokens); }
                 ggml_moe_cache_handle_op_miss(cache, moe_layer, moe_bucket, split_backend,
                                               moe_topk_host.data(), op_top_k, op_n_tokens);
+                // DEBUG: sync right after handle_op_miss's H2Ds. If the
+                // crash surfaces HERE, the H2Ds are bad; if it surfaces at
+                // the op compute below, the op's inputs/kernel are bad.
+                if (dbg_on) {
+                    ggml_backend_synchronize(split_backend);
+                    fprintf(stderr, "DBG walk: post-handle_op_miss sync OK (L%d B%d)\n",
+                            moe_layer, (int) moe_bucket);
+                }
                 // Patch src[2] to the cache ids tensor (set_ids just
                 // populated + reshaped it). Record the original so a
                 // reused graph can recover it next pass.
