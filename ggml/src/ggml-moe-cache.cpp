@@ -683,6 +683,25 @@ bool ggml_moe_cache_node_cache_op(
     return true;
 }
 
+int ggml_moe_cache_node_topk_layer(
+        ggml_moe_cache_t c, const ggml_tensor * node) {
+    if (!c || !node) return -1;
+    if (node->op != GGML_OP_CONT) return -1;
+    // build_moe_ffn names the per-layer ids_c (ggml_cont of the argsort
+    // top-k routing ids) "ffn_moe_slot_ids-{layer}" via the graph-build
+    // callback. It is the LAST node before the layer's MoE mul_mat_id
+    // ops, contiguous [top_k, n_tokens] — the node-walk's interception
+    // point.
+    const char * p = strstr(node->name, "ffn_moe_slot_ids-");
+    if (!p) return -1;
+    p += 17 /* strlen("ffn_moe_slot_ids-") */;
+    char * end = nullptr;
+    const long layer = strtol(p, &end, 10);
+    if (end == p) return -1;
+    if (layer < 0 || layer >= c->n_layers) return -1;
+    return (int) layer;
+}
+
 void ggml_moe_cache_handle_op_miss(
         ggml_moe_cache_t c, int layer_idx, ggml_moe_bucket bucket,
         ggml_backend_t backend, const int32_t * ids, int top_k, int n_tokens) {

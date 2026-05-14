@@ -2067,103 +2067,82 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         if (sched->moe_cache && !sched->callback_eval) {
-            // Phase 2 moe-cache node-walk. Compute the split in chunks;
-            // intercept each MoE mul_mat_id whose src[0] is a cache slot
-            // pool. At that node ALL upstream nodes (incl. argsort) have
-            // run, so src[2] holds the CURRENT-pass ids. Read top_k /
-            // n_tokens straight from that live node, D2H the ids,
-            // classify + H2D misses, set_ids (reshapes the per-cell ids
-            // tensor to this exact op), patch src[2] -> that ids tensor,
-            // then compute the op. Everything comes from the live node —
-            // robust against graph reserve/reuse and ubatch-size changes.
+            // iter6 moe-cache node-walk. Compute the split in per-layer
+            // chunks. The interception point is the per-layer ids_c CONT
+            // node ("ffn_moe_slot_ids-{layer}"): ggml_cont makes it a
+            // contiguous [top_k, n_tokens] current-pass tensor, and it is
+            // the last node before the layer's MoE mul_mat_id ops. We
+            // compute the prefix up to AND INCLUDING ids_c, sync, D2H the
+            // live ids, then for every cache mul_mat_id of that layer call
+            // handle_op_miss (classify + H2D misses + populate the
+            // per-cell slot-ids tensor) and patch src[2] to that slot-ids
+            // tensor. The patched ops are computed as part of the NEXT
+            // chunk — a multi-node ggml_graph_view — never as a lone
+            // 1-node view (a lone mul_mat_id breaks the CUDA MMQ-ids
+            // gather path: the ids_src1 gather buffer is read out of
+            // bounds). Purely structural: no persistent pointer state,
+            // robust across graph reserve / reuse / rebuild.
             ggml_moe_cache_t cache = (ggml_moe_cache_t) sched->moe_cache;
-            // DEBUG: dump src[0] names of MUL_MAT_ID nodes + node_cache_op result.
-            {
-                static int dbg_mm = 0;
-                for (int k = 0; k < split->graph.n_nodes && dbg_mm < 12; ++k) {
-                    ggml_tensor * nd = split->graph.nodes[k];
-                    if (nd->op != GGML_OP_MUL_MAT_ID) continue;
-                    int dl = -1; enum ggml_moe_bucket db = GGML_MOE_BUCKET_INVALID;
-                    bool m = ggml_moe_cache_node_cache_op(cache, nd, &dl, &db);
-                    fprintf(stderr, "DBG mmid node[%d] '%s' src0='%s' src2='%s' match=%d (L%d B%d)\n",
-                            k, nd->name,
-                            nd->src[0] ? nd->src[0]->name : "(null)",
-                            nd->src[2] ? nd->src[2]->name : "(null)",
-                            (int) m, dl, (int) db);
-                    ++dbg_mm;
-                }
-            }
             for (int j0 = 0; j0 < split->graph.n_nodes; ) {
+                // Scan for the next ids_c CONT node.
                 int j1 = j0;
-                int moe_layer = -1;
-                enum ggml_moe_bucket moe_bucket = GGML_MOE_BUCKET_INVALID;
-                while (j1 < split->graph.n_nodes &&
-                       !ggml_moe_cache_node_cache_op(cache, split->graph.nodes[j1],
-                                                     &moe_layer, &moe_bucket)) {
+                int ids_layer = -1;
+                while (j1 < split->graph.n_nodes) {
+                    ids_layer = ggml_moe_cache_node_topk_layer(cache, split->graph.nodes[j1]);
+                    if (ids_layer >= 0) {
+                        break;
+                    }
                     ++j1;
                 }
-
-                static int dbg_w = 0;
-                const bool dbg_on = dbg_w < 20;
-                // Compute the non-cache prefix [j0, j1).
-                if (j1 > j0) {
-                    if (dbg_on) { fprintf(stderr, "DBG walk: prefix [%d,%d) compute...\n", j0, j1); }
-                    struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1);
+                // Compute the chunk [j0, j1+1): the prefix plus ids_c
+                // itself (or the whole remaining tail if no ids_c found).
+                // Always a multi-node view in practice.
+                const int chunk_end = (j1 < split->graph.n_nodes)
+                    ? j1 + 1 : split->graph.n_nodes;
+                if (chunk_end > j0) {
+                    struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, chunk_end);
                     enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
                     if (ec != GGML_STATUS_SUCCESS) {
                         return ec;
                     }
                 }
                 if (j1 >= split->graph.n_nodes) {
-                    if (dbg_on) { fprintf(stderr, "DBG walk: split done (no more cache ops)\n"); ++dbg_w; }
-                    break;
+                    break;  // no more ids_c — tail already computed
                 }
-
-                // Intercept the cache mul_mat_id at j1. Its inputs (incl.
-                // argsort -> src[2]) are computed; wait, then read the
-                // live ids.
-                if (dbg_on) { fprintf(stderr, "DBG walk: intercept j1=%d sync...\n", j1); }
+                // ids_c at j1 is now computed. Sync + D2H the live
+                // current-pass expert ids (contiguous [top_k, n_tokens]).
                 ggml_backend_synchronize(split_backend);
-                if (dbg_on) { fprintf(stderr, "DBG walk: synced, handle_op_miss L%d B%d...\n", moe_layer, (int) moe_bucket); ++dbg_w; }
-                ggml_tensor * node = split->graph.nodes[j1];
-                ggml_tensor * ids_t = node->src[2];
-                // On graph reuse src[2] was patched to the cache ids
-                // tensor on a prior pass; recover the original contiguous
-                // current-pass ids tensor.
-                ggml_tensor * orig = ggml_moe_cache_resolve_original_ids(cache, ids_t);
-                if (orig) ids_t = orig;
-                const int op_top_k    = (int) ids_t->ne[0];
-                const int op_n_tokens = (int) ids_t->ne[1];
+                ggml_tensor * ids_c = split->graph.nodes[j1];
+                const int op_top_k    = (int) ids_c->ne[0];
+                const int op_n_tokens = (int) ids_c->ne[1];
                 const size_t n_ids = (size_t) op_top_k * op_n_tokens;
                 moe_topk_host.resize(n_ids);
-                ggml_backend_tensor_get(ids_t, moe_topk_host.data(), 0,
+                ggml_backend_tensor_get(ids_c, moe_topk_host.data(), 0,
                                         n_ids * sizeof(int32_t));
-                if (dbg_on) { fprintf(stderr, "DBG walk: ids_t='%s' ne=[%d,%d] -> handle_op_miss\n",
-                                      ids_t->name, op_top_k, op_n_tokens); }
-                ggml_moe_cache_handle_op_miss(cache, moe_layer, moe_bucket, split_backend,
-                                              moe_topk_host.data(), op_top_k, op_n_tokens);
-                // DEBUG: sync right after handle_op_miss's H2Ds. If the
-                // crash surfaces HERE, the H2Ds are bad; if it surfaces at
-                // the op compute below, the op's inputs/kernel are bad.
-                if (dbg_on) {
-                    ggml_backend_synchronize(split_backend);
-                    fprintf(stderr, "DBG walk: post-handle_op_miss sync OK (L%d B%d)\n",
-                            moe_layer, (int) moe_bucket);
+                // For every cache mul_mat_id of this layer: classify +
+                // H2D misses, populate the per-cell slot-ids tensor, then
+                // patch src[2] to it.
+                for (int k = j1 + 1; k < split->graph.n_nodes; ++k) {
+                    ggml_tensor * kn = split->graph.nodes[k];
+                    int op_layer = -1;
+                    enum ggml_moe_bucket op_bucket = GGML_MOE_BUCKET_INVALID;
+                    if (!ggml_moe_cache_node_cache_op(cache, kn, &op_layer, &op_bucket)) {
+                        // Stop at the next layer's ids_c — its ops belong
+                        // to the next chunk.
+                        if (ggml_moe_cache_node_topk_layer(cache, kn) >= 0) {
+                            break;
+                        }
+                        continue;
+                    }
+                    if (op_layer != ids_layer) {
+                        break;  // a different layer's cache op
+                    }
+                    ggml_moe_cache_handle_op_miss(cache, op_layer, op_bucket,
+                                                  split_backend, moe_topk_host.data(),
+                                                  op_top_k, op_n_tokens);
+                    kn->src[2] = ggml_moe_cache_ids_tensor(cache, op_layer, op_bucket);
                 }
-                // Patch src[2] to the cache ids tensor (set_ids just
-                // populated + reshaped it). Record the original so a
-                // reused graph can recover it next pass.
-                ggml_moe_cache_record_original_ids(cache, moe_layer, moe_bucket, ids_t);
-                node->src[2] = ggml_moe_cache_ids_tensor(cache, moe_layer, moe_bucket);
-
-                // Compute the cache mul_mat_id node itself.
-                if (dbg_on) { fprintf(stderr, "DBG walk: compute op [%d] '%s'...\n", j1, node->name); }
-                struct ggml_cgraph gv1 = ggml_graph_view(&split->graph, j1, j1 + 1);
-                enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv1);
-                if (ec != GGML_STATUS_SUCCESS) {
-                    return ec;
-                }
-
+                // The patched mul_mat_ids compute in the next chunk.
                 j0 = j1 + 1;
             }
         } else if (!sched->callback_eval) {

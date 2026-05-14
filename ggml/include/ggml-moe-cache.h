@@ -205,6 +205,16 @@ bool ggml_moe_cache_node_cache_op(
     int *                      out_layer_idx,
     enum ggml_moe_bucket *     out_bucket);
 
+// If `node` is a per-layer ids_c tensor — ggml_cont(selected_experts),
+// named "ffn_moe_slot_ids-{layer}" — return its layer index, else -1.
+// This is the node-walk's per-layer interception point: it is the LAST
+// node of the prefix chunk, so when the walk syncs after computing the
+// prefix, ids_c holds the CURRENT-pass expert ids. Structural match
+// (op == GGML_OP_CONT + name) — robust across graph reserve/reuse.
+int ggml_moe_cache_node_topk_layer(
+    ggml_moe_cache_t           cache,
+    const struct ggml_tensor * node);
+
 // Handle misses for ONE (layer, bucket) using the current-pass expert
 // ids D2H'd from the live mul_mat_id node's src[2]. Classifies used
 // experts, evicts+H2Ds missing experts into the slot pool from the
