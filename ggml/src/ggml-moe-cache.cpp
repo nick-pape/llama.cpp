@@ -830,6 +830,23 @@ void ggml_moe_cache_remap_ids_inplace(
 
     ggml_backend_tensor_set(ids_tensor, slot_ids.data(), 0,
                             n_ids * sizeof(int32_t));
+
+    {
+        static int drb_s = 0, drb_b = 0;
+        const bool is_big = n_tokens > 4;
+        const bool show = is_big ? (drb_b++ < 12) : (drb_s++ < 4);
+        if (show) {
+            ggml_backend_synchronize(backend);
+            int32_t rb[4] = {-1,-1,-1,-1};
+            ggml_backend_tensor_get(ids_tensor, rb, 0, sizeof(rb));
+            fprintf(stderr, "DBG remap-rb L%d B%d (n_tok=%d): after H2D+sync first4=%d,%d,%d,%d "
+                    "(slot_ids were %d,%d,%d,%d) data=%p view_src=%p\n",
+                    layer_idx, (int) bucket, n_tokens, rb[0], rb[1], rb[2], rb[3],
+                    slot_ids[0], slot_ids.size()>1?slot_ids[1]:-1,
+                    slot_ids.size()>2?slot_ids[2]:-1, slot_ids.size()>3?slot_ids[3]:-1,
+                    (void *) ids_tensor->data, (void *) ids_tensor->view_src);
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
