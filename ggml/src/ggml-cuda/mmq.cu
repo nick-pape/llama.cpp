@@ -167,6 +167,20 @@ void ggml_cuda_mul_mat_q(
 
     const int64_t n_expert_used = ids->ne[0];
     const int64_t ne_get_rows = ne12 * n_expert_used;
+    if (ne1 != n_expert_used) {
+        fprintf(stderr,
+            "mmq.cu DBG: ne1=%lld n_expert_used=%lld\n"
+            "  dst name=%s ne=[%lld,%lld,%lld,%lld]\n"
+            "  ids name=%s op=%d ne=[%lld,%lld,%lld,%lld]\n"
+            "  src0 name=%s ne=[%lld,%lld,%lld,%lld]\n"
+            "  src1 name=%s ne=[%lld,%lld,%lld,%lld]\n",
+            (long long) ne1, (long long) n_expert_used,
+            dst->name,  (long long) dst->ne[0],  (long long) dst->ne[1],  (long long) dst->ne[2],  (long long) dst->ne[3],
+            ids->name,  (int) ids->op,
+            (long long) ids->ne[0],  (long long) ids->ne[1],  (long long) ids->ne[2],  (long long) ids->ne[3],
+            src0->name, (long long) src0->ne[0], (long long) src0->ne[1], (long long) src0->ne[2], (long long) src0->ne[3],
+            src1->name, (long long) src1->ne[0], (long long) src1->ne[1], (long long) src1->ne[2], (long long) src1->ne[3]);
+    }
     GGML_ASSERT(ne1 == n_expert_used);
 
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
