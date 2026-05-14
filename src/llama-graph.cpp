@@ -1504,14 +1504,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             ggml_tensor * map = ggml_moe_cache_mapping_tensor(moe_cache, il, b);
             if (!map) return selected_experts;
             // ggml_get_rows requires a->ne[2] == b->ne[1] (batched source).
-            // Mapping is shared across all tokens; broadcast it via the same
-            // reshape + repeat pattern used for up_exps_s scaling tensors so
-            // get_rows accepts it. Repeat is stride-only (no data copy).
+            // The repeat-to-broadcast pattern triggered a CUDA illegal
+            // memory access at decode time (likely a repeat-kernel +
+            // stride-0 edge case with the synthesized intermediate).
+            // Cleaner shape: reshape mapping to [1, n_experts, 1, 1] and
+            // flatten selected_experts to [top_k*n_tokens, 1, 1, 1]. Then
+            // a->ne[2..3] == b->ne[1..2] == 1, no broadcast needed.
             const int64_t n_experts = map->ne[0];
-            ggml_tensor * map_b = ggml_reshape_3d(ctx0, map, 1, n_experts, 1);
-            map_b = ggml_repeat_4d(ctx0, map_b, 1, n_experts, n_tokens, 1);
-            ggml_tensor * sids = ggml_get_rows(ctx0, map_b, selected_experts);
-            // get_rows output is [1, top_k, n_tokens, 1]; mul_mat_id needs
+            ggml_tensor * map_2d = ggml_reshape_2d(ctx0, map, 1, n_experts);
+            ggml_tensor * ids_1d = ggml_reshape_1d(ctx0, selected_experts, top_k * n_tokens);
+            ggml_tensor * sids   = ggml_get_rows(ctx0, map_2d, ids_1d);
+            // get_rows output is [1, top_k*n_tokens, 1, 1]; mul_mat_id needs
             // ids 2D [top_k, n_tokens]. Reshape (view-only).
             sids = ggml_reshape_2d(ctx0, sids, top_k, n_tokens);
             return sids;
