@@ -805,6 +805,28 @@ void ggml_moe_cache_remap_ids_inplace(
         const int32_t e = ids[i];
         slot_ids[i] = (e >= 0 && e < cell.n_experts) ? cell.mapping_host[e] : 0;
     }
+
+    {
+        static int dbg = 0;
+        if (dbg < 24) {
+            int32_t min_s = 1<<30, max_s = -(1<<30), min_e = 1<<30, max_e = -(1<<30);
+            for (size_t i = 0; i < n_ids; ++i) {
+                if (slot_ids[i] < min_s) min_s = slot_ids[i];
+                if (slot_ids[i] > max_s) max_s = slot_ids[i];
+                if (ids[i]      < min_e) min_e = ids[i];
+                if (ids[i]      > max_e) max_e = ids[i];
+            }
+            fprintf(stderr, "DBG remap L%d B%d: ids_t='%s' op=%d ne=[%lld,%lld,%lld,%lld] "
+                    "top_k=%d n_tok=%d n_exp=%d n_slots=%lld  expert[%d..%d] slot[%d..%d]\n",
+                    layer_idx, (int) bucket, ids_tensor->name, (int) ids_tensor->op,
+                    (long long) ids_tensor->ne[0], (long long) ids_tensor->ne[1],
+                    (long long) ids_tensor->ne[2], (long long) ids_tensor->ne[3],
+                    top_k, n_tokens, (int) cell.n_experts,
+                    (long long) cell.pool_tensor->ne[2], min_e, max_e, min_s, max_s);
+            ++dbg;
+        }
+    }
+
     ggml_backend_tensor_set(ids_tensor, slot_ids.data(), 0,
                             n_ids * sizeof(int32_t));
 }

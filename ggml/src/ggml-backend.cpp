@@ -2107,6 +2107,26 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 // The layer's ids_c tensors are computed. Sync, then remap
                 // every cache op of this layer in place.
                 ggml_backend_synchronize(split_backend);
+                {
+                    static int dbg = 0;
+                    if (dbg < 8) {
+                        int n_cache = 0;
+                        for (int t = 0; t < split->graph.n_nodes; ++t) {
+                            int dl = -1; enum ggml_moe_bucket db = GGML_MOE_BUCKET_INVALID;
+                            if (ggml_moe_cache_node_cache_op(cache, split->graph.nodes[t], &dl, &db)) ++n_cache;
+                        }
+                        ggml_tensor * fn = split->graph.nodes[j1];
+                        fprintf(stderr, "DBG walk: split n_nodes=%d j1=%d L%d B%d "
+                                "src0='%s' src2='%s' src2_ne=[%lld,%lld] n_cache_ops=%d\n",
+                                split->graph.n_nodes, j1, moe_layer, (int) moe_bucket,
+                                fn->src[0] ? fn->src[0]->name : "(null)",
+                                fn->src[2] ? fn->src[2]->name : "(null)",
+                                fn->src[2] ? (long long) fn->src[2]->ne[0] : -1,
+                                fn->src[2] ? (long long) fn->src[2]->ne[1] : -1,
+                                n_cache);
+                        ++dbg;
+                    }
+                }
                 int k = j1;
                 while (k < split->graph.n_nodes) {
                     int op_layer = -1;
