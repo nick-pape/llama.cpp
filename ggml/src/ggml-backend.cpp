@@ -1839,10 +1839,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 if (cur->op == GGML_OP_GET_ROWS && cur->src[1]) {
                                     cur = cur->src[1];
                                 } else if ((cur->op == GGML_OP_RESHAPE ||
-                                            cur->op == GGML_OP_VIEW ||
-                                            cur->op == GGML_OP_CONT ||
-                                            cur->op == GGML_OP_TRANSPOSE ||
-                                            cur->op == GGML_OP_PERMUTE) && cur->src[0]) {
+                                            cur->op == GGML_OP_CONT) && cur->src[0]) {
+                                    // Stop at VIEW — argsort_top_k wraps
+                                    // argsort in a view that slices to
+                                    // top_k; unwrapping it exposes the
+                                    // full-n_expert sort.
                                     cur = cur->src[0];
                                 } else {
                                     break;
