@@ -2083,6 +2083,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     topk_layer = ggml_moe_cache_node_topk_layer(cache, split->graph.nodes[j1]);
                 }
 
+                // DEBUG: log chunk structure for the first few chunks.
+                {
+                    static int dbg_c = 0;
+                    if (dbg_c < 14) {
+                        const char * n0  = split->graph.nodes[j0]->name;
+                        const char * n1  = split->graph.nodes[j1]->name;
+                        fprintf(stderr, "DBG nodewalk: split has %d nodes | chunk [%d..%d] (%d) "
+                                "j0='%s'(op%d) j1='%s'(op%d) topk_layer=%d\n",
+                                split->graph.n_nodes, j0, j1, j1 - j0 + 1,
+                                n0, (int) split->graph.nodes[j0]->op,
+                                n1, (int) split->graph.nodes[j1]->op, topk_layer);
+                        ++dbg_c;
+                    }
+                }
+
                 struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1 + 1);
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {
