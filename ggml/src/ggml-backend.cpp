@@ -1651,16 +1651,33 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ggml_backend_synchronize(input_backend);
 
                     // get the ids. With Phase 1 (GPU-side gather),
-                    // node->src[2] is the ggml_get_rows(mapping, selected_experts)
-                    // output; the actual expert ids are src[2]->src[1]
-                    // (the argsort/topk result). Walk back so the D2H
+                    // node->src[2] is reshape_2d(get_rows(reshape_2d(mapping),
+                    // reshape_1d(cont(selected_experts)))) — a chain of view
+                    // ops on top of the get_rows output. Walk back through
+                    // any reshape/view/cont/transpose/permute nodes plus
+                    // get_rows->src[1] until we reach the real
+                    // selected_experts (argsort/topk output) so the D2H
                     // below reads real expert ids, not slot ids.
                     // Fallback to the legacy resolve for ops that didn't
                     // get Phase 1 substitution (cache disabled per-bucket).
                     ggml_tensor * ids_tensor = node->src[2];
                     if (sched->moe_cache) {
-                        if (ids_tensor->op == GGML_OP_GET_ROWS && ids_tensor->src[1]) {
-                            ids_tensor = ids_tensor->src[1];
+                        ggml_tensor * cur = ids_tensor;
+                        for (int hops = 0; cur && hops < 8; ++hops) {
+                            if (cur->op == GGML_OP_GET_ROWS && cur->src[1]) {
+                                cur = cur->src[1];
+                            } else if ((cur->op == GGML_OP_RESHAPE ||
+                                        cur->op == GGML_OP_VIEW ||
+                                        cur->op == GGML_OP_CONT ||
+                                        cur->op == GGML_OP_TRANSPOSE ||
+                                        cur->op == GGML_OP_PERMUTE) && cur->src[0]) {
+                                cur = cur->src[0];
+                            } else {
+                                break;
+                            }
+                        }
+                        if (cur && cur != ids_tensor) {
+                            ids_tensor = cur;
                         } else {
                             ggml_tensor * resolved = ggml_moe_cache_resolve_original_ids(
                                 (ggml_moe_cache_t) sched->moe_cache, ids_tensor);
@@ -1807,12 +1824,29 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         if (scratch) {
                             node->src[0] = scratch;
                             // Restore src[2] to the original expert ids.
-                            // With Phase 1, src[2] is get_rows(mapping, ids)
-                            // — walk back to ids. With legacy patching,
-                            // resolve_original_ids returns the recorded
-                            // pre-patch tensor.
-                            if (node->src[2] && node->src[2]->op == GGML_OP_GET_ROWS && node->src[2]->src[1]) {
-                                node->src[2] = node->src[2]->src[1];
+                            // Walk through reshape/view/cont/transpose/permute
+                            // and get_rows links until we reach the real
+                            // selected_experts (argsort output). Without this,
+                            // mul_mat_id reads scratch[slot_id] which mixes
+                            // slot indices into the n_expert-sized scratch
+                            // and produces wrong-expert output (no crash, but
+                            // garbage tokens).
+                            ggml_tensor * cur = node->src[2];
+                            for (int hops = 0; cur && hops < 8; ++hops) {
+                                if (cur->op == GGML_OP_GET_ROWS && cur->src[1]) {
+                                    cur = cur->src[1];
+                                } else if ((cur->op == GGML_OP_RESHAPE ||
+                                            cur->op == GGML_OP_VIEW ||
+                                            cur->op == GGML_OP_CONT ||
+                                            cur->op == GGML_OP_TRANSPOSE ||
+                                            cur->op == GGML_OP_PERMUTE) && cur->src[0]) {
+                                    cur = cur->src[0];
+                                } else {
+                                    break;
+                                }
+                            }
+                            if (cur && cur != node->src[2]) {
+                                node->src[2] = cur;
                             } else {
                                 ggml_tensor * orig = ggml_moe_cache_resolve_original_ids(
                                     moe_cache, node->src[2]);
