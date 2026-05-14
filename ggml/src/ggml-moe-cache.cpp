@@ -668,10 +668,18 @@ bool ggml_moe_cache_node_cache_op(
     const ggml_tensor * w = node->src[0];
     if (!w) return false;
     // build_moe_ffn rebinds the MoE weight to the cache slot pool, named
-    // "moe-cache-pool-L{layer}-B{bucket}" in bind_bucket. Parse it.
+    // "moe-cache-pool-L{layer}-B{bucket}" in bind_bucket. The node-walk
+    // may further repoint src[0] to the per-cell overflow scratch
+    // ("moe-cache-overflow-L{layer}-B{bucket}") on a prefill-overflow op;
+    // match that too so a reused graph's overflow ops are still found.
     const char * p = strstr(w->name, "moe-cache-pool-L");
-    if (!p) return false;
-    p += 16 /* strlen("moe-cache-pool-L") */;
+    if (p) {
+        p += 16 /* strlen("moe-cache-pool-L") */;
+    } else {
+        p = strstr(w->name, "moe-cache-overflow-L");
+        if (!p) return false;
+        p += 20 /* strlen("moe-cache-overflow-L") */;
+    }
     char * end = nullptr;
     const long layer = strtol(p, &end, 10);
     if (!end || end[0] != '-' || end[1] != 'B') return false;
@@ -847,6 +855,115 @@ void ggml_moe_cache_remap_ids_inplace(
                     (void *) ids_tensor->data, (void *) ids_tensor->view_src);
         }
     }
+}
+
+void ggml_moe_cache_remap_or_overflow(
+        ggml_moe_cache_t c, int layer_idx, ggml_moe_bucket bucket,
+        ggml_backend_t backend, ggml_tensor * node) {
+    if (!c || !backend || !node) return;
+    if (bucket < 0 || bucket >= GGML_MOE_BUCKET_COUNT) return;
+    if (layer_idx < 0 || layer_idx >= c->n_layers) return;
+
+    auto & cell = c->cells[cell_idx(layer_idx, bucket)];
+    if (!cell.bound || !cell.host_weight || !cell.pool_tensor) return;
+
+    ggml_tensor * ids_tensor = node->src[2];
+    if (!ids_tensor) return;
+    const int top_k    = (int) ids_tensor->ne[0];
+    const int n_tokens = (int) ids_tensor->ne[1];
+    if (top_k <= 0 || n_tokens <= 0) return;
+    const size_t n_ids = (size_t) top_k * n_tokens;
+
+    // D2H the current-pass expert ids from the live ids tensor.
+    std::vector<int32_t> ids(n_ids);
+    ggml_backend_tensor_get(ids_tensor, ids.data(), 0, n_ids * sizeof(int32_t));
+
+    // Dedup the experts used by this op.
+    std::vector<uint8_t> used((size_t) cell.n_experts, 0);
+    int n_unique = 0;
+    for (size_t i = 0; i < n_ids; ++i) {
+        const int32_t e = ids[i];
+        if (e >= 0 && e < cell.n_experts && !used[e]) { used[e] = 1; ++n_unique; }
+    }
+
+    const uint8_t * w_base = (const uint8_t *) cell.host_weight->data;
+
+    // ---- Overflow path -----------------------------------------------------
+    // This op uses more unique experts than the slot pool can hold. A slot
+    // remap is impossible (not every expert can get a distinct slot), so
+    // route the op through a full-size [K,N,n_experts] scratch buffer and
+    // keep the ORIGINAL expert ids in src[2] -- the kernel reads
+    // scratch[expert_id] directly. Typical on prefill (a long prompt
+    // touches nearly every expert); decode fits and uses the slot pool.
+    if (n_unique > cell.n_slots) {
+        ggml_tensor * scratch = ggml_moe_cache_acquire_overflow_scratch(
+            c, backend, layer_idx, bucket, cell.host_weight);
+        if (scratch) {
+            // Contiguous-batch H2D of the used experts into the scratch.
+            // Over-copy a little padding past each non-final batch so the
+            // CUDA MMQ kernel never reads uninitialised tail bytes.
+            int e = 0;
+            while (e < cell.n_experts && !used[e]) ++e;
+            if (e < cell.n_experts) {
+                int first = e, last = e;
+                auto flush = [&]() {
+                    const size_t off = (size_t) first * cell.expert_size;
+                    const size_t sz  = (size_t) (last - first + 1) * cell.expert_size;
+                    const size_t pad = (last < cell.n_experts - 1)
+                        ? (cell.expert_size < 512 ? cell.expert_size : (size_t) 512)
+                        : 0;
+                    ggml_backend_tensor_set_async(backend, scratch,
+                        w_base + off, off, sz + pad);
+                };
+                for (++e; e < cell.n_experts; ++e) {
+                    if (!used[e]) continue;
+                    if (e == last + 1) { last = e; continue; }
+                    flush();
+                    first = e; last = e;
+                }
+                flush();
+            }
+            node->src[0] = scratch;
+            // src[2] keeps the raw expert ids (correct for the full-size
+            // scratch) -- do NOT remap.
+            return;
+        }
+        // scratch alloc failed: fall through to the cache path. It will
+        // produce wrong-expert output for the overflowing experts but
+        // stays in-bounds (mapping values are clamped to [0, n_slots)).
+    }
+
+    // ---- Fits path ---------------------------------------------------------
+    // Restore src[0] to the slot pool (it may be the overflow scratch from
+    // a prior pass on a reused graph) and remap src[2] to slot ids.
+    node->src[0] = cell.pool_tensor;
+
+    // Classify: hits update LRU state; misses evict + async H2D into the
+    // pool + record. Expert-weight H2Ds source the persistent host model
+    // weight, so async is safe; they run on the compute backend's stream
+    // ordered before the chunk compute that follows in the node-walk.
+    for (int32_t e = 0; e < (int32_t) cell.n_experts; ++e) {
+        if (!used[e]) continue;
+        int slot = ggml_moe_cache_lookup(c, layer_idx, bucket, e);
+        if (slot >= 0) continue;   // already resident
+        slot = ggml_moe_cache_select_slot_for_miss(c, layer_idx, bucket, e);
+        if (slot < 0) continue;
+        ggml_backend_tensor_set_async(backend, cell.pool_tensor,
+            w_base + (size_t) e * cell.expert_size,
+            (size_t) slot * cell.slot_stride,
+            cell.expert_size);
+        ggml_moe_cache_record_slot(c, layer_idx, bucket, slot, e);
+    }
+
+    // Build slot_ids = mapping[expert_id] and H2D them back into the same
+    // ids tensor in place (synchronous: the host buffer is a local).
+    std::vector<int32_t> slot_ids(n_ids);
+    for (size_t i = 0; i < n_ids; ++i) {
+        const int32_t e = ids[i];
+        slot_ids[i] = (e >= 0 && e < cell.n_experts) ? cell.mapping_host[e] : 0;
+    }
+    ggml_backend_tensor_set(ids_tensor, slot_ids.data(), 0,
+                            n_ids * sizeof(int32_t));
 }
 
 // -----------------------------------------------------------------------------

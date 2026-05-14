@@ -2126,11 +2126,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 if (j1 >= split->graph.n_nodes) {
                     break;  // no more cache ops — tail already computed
                 }
-                // j1's ids_c is computed. Sync, remap it in place.
+                // j1's ids_c is computed. Sync, then either remap src[2]
+                // to slot ids (op fits the pool) or route the op through
+                // the full-size overflow scratch (prefill overflow).
                 ggml_backend_synchronize(split_backend);
-                ggml_moe_cache_remap_ids_inplace(cache, moe_layer, moe_bucket,
+                ggml_moe_cache_remap_or_overflow(cache, moe_layer, moe_bucket,
                                                  split_backend,
-                                                 split->graph.nodes[j1]->src[2]);
+                                                 split->graph.nodes[j1]);
                 // Scan for the cache op AFTER j1.
                 int j2 = j1 + 1;
                 while (j2 < split->graph.n_nodes) {

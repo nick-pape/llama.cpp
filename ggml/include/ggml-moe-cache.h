@@ -237,6 +237,25 @@ void ggml_moe_cache_remap_ids_inplace(
     ggml_backend_t          backend,
     struct ggml_tensor *    ids_tensor);
 
+// Per-op miss handling for ONE cache mul_mat_id `node`, with prefill-
+// overflow fallback. D2Hs the current-pass expert ids from node->src[2],
+// dedups the used experts, then:
+//   * if n_unique_used <= n_slots: restore node->src[0] to the slot pool,
+//     classify + H2D missed experts into the pool, and H2D the remapped
+//     slot ids back into node->src[2] in place.
+//   * if n_unique_used > n_slots (overflow): repoint node->src[0] to the
+//     per-cell full-size [K,N,n_experts] overflow scratch, H2D the used
+//     experts into it, and LEAVE node->src[2] as the raw expert ids (the
+//     kernel reads scratch[expert_id] directly).
+// Both src[0] states are recognised by ggml_moe_cache_node_cache_op, so a
+// reused graph re-enters this with the correct dispatch each pass.
+void ggml_moe_cache_remap_or_overflow(
+    ggml_moe_cache_t        cache,
+    int                     layer_idx,
+    enum ggml_moe_bucket    bucket,
+    ggml_backend_t          backend,
+    struct ggml_tensor *    node);
+
 // Handle misses for ONE (layer, bucket) using the current-pass expert
 // ids D2H'd from the live mul_mat_id node's src[2]. Classifies used
 // experts, evicts+H2Ds missing experts into the slot pool from the
