@@ -15,6 +15,8 @@
 struct ggml_cgraph;
 struct ggml_context;
 struct ggml_tensor;
+struct ggml_moe_cache;
+typedef struct ggml_moe_cache * ggml_moe_cache_t;
 
 struct llama_cparams;
 struct llama_layer;
@@ -540,6 +542,11 @@ struct llm_graph_params {
     ggml_backend_sched_t sched;
     ggml_backend_t backend_cpu;
 
+    // MoE expert-weight cache (optional). If non-null, build_moe_ffn
+    // injects ggml_get_rows(mapping_tensor, selected_experts) per bucket
+    // and routes mul_mat_id through the resulting slot_ids.
+    ggml_moe_cache_t moe_cache = nullptr;
+
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
@@ -753,6 +760,8 @@ struct llm_graph_context {
     ggml_backend_sched_t sched;
 
     ggml_backend_t backend_cpu; // TODO: needed by build_attn_mha, figure out a way to remove?
+
+    ggml_moe_cache_t moe_cache;
 
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;

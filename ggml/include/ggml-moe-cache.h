@@ -152,6 +152,37 @@ bool ggml_moe_cache_set_ids(
     int                     top_k,
     int                     n_tokens);
 
+// Returns the persistent expert_id -> slot_idx mapping tensor for
+// (layer, bucket). Shape [n_experts] int32, GPU-resident. Used in
+// build_moe_ffn as the source of ggml_get_rows(mapping, selected_experts)
+// so slot_ids are computed on the GPU rather than built on host +
+// H2D'd via set_ids. The device data is kept current by record_slot
+// (shadow update) + ggml_moe_cache_flush_mapping_to_device (H2D flush)
+// from the compute_splits cache hook.
+//
+// Entries default to 0 (slot 0). After eviction of expert E from slot S,
+// mapping[E] is reset to 0. mul_mat_id's assertion (expert<ne02) holds
+// for all reachable mapping values. Reading a "stale" mapping entry
+// returns slot 0's resident expert — wrong expert, no crash. Sticky
+// routing makes this rare in practice (~1% mismatch at cache>=top_k*2).
+//
+// Returns NULL if cell not bound.
+struct ggml_tensor * ggml_moe_cache_mapping_tensor(
+    ggml_moe_cache_t        cache,
+    int                     layer_idx,
+    enum ggml_moe_bucket    bucket);
+
+// Flush dirty mapping entries to device. Called from compute_splits
+// cache hook after miss handling + record_slot updates. Issues one
+// async 4-byte H2D per dirty entry (typically <= top_k entries per
+// op) on the given backend's compute stream so writes are ordered
+// before downstream get_rows reads.
+void ggml_moe_cache_flush_mapping_to_device(
+    ggml_moe_cache_t        cache,
+    int                     layer_idx,
+    enum ggml_moe_bucket    bucket,
+    ggml_backend_t          backend);
+
 // Record the "original" ids tensor (e.g. selected_experts) for this
 // (layer, bucket) so that the scheduler can recover it after our
 // node->src[2] patch from a previous call has persisted via graph

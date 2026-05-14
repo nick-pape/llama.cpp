@@ -71,6 +71,19 @@ struct ggml_moe_cache {
         uint8_t *             ids_base    = nullptr;
         ggml_tensor *         ids_tensor  = nullptr;
 
+        // Mapping: expert_id -> slot_idx, GPU-resident. Used by
+        // ggml_get_rows in build_moe_ffn to compute slot_ids on device,
+        // replacing the host-build + set_ids H2D path. Entries default
+        // to 0 so any reachable value satisfies mul_mat_id's expert<ne02
+        // assertion; reading a stale entry returns slot 0's content
+        // (wrong expert, no crash — bounded by sticky-routing rarity).
+        ggml_backend_buffer_t mapping_buf    = nullptr;
+        uint8_t *             mapping_base   = nullptr;
+        ggml_tensor *         mapping_tensor = nullptr;
+        std::vector<int32_t>  mapping_host;        // [n_experts] shadow
+        std::vector<int32_t>  mapping_dirty_list;  // expert_ids needing H2D
+        std::vector<uint8_t>  mapping_in_dirty;    // [n_experts] dedup membership
+
         // Original src[2] (e.g. selected_experts) recorded by the
         // scheduler. compute_splits patches node->src[2] to ids_tensor
         // (above) so the kernel reads remapped slot indices; across
@@ -240,8 +253,9 @@ void ggml_moe_cache_free(ggml_moe_cache_t c) {
     }
 
     for (auto & cell : c->cells) {
-        if (cell.pool_buf) ggml_backend_buffer_free(cell.pool_buf);
-        if (cell.ids_buf)  ggml_backend_buffer_free(cell.ids_buf);
+        if (cell.pool_buf)    ggml_backend_buffer_free(cell.pool_buf);
+        if (cell.ids_buf)     ggml_backend_buffer_free(cell.ids_buf);
+        if (cell.mapping_buf) ggml_backend_buffer_free(cell.mapping_buf);
     }
     if (c->scratch_buf)    ggml_backend_buffer_free(c->scratch_buf);
     if (c->tensor_ctx)     ggml_free(c->tensor_ctx);
@@ -383,6 +397,39 @@ bool ggml_moe_cache_bind_bucket(
     snprintf(cell.ids_tensor->name, sizeof(cell.ids_tensor->name),
              "moe-cache-ids-L%d-B%d", layer_idx, (int) bucket);
 
+    // Allocate mapping buffer: [n_experts] int32, GPU-resident. Used
+    // by build_moe_ffn's ggml_get_rows to compute slot_ids on device.
+    const size_t mapping_bytes = (size_t) n_experts * sizeof(int32_t);
+    cell.mapping_buf = ggml_backend_buft_alloc_buffer(buft, mapping_bytes);
+    if (!cell.mapping_buf) {
+        moe_cache_log("cell (layer=%d, bucket=%d) failed to allocate %zu bytes for mapping",
+                      layer_idx, (int) bucket, mapping_bytes);
+        ggml_backend_buffer_free(cell.pool_buf); cell.pool_buf = nullptr;
+        ggml_backend_buffer_free(cell.ids_buf);  cell.ids_buf  = nullptr;
+        return false;
+    }
+    cell.mapping_base = (uint8_t *) ggml_backend_buffer_get_base(cell.mapping_buf);
+    cell.mapping_tensor = ggml_new_tensor_1d(c->tensor_ctx, GGML_TYPE_I32, n_experts);
+    if (!cell.mapping_tensor) {
+        moe_cache_log("cell (layer=%d, bucket=%d) failed to construct mapping tensor wrapper", layer_idx, (int) bucket);
+        ggml_backend_buffer_free(cell.pool_buf);    cell.pool_buf    = nullptr;
+        ggml_backend_buffer_free(cell.ids_buf);     cell.ids_buf     = nullptr;
+        ggml_backend_buffer_free(cell.mapping_buf); cell.mapping_buf = nullptr;
+        return false;
+    }
+    cell.mapping_tensor->data   = cell.mapping_base;
+    cell.mapping_tensor->buffer = cell.mapping_buf;
+    snprintf(cell.mapping_tensor->name, sizeof(cell.mapping_tensor->name),
+             "moe-cache-map-L%d-B%d", layer_idx, (int) bucket);
+
+    // Initial mapping: all experts -> slot 0 (safe default). Single full
+    // H2D rather than per-entry; subsequent updates use dirty list.
+    cell.mapping_host.assign((size_t) n_experts, 0);
+    cell.mapping_in_dirty.assign((size_t) n_experts, 0);
+    cell.mapping_dirty_list.clear();
+    ggml_backend_tensor_set(cell.mapping_tensor, cell.mapping_host.data(),
+                            0, mapping_bytes);
+
     cell.slot_to_expert.assign(cell.n_slots, -1);
     cell.expert_to_slot.reserve((size_t) cell.n_slots);
     cell.freq.assign(cell.n_slots, 0);
@@ -390,7 +437,7 @@ bool ggml_moe_cache_bind_bucket(
     cell.tier.assign(cell.n_slots, 0);   // probationary
     cell.next_unused = 0;
     cell.bound       = true;
-    c->total_bytes  += pool_bytes + ids_bytes;
+    c->total_bytes  += pool_bytes + ids_bytes + mapping_bytes;
 
     static int n_bound = 0;
     if (n_bound < 8) {
@@ -512,12 +559,32 @@ void ggml_moe_cache_record_slot(
     const int32_t prev = cell.slot_to_expert[slot_idx];
     if (prev >= 0) {
         cell.expert_to_slot.erase(prev);
+        // Stale-mapping safety: future reads of prev now hit slot 0
+        // (some valid expert) instead of slot_idx (which now holds a
+        // different expert). Reset the device-side mapping entry too.
+        if ((size_t) prev < cell.mapping_host.size() && cell.mapping_host[prev] != 0) {
+            cell.mapping_host[prev] = 0;
+            if (!cell.mapping_in_dirty[prev]) {
+                cell.mapping_in_dirty[prev] = 1;
+                cell.mapping_dirty_list.push_back(prev);
+            }
+        }
     }
     cell.slot_to_expert[slot_idx] = expert_id;
     cell.expert_to_slot[expert_id] = slot_idx;
     cell.freq[slot_idx]      = 1;
     cell.last_tick[slot_idx] = ++c->tick;
     cell.tier[slot_idx]      = 0;   // new entry starts probationary (SLRU)
+
+    // Mark mapping entry dirty so flush_mapping_to_device picks it up
+    // before downstream graph nodes read mapping_tensor.
+    if ((size_t) expert_id < cell.mapping_host.size()) {
+        cell.mapping_host[expert_id] = slot_idx;
+        if (!cell.mapping_in_dirty[expert_id]) {
+            cell.mapping_in_dirty[expert_id] = 1;
+            cell.mapping_dirty_list.push_back(expert_id);
+        }
+    }
 
     c->stats.total_h2d_bytes += (int64_t) cell.expert_size;
 }
@@ -552,6 +619,34 @@ ggml_tensor * ggml_moe_cache_ids_tensor(
     if (layer_idx < 0 || layer_idx >= c->n_layers)     return nullptr;
     auto & cell = c->cells[cell_idx(layer_idx, bucket)];
     return cell.bound ? cell.ids_tensor : nullptr;
+}
+
+ggml_tensor * ggml_moe_cache_mapping_tensor(
+        ggml_moe_cache_t c, int layer_idx, ggml_moe_bucket bucket) {
+    if (!c) return nullptr;
+    if (bucket < 0 || bucket >= GGML_MOE_BUCKET_COUNT) return nullptr;
+    if (layer_idx < 0 || layer_idx >= c->n_layers)     return nullptr;
+    auto & cell = c->cells[cell_idx(layer_idx, bucket)];
+    return cell.bound ? cell.mapping_tensor : nullptr;
+}
+
+void ggml_moe_cache_flush_mapping_to_device(
+        ggml_moe_cache_t c, int layer_idx, ggml_moe_bucket bucket, ggml_backend_t backend) {
+    if (!c || !backend) return;
+    if (bucket < 0 || bucket >= GGML_MOE_BUCKET_COUNT) return;
+    if (layer_idx < 0 || layer_idx >= c->n_layers)     return;
+    auto & cell = c->cells[cell_idx(layer_idx, bucket)];
+    if (!cell.bound || !cell.mapping_tensor) return;
+    if (cell.mapping_dirty_list.empty())     return;
+
+    for (int32_t expert_id : cell.mapping_dirty_list) {
+        const size_t offset = (size_t) expert_id * sizeof(int32_t);
+        ggml_backend_tensor_set_async(backend, cell.mapping_tensor,
+                                       &cell.mapping_host[expert_id],
+                                       offset, sizeof(int32_t));
+        cell.mapping_in_dirty[expert_id] = 0;
+    }
+    cell.mapping_dirty_list.clear();
 }
 
 // -----------------------------------------------------------------------------

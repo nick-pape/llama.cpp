@@ -11,6 +11,8 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include "ggml-moe-cache.h"
+
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -947,6 +949,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     rope_type        (hparams.rope_type),
     sched            (params.sched),
     backend_cpu      (params.backend_cpu),
+    moe_cache        (params.moe_cache),
     cvec             (params.cvec),
     loras            (params.loras),
     mctx             (params.mctx),
@@ -1459,6 +1462,60 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     cb(selected_experts->src[0], "ffn_moe_argsort", il);
     cb(selected_experts, "ffn_moe_topk", il);
 
+    // MoE expert cache (Phase 1): replace per-bucket build_lora_mm_id's ids
+    // tensor with slot_ids = ggml_get_rows(mapping, selected_experts) so the
+    // remap from expert_id to slot_idx happens on the GPU rather than
+    // building slot_ids on host + H2D'ing via set_ids in compute_splits.
+    // mapping_tensor is updated by record_slot + flush_mapping_to_device on
+    // misses (stream-ordered before this get_rows reads it).
+    //
+    // Bias and scaling ops (ggml_add_id, ggml_get_rows on _s tensors) keep
+    // the original selected_experts since those tensors are per-n_expert,
+    // not per-n_slot. Only mul_mat_id reads through the slot pool.
+    ggml_tensor * slot_ids_up      = selected_experts;
+    ggml_tensor * slot_ids_gate    = selected_experts;
+    ggml_tensor * slot_ids_down    = selected_experts;
+    ggml_tensor * slot_ids_gate_up = selected_experts;
+
+    if (moe_cache && n_expert_used > 0) {
+        const int top_k = (int) n_expert_used;
+        const int max_n_tokens = std::max<int>(8192, (int) ubatch.n_tokens);
+        // Useful-slot floor: below n_slots == min_useful_topk * top_k the
+        // cache hurts more than it helps (measured: 12-24% regression at
+        // cache=16/24 with top_k=8). Mirror the gate in
+        // ggml-backend.cpp's split_graph substitution so both layers stay
+        // consistent — if split_graph won't substitute src[0]=pool, this
+        // graph mustn't route slot_ids as src[2] either.
+        static int min_useful_topk = -1;
+        if (min_useful_topk < 0) {
+            const char * e = getenv("MOE_CACHE_MIN_USEFUL_TOPK");
+            min_useful_topk = (e && *e) ? atoi(e) : 4;
+            if (min_useful_topk < 1) min_useful_topk = 1;
+        }
+        auto bind_and_gather = [&](ggml_tensor * w, ggml_moe_bucket b) -> ggml_tensor * {
+            if (!w) return selected_experts;
+            if (!ggml_moe_cache_bind_bucket(moe_cache, il, b, w, top_k, max_n_tokens)) {
+                return selected_experts;
+            }
+            ggml_tensor * pool = ggml_moe_cache_pool_tensor(moe_cache, il, b);
+            if (!pool || pool->ne[2] < (int64_t) min_useful_topk * top_k) {
+                return selected_experts;
+            }
+            ggml_tensor * map = ggml_moe_cache_mapping_tensor(moe_cache, il, b);
+            if (!map) return selected_experts;
+            ggml_tensor * sids = ggml_get_rows(ctx0, map, selected_experts);
+            return sids;
+        };
+        slot_ids_up      = bind_and_gather(up_exps,      GGML_MOE_BUCKET_UP);
+        slot_ids_gate    = bind_and_gather(gate_exps,    GGML_MOE_BUCKET_GATE);
+        slot_ids_down    = bind_and_gather(down_exps,    GGML_MOE_BUCKET_DOWN);
+        slot_ids_gate_up = bind_and_gather(gate_up_exps, GGML_MOE_BUCKET_GATE_UP);
+        if (slot_ids_up      != selected_experts) cb(slot_ids_up,      "ffn_moe_slot_ids_up",      il);
+        if (slot_ids_gate    != selected_experts) cb(slot_ids_gate,    "ffn_moe_slot_ids_gate",    il);
+        if (slot_ids_down    != selected_experts) cb(slot_ids_down,    "ffn_moe_slot_ids_down",    il);
+        if (slot_ids_gate_up != selected_experts) cb(slot_ids_gate_up, "ffn_moe_slot_ids_gate_up", il);
+    }
+
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented
         ggml_tensor * f_sel = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
@@ -1516,7 +1573,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts); // [n_ff*2, n_expert_used, n_tokens]
+        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, slot_ids_gate_up); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
 
         if (gate_up_exps_b) {
@@ -1540,7 +1597,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+        up = build_lora_mm_id(up_exps, cur, slot_ids_up); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_b) {
@@ -1558,7 +1615,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+            cur = build_lora_mm_id(gate_exps, cur, slot_ids_gate); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
@@ -1648,7 +1705,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, selected_experts); // [n_embd, n_expert_used, n_tokens]
+    experts = build_lora_mm_id(down_exps, cur, slot_ids_down); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
 
     if (down_exps_b) {

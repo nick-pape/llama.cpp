@@ -1650,16 +1650,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                     ggml_backend_synchronize(input_backend);
 
-                    // get the ids. If node->src[2] is one of our cache
-                    // ids tensors (i.e. patched in a previous call and
-                    // persisted via graph reuse), resolve back to the
-                    // ORIGINAL selected_experts so the D2H below reads
-                    // real expert ids, not stale slot ids.
+                    // get the ids. With Phase 1 (GPU-side gather),
+                    // node->src[2] is the ggml_get_rows(mapping, selected_experts)
+                    // output; the actual expert ids are src[2]->src[1]
+                    // (the argsort/topk result). Walk back so the D2H
+                    // below reads real expert ids, not slot ids.
+                    // Fallback to the legacy resolve for ops that didn't
+                    // get Phase 1 substitution (cache disabled per-bucket).
                     ggml_tensor * ids_tensor = node->src[2];
                     if (sched->moe_cache) {
-                        ggml_tensor * resolved = ggml_moe_cache_resolve_original_ids(
-                            (ggml_moe_cache_t) sched->moe_cache, ids_tensor);
-                        if (resolved) ids_tensor = resolved;
+                        if (ids_tensor->op == GGML_OP_GET_ROWS && ids_tensor->src[1]) {
+                            ids_tensor = ids_tensor->src[1];
+                        } else {
+                            ggml_tensor * resolved = ggml_moe_cache_resolve_original_ids(
+                                (ggml_moe_cache_t) sched->moe_cache, ids_tensor);
+                            if (resolved) ids_tensor = resolved;
+                        }
                     }
                     ggml_backend_t ids_backend = split_backend;
 
@@ -1800,11 +1806,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             moe_cache, split_backend, moe_layer_idx, moe_bucket, input);
                         if (scratch) {
                             node->src[0] = scratch;
-                            // Restore src[2] to the original ids tensor if
-                            // a prior call patched it to our cache.ids_tensor.
-                            ggml_tensor * orig = ggml_moe_cache_resolve_original_ids(
-                                moe_cache, node->src[2]);
-                            if (orig) node->src[2] = orig;
+                            // Restore src[2] to the original expert ids.
+                            // With Phase 1, src[2] is get_rows(mapping, ids)
+                            // — walk back to ids. With legacy patching,
+                            // resolve_original_ids returns the recorded
+                            // pre-patch tensor.
+                            if (node->src[2] && node->src[2]->op == GGML_OP_GET_ROWS && node->src[2]->src[1]) {
+                                node->src[2] = node->src[2]->src[1];
+                            } else {
+                                ggml_tensor * orig = ggml_moe_cache_resolve_original_ids(
+                                    moe_cache, node->src[2]);
+                                if (orig) node->src[2] = orig;
+                            }
 
                             // Standard contiguous-batch H2D into scratch.
                             int id = 0;
@@ -1939,34 +1952,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         prof.t_miss_h2d_us += std::chrono::duration<double, std::micro>(t_c - t_b).count();
                         prof.n_miss_batches += local_batches;
 
-                        // Build remapped slot_ids on host.
-                        const int top_k    = (int) op_top_k;
-                        const int n_tokens = (int) op_n_tokens;
-                        std::vector<int32_t> slot_ids((size_t) top_k * n_tokens);
-                        const size_t stride0 = ids_tensor->nb[0] / sizeof(int32_t);
-                        const size_t stride1 = ids_tensor->nb[1] / sizeof(int32_t);
-                        for (int t = 0; t < n_tokens; ++t) {
-                            for (int k = 0; k < top_k; ++k) {
-                                const int32_t eid = ids[t * stride1 + k * stride0];
-                                slot_ids[(size_t) t * top_k + k] = slot_of_expert[eid];
-                            }
-                        }
+                        // Phase 1: slot_ids are computed in the graph
+                        // by ggml_get_rows(mapping, selected_experts).
+                        // record_slot has already updated mapping_host
+                        // for every (evicted_expert -> 0, new_expert ->
+                        // slot) change; flush those dirty entries to
+                        // device via async 4-byte H2Ds on the compute
+                        // stream so the get_rows node reads up-to-date
+                        // mapping values. node->src[2] is left as the
+                        // get_rows output — no patching, no resolve_original.
                         auto t_d = clk::now();
-                        prof.t_slot_ids_build_us += std::chrono::duration<double, std::micro>(t_d - t_c).count();
-
-                        // H2D slot_ids onto the cache's ids tensor.
-                        ggml_moe_cache_set_ids(moe_cache, moe_layer_idx, moe_bucket,
-                            split_backend, slot_ids.data(), top_k, n_tokens);
+                        ggml_moe_cache_flush_mapping_to_device(
+                            moe_cache, moe_layer_idx, moe_bucket, split_backend);
                         auto t_e = clk::now();
                         prof.t_set_ids_us += std::chrono::duration<double, std::micro>(t_e - t_d).count();
-
-                        // Record the original src[2] BEFORE patching.
-                        ggml_moe_cache_record_original_ids(
-                            moe_cache, moe_layer_idx, moe_bucket, ids_tensor);
-                        node->src[2] = ggml_moe_cache_ids_tensor(
-                            moe_cache, moe_layer_idx, moe_bucket);
-                        auto t_f = clk::now();
-                        prof.t_record_patch_us += std::chrono::duration<double, std::micro>(t_f - t_e).count();
+                        prof.t_slot_ids_build_us = 0; // no host build in Phase 1
                         ++prof.n_ops;
                         if ((prof.n_ops % 5000) == 0) {
                             char tag[32];
