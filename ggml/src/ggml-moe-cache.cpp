@@ -60,6 +60,12 @@ struct ggml_moe_cache {
         int    top_k = 0;             // routing top-k; sizes slot_ids buffer
         int    max_n_tokens = 0;      // upper bound on n_tokens, sizes slot_ids buffer
 
+        // Host-resident expert weight tensor (the MoE op's src[0] before
+        // substitution). Phase 2's handle_layer_miss reads expert bytes
+        // from host_weight->data + expert_id * expert_size to H2D into
+        // slot pools. Set at bind time.
+        const ggml_tensor * host_weight = nullptr;
+
         // Slot pool: persistent device buffer + ggml_tensor wrapper.
         ggml_backend_buffer_t pool_buf    = nullptr;
         uint8_t *             pool_base   = nullptr;
@@ -115,6 +121,12 @@ struct ggml_moe_cache {
     };
     std::vector<cell> cells;
     uint64_t          tick = 0;  // monotonic, for LFRU LRU-tiebreak
+
+    // Phase 2: per-layer selected_experts (argsort/topk) tensor pointers,
+    // registered by build_moe_ffn. The compute_splits node-walk matches
+    // graph nodes against these to find miss-handling points. Indexed by
+    // layer; nullptr if not registered.
+    std::vector<ggml_tensor *> topk_by_layer;
 
     // Shared overflow scratch buffer. Allocated lazily on first overflow,
     // grown to fit the largest expert tensor seen. A real
@@ -217,6 +229,7 @@ ggml_moe_cache_t ggml_moe_cache_init(
     }
 
     c->cells.resize((size_t) n_layers * GGML_MOE_BUCKET_COUNT);
+    c->topk_by_layer.assign((size_t) n_layers, nullptr);
 
     const char * policy_name = "rr";
     switch (policy) {
@@ -436,6 +449,7 @@ bool ggml_moe_cache_bind_bucket(
     cell.last_tick.assign(cell.n_slots, 0);
     cell.tier.assign(cell.n_slots, 0);   // probationary
     cell.next_unused = 0;
+    cell.host_weight = weight;   // Phase 2: source for handle_layer_miss H2Ds
     cell.bound       = true;
     c->total_bytes  += pool_bytes + ids_bytes + mapping_bytes;
 
@@ -647,6 +661,67 @@ void ggml_moe_cache_flush_mapping_to_device(
         cell.mapping_in_dirty[expert_id] = 0;
     }
     cell.mapping_dirty_list.clear();
+}
+
+// -----------------------------------------------------------------------------
+// Phase 2: in-graph miss handling
+// -----------------------------------------------------------------------------
+
+void ggml_moe_cache_register_topk(
+        ggml_moe_cache_t c, int layer_idx, ggml_tensor * selected_experts) {
+    if (!c) return;
+    if (layer_idx < 0 || layer_idx >= c->n_layers) return;
+    c->topk_by_layer[layer_idx] = selected_experts;
+}
+
+int ggml_moe_cache_node_topk_layer(
+        ggml_moe_cache_t c, const ggml_tensor * node) {
+    if (!c || !node) return -1;
+    for (int l = 0; l < c->n_layers; ++l) {
+        if (c->topk_by_layer[l] == node) return l;
+    }
+    return -1;
+}
+
+void ggml_moe_cache_handle_layer_miss(
+        ggml_moe_cache_t c, int layer_idx, ggml_backend_t backend,
+        const int32_t * ids, int top_k, int n_tokens) {
+    if (!c || !backend || !ids) return;
+    if (layer_idx < 0 || layer_idx >= c->n_layers) return;
+    if (top_k <= 0 || n_tokens <= 0) return;
+
+    const size_t n_ids = (size_t) top_k * n_tokens;
+
+    for (int b = 0; b < GGML_MOE_BUCKET_COUNT; ++b) {
+        auto & cell = c->cells[cell_idx(layer_idx, (ggml_moe_bucket) b)];
+        if (!cell.bound || !cell.host_weight || !cell.pool_tensor) continue;
+
+        // Dedup the experts used by this op (current-pass ids).
+        std::vector<uint8_t> used((size_t) cell.n_experts, 0);
+        for (size_t i = 0; i < n_ids; ++i) {
+            const int32_t e = ids[i];
+            if (e >= 0 && e < cell.n_experts) used[e] = 1;
+        }
+
+        // Classify: hits update LRU state; misses evict + H2D + record.
+        const uint8_t * w_base = (const uint8_t *) cell.host_weight->data;
+        for (int32_t e = 0; e < (int32_t) cell.n_experts; ++e) {
+            if (!used[e]) continue;
+            int slot = ggml_moe_cache_lookup(c, layer_idx, (ggml_moe_bucket) b, e);
+            if (slot >= 0) continue;   // already resident
+            slot = ggml_moe_cache_select_slot_for_miss(c, layer_idx, (ggml_moe_bucket) b, e);
+            if (slot < 0) continue;
+            // H2D the expert's bytes from the host weight into its slot.
+            ggml_backend_tensor_set_async(backend, cell.pool_tensor,
+                w_base + (size_t) e * cell.expert_size,
+                (size_t) slot * cell.slot_stride,
+                cell.expert_size);
+            ggml_moe_cache_record_slot(c, layer_idx, (ggml_moe_bucket) b, slot, e);
+        }
+        // Push the (expert -> slot) updates to the device mapping tensor so
+        // the downstream get_rows for this layer reads current slot ids.
+        ggml_moe_cache_flush_mapping_to_device(c, layer_idx, (ggml_moe_bucket) b, backend);
+    }
 }
 
 // -----------------------------------------------------------------------------

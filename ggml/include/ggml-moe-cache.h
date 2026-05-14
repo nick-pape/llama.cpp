@@ -183,6 +183,51 @@ void ggml_moe_cache_flush_mapping_to_device(
     enum ggml_moe_bucket    bucket,
     ggml_backend_t          backend);
 
+// --- Phase 2: in-graph miss handling -------------------------------------
+//
+// Phase 1's get_rows reads mapping[selected_experts] with the CURRENT pass's
+// ids, but the compute_splits prep-time hook can only populate mapping from
+// the PREVIOUS pass's ids (argsort runs later, inside graph_compute). The
+// mismatch produces wrong slot_ids. Phase 2 fixes this: compute_splits walks
+// the split node-by-node and, right after each layer's selected_experts node
+// is computed + synced, calls handle_layer_miss with the CURRENT ids — so
+// mapping is correct before the downstream get_rows reads it.
+
+// Register a layer's selected_experts (argsort/topk) tensor so the
+// compute_splits node-walk can recognise it as a miss-handling point.
+// Called from build_moe_ffn once per layer per graph build; overwrites
+// the previous registration for that layer (graph reuse keeps pointers
+// stable, fresh builds re-register).
+void ggml_moe_cache_register_topk(
+    ggml_moe_cache_t        cache,
+    int                     layer_idx,
+    struct ggml_tensor *    selected_experts);
+
+// If `node` is a registered selected_experts tensor, return its layer
+// index; otherwise -1. O(n_layers) scan, called per graph node in the
+// compute_splits node-walk.
+int ggml_moe_cache_node_topk_layer(
+    ggml_moe_cache_t           cache,
+    const struct ggml_tensor * node);
+
+// Handle misses for ALL buckets of `layer_idx` using the current-pass
+// expert ids (D2H'd from the just-computed selected_experts node). For
+// each bucket: classify used experts, evict+H2D missing experts into
+// slot pool from the bound host weight, record slots, flush mapping to
+// device on `backend`'s stream. After this returns, every bound cell's
+// mapping_tensor is correct for `ids` and the downstream get_rows for
+// this layer will produce valid slot_ids.
+//
+// `ids` is top_k*n_tokens int32 values in [0, n_experts). `backend` is
+// the compute backend running the MoE ops (H2Ds + flush go on its stream).
+void ggml_moe_cache_handle_layer_miss(
+    ggml_moe_cache_t        cache,
+    int                     layer_idx,
+    ggml_backend_t          backend,
+    const int32_t *         ids,
+    int                     top_k,
+    int                     n_tokens);
+
 // Record the "original" ids tensor (e.g. selected_experts) for this
 // (layer, bucket) so that the scheduler can recover it after our
 // node->src[2] patch from a previous call has persisted via graph

@@ -1492,6 +1492,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             min_useful_topk = (e && *e) ? atoi(e) : 4;
             if (min_useful_topk < 1) min_useful_topk = 1;
         }
+        // Contiguous current-pass ids, created lazily by the first caching
+        // bucket and shared by all buckets of this layer. This is the node
+        // the Phase 2 compute_splits walk intercepts: it's contiguous
+        // [top_k, n_tokens] (unlike selected_experts, which is the
+        // non-contiguous argsort_top_k view), so the D2H there is simple.
+        ggml_tensor * ids_c = nullptr;
         auto bind_and_gather = [&](ggml_tensor * w, ggml_moe_bucket b) -> ggml_tensor * {
             if (!w) return selected_experts;
             if (!ggml_moe_cache_bind_bucket(moe_cache, il, b, w, top_k, max_n_tokens)) {
@@ -1504,19 +1510,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             ggml_tensor * map = ggml_moe_cache_mapping_tensor(moe_cache, il, b);
             if (!map) return selected_experts;
             // ggml_get_rows requires a->ne[2] == b->ne[1] (batched source).
-            // The repeat-to-broadcast pattern triggered a CUDA illegal
-            // memory access at decode time (likely a repeat-kernel +
-            // stride-0 edge case with the synthesized intermediate).
-            // Cleaner shape: reshape mapping to [1, n_experts, 1, 1] and
-            // flatten selected_experts to [top_k*n_tokens, 1, 1, 1]. Then
-            // a->ne[2..3] == b->ne[1..2] == 1, no broadcast needed.
+            // Cleaner shape: reshape mapping to [1, n_experts] and flatten
+            // ids to [top_k*n_tokens]. Then a->ne[2..3] == b->ne[1..2] == 1,
+            // no broadcast needed.
             const int64_t n_experts = map->ne[0];
             ggml_tensor * map_2d = ggml_reshape_2d(ctx0, map, 1, n_experts);
-            // selected_experts can be a non-contiguous view (e.g., when
-            // argsort_top_k wraps argsort with a slice); reshape_1d
-            // asserts contiguity. ggml_cont is a no-op if already
-            // contiguous and a cheap copy otherwise.
-            ggml_tensor * ids_c  = ggml_cont(ctx0, selected_experts);
+            // selected_experts is the non-contiguous argsort_top_k view;
+            // reshape_1d asserts contiguity. ggml_cont once per layer.
+            if (!ids_c) ids_c = ggml_cont(ctx0, selected_experts);
             ggml_tensor * ids_1d = ggml_reshape_1d(ctx0, ids_c, top_k * n_tokens);
             ggml_tensor * sids   = ggml_get_rows(ctx0, map_2d, ids_1d);
             // get_rows output is [1, top_k*n_tokens, 1, 1]; mul_mat_id needs
@@ -1532,6 +1533,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (slot_ids_gate    != selected_experts) cb(slot_ids_gate,    "ffn_moe_slot_ids_gate",    il);
         if (slot_ids_down    != selected_experts) cb(slot_ids_down,    "ffn_moe_slot_ids_down",    il);
         if (slot_ids_gate_up != selected_experts) cb(slot_ids_gate_up, "ffn_moe_slot_ids_gate_up", il);
+
+        // Phase 2: register this layer's contiguous ids tensor (ids_c) so
+        // the compute_splits node-walk recognises it as a miss-handling
+        // point and populates the mapping with CURRENT-pass ids before the
+        // get_rows above is computed. ids_c is non-null iff at least one
+        // bucket actually uses the cache.
+        if (ids_c) {
+            ggml_moe_cache_register_topk(moe_cache, il, ids_c);
+        }
     }
 
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {

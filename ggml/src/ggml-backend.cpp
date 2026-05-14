@@ -1608,6 +1608,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
+    std::vector<int32_t> moe_topk_host;  // Phase 2: D2H buffer for current-pass ids
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
@@ -1886,6 +1887,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
 
                     if (use_moe_cache && !moe_overflow && !moe_handled) {
+                        // Phase 2: prep-time (previous-pass-ids) miss handling
+                        // removed — the compute_splits node-walk below handles
+                        // misses with CURRENT-pass ids after argsort. The pool
+                        // is already substituted as src[0] by split_graph;
+                        // just mark the op handled so the fallback copy_experts
+                        // path is skipped.
+                        moe_handled = true;
+                    }
+                    if (false) {  // dead: superseded by the Phase 2 node-walk
                         moe_handled = true;
 
                         // PROFILING: aggregated timings across all MoE
@@ -2056,7 +2066,47 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        if (!sched->callback_eval) {
+        if (sched->moe_cache && !sched->callback_eval) {
+            // Phase 2 moe-cache node-walk: compute the split in chunks,
+            // breaking after each registered selected_experts (ids_c)
+            // node. At that break the current-pass expert ids are
+            // computed; D2H them and run handle_layer_miss so the
+            // mapping is correct before the downstream get_rows for
+            // this layer reads it. Splits with no topk node compute in
+            // a single chunk (same as the fast path).
+            ggml_moe_cache_t cache = (ggml_moe_cache_t) sched->moe_cache;
+            for (int j0 = 0; j0 < split->graph.n_nodes; ) {
+                int j1 = j0;
+                int topk_layer = ggml_moe_cache_node_topk_layer(cache, split->graph.nodes[j1]);
+                while (topk_layer < 0 && j1 < split->graph.n_nodes - 1) {
+                    ++j1;
+                    topk_layer = ggml_moe_cache_node_topk_layer(cache, split->graph.nodes[j1]);
+                }
+
+                struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1 + 1);
+                enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
+                if (ec != GGML_STATUS_SUCCESS) {
+                    return ec;
+                }
+
+                if (topk_layer >= 0) {
+                    // ids_c is contiguous [top_k, n_tokens] i32. Wait for
+                    // the compute, D2H it, handle misses for all buckets.
+                    ggml_backend_synchronize(split_backend);
+                    ggml_tensor * topk = split->graph.nodes[j1];
+                    const int top_k    = (int) topk->ne[0];
+                    const int n_tokens = (int) topk->ne[1];
+                    const size_t n_ids = (size_t) top_k * n_tokens;
+                    moe_topk_host.resize(n_ids);
+                    ggml_backend_tensor_get(topk, moe_topk_host.data(), 0,
+                                            n_ids * sizeof(int32_t));
+                    ggml_moe_cache_handle_layer_miss(cache, topk_layer, split_backend,
+                        moe_topk_host.data(), top_k, n_tokens);
+                }
+
+                j0 = j1 + 1;
+            }
+        } else if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
