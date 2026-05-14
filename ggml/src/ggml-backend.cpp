@@ -2082,6 +2082,27 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             // ids_c is recomputed fresh every pass, robust across graph
             // reserve / reuse / rebuild.
             ggml_moe_cache_t cache = (ggml_moe_cache_t) sched->moe_cache;
+            {
+                static int dbg_w = 0;
+                if (dbg_w < 24) {
+                    int n_cache = 0, first_idx = -1;
+                    long long first_ne1 = -1;
+                    for (int t = 0; t < split->graph.n_nodes; ++t) {
+                        int dl = -1; enum ggml_moe_bucket db = GGML_MOE_BUCKET_INVALID;
+                        if (ggml_moe_cache_node_cache_op(cache, split->graph.nodes[t], &dl, &db)) {
+                            if (first_idx < 0) {
+                                first_idx = t;
+                                ggml_tensor * s2 = split->graph.nodes[t]->src[2];
+                                first_ne1 = s2 ? (long long) s2->ne[1] : -1;
+                            }
+                            ++n_cache;
+                        }
+                    }
+                    fprintf(stderr, "DBG walkenter: n_nodes=%d n_cache_ops=%d first_idx=%d first_src2_ne1=%lld\n",
+                            split->graph.n_nodes, n_cache, first_idx, first_ne1);
+                    ++dbg_w;
+                }
+            }
             int j0 = 0;
             while (j0 < split->graph.n_nodes) {
                 // Scan for the next cache mul_mat_id at or after j0.

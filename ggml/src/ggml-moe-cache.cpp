@@ -807,8 +807,10 @@ void ggml_moe_cache_remap_ids_inplace(
     }
 
     {
-        static int dbg = 0;
-        if (dbg < 24) {
+        static int dbg_small = 0, dbg_big = 0;
+        const bool is_big = n_tokens > 4;
+        const bool show = is_big ? (dbg_big++ < 16) : (dbg_small++ < 6);
+        if (show) {
             int32_t min_s = 1<<30, max_s = -(1<<30), min_e = 1<<30, max_e = -(1<<30);
             for (size_t i = 0; i < n_ids; ++i) {
                 if (slot_ids[i] < min_s) min_s = slot_ids[i];
@@ -823,7 +825,6 @@ void ggml_moe_cache_remap_ids_inplace(
                     (long long) ids_tensor->ne[2], (long long) ids_tensor->ne[3],
                     top_k, n_tokens, (int) cell.n_experts,
                     (long long) cell.pool_tensor->ne[2], min_e, max_e, min_s, max_s);
-            ++dbg;
         }
     }
 
