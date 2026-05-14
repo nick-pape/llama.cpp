@@ -53,6 +53,13 @@ struct ggml_moe_cache {
     // One cell per (layer, bucket). Indexed [layer * GGML_MOE_BUCKET_COUNT + bucket].
     struct cell {
         bool   bound = false;
+        // True when n_slots >= n_experts AND we've pre-populated the pool
+        // with every expert at slot[i] = expert i AND overridden the
+        // model's weight tensor to point at the pool. After this, the
+        // scheduler treats the expert tensor as GPU-resident → no split
+        // boundary at this op → no per-op cache machinery → cache cell
+        // runs at pure-GPU speed for this (layer, bucket).
+        bool   fully_resident = false;
         size_t expert_size = 0;       // bytes per expert in this (layer, bucket)
         size_t slot_stride = 0;       // padded expert_size, multiple of 512 for MMQ safety
         int    n_slots = 0;           // min(slots_per_bucket, n_experts)
@@ -392,12 +399,60 @@ bool ggml_moe_cache_bind_bucket(
     cell.bound       = true;
     c->total_bytes  += pool_bytes + ids_bytes;
 
+    // Phase 2: full-cache hijack. When the pool can hold every expert
+    // (n_slots >= n_experts), pre-load all experts into the pool with
+    // identity mapping (slot[i] = expert i), then override the model's
+    // weight tensor to point at the pool. The scheduler will then see
+    // a GPU-resident input on subsequent split_graph calls → no split
+    // boundary for this op → no compute_splits cache machinery → this
+    // cell runs at pure-GPU speed.
+    if (cell.n_slots >= (int) cell.n_experts) {
+        // Pre-populate pool with all experts at their canonical slots.
+        // This is a one-time cost paid at bind time; for Qwen3.6 with
+        // 256 experts × ~600 KiB each × 40 layers × 3 buckets ≈ 18 GiB
+        // total H2D, done once. Subsequent forward passes pay zero
+        // per-op H2D for this cell.
+        const uint8_t * src_base = (const uint8_t *) weight->data;
+        // Mark hits for every expert; identity mapping.
+        for (int i = 0; i < (int) cell.n_experts; ++i) {
+            cell.slot_to_expert[i] = i;
+            cell.expert_to_slot[i] = i;
+        }
+        // Tensor wrapper to receive the H2D (must have a backend
+        // buffer for ggml_backend_tensor_set to work).
+        ggml_tensor preload = *cell.pool_tensor;
+        preload.ne[0] = weight->ne[0];
+        preload.ne[1] = weight->ne[1];
+        preload.ne[2] = cell.n_experts;
+        preload.nb[0] = weight->nb[0];
+        preload.nb[1] = weight->nb[1];
+        preload.nb[2] = cell.slot_stride;
+        preload.nb[3] = cell.slot_stride * cell.n_experts;
+        preload.data   = cell.pool_base;
+        preload.buffer = cell.pool_buf;
+        ggml_backend_tensor_set(&preload, src_base, 0,
+                                (size_t) cell.n_experts * cell.slot_stride);
+        // Hijack the model's expert weight tensor — overwrite its
+        // buffer + data so subsequent scheduler passes see this as
+        // GPU-resident. Cast away const: we own the model tensor's
+        // lifetime via the cache for as long as the cache lives.
+        struct ggml_tensor * model_weight = const_cast<struct ggml_tensor *>(weight);
+        model_weight->buffer = cell.pool_buf;
+        model_weight->data   = cell.pool_base;
+        cell.fully_resident = true;
+        moe_cache_log("cell HIJACKED (layer=%d, bucket=%d): preloaded %lld experts × %zu B = %.1f MiB, model tensor now GPU-resident",
+                      layer_idx, (int) bucket, (long long) cell.n_experts,
+                      cell.expert_size,
+                      (cell.n_experts * cell.slot_stride) / (1024.0 * 1024.0));
+    }
+
     static int n_bound = 0;
     if (n_bound < 8) {
-        moe_cache_log("cell bound (layer=%d, bucket=%d) expert_size=%zu slot_stride=%zu n_slots=%d top_k=%d max_n_tokens=%d pool=%.2f MiB ids=%zu B",
+        moe_cache_log("cell bound (layer=%d, bucket=%d) expert_size=%zu slot_stride=%zu n_slots=%d top_k=%d max_n_tokens=%d pool=%.2f MiB ids=%zu B%s",
                       layer_idx, (int) bucket, cell.expert_size, cell.slot_stride,
                       cell.n_slots, top_k, max_n_tokens,
-                      pool_bytes / (1024.0 * 1024.0), ids_bytes);
+                      pool_bytes / (1024.0 * 1024.0), ids_bytes,
+                      cell.fully_resident ? " [FULL/HIJACK]" : "");
         ++n_bound;
     }
 
