@@ -2082,27 +2082,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             // ids_c is recomputed fresh every pass, robust across graph
             // reserve / reuse / rebuild.
             ggml_moe_cache_t cache = (ggml_moe_cache_t) sched->moe_cache;
-            {
-                static int dbg_w = 0;
-                if (dbg_w < 24) {
-                    int n_cache = 0, first_idx = -1;
-                    long long first_ne1 = -1;
-                    for (int t = 0; t < split->graph.n_nodes; ++t) {
-                        int dl = -1; enum ggml_moe_bucket db = GGML_MOE_BUCKET_INVALID;
-                        if (ggml_moe_cache_node_cache_op(cache, split->graph.nodes[t], &dl, &db)) {
-                            if (first_idx < 0) {
-                                first_idx = t;
-                                ggml_tensor * s2 = split->graph.nodes[t]->src[2];
-                                first_ne1 = s2 ? (long long) s2->ne[1] : -1;
-                            }
-                            ++n_cache;
-                        }
-                    }
-                    fprintf(stderr, "DBG walkenter: n_nodes=%d n_cache_ops=%d first_idx=%d first_src2_ne1=%lld\n",
-                            split->graph.n_nodes, n_cache, first_idx, first_ne1);
-                    ++dbg_w;
-                }
-            }
             int j0 = 0;
             while (j0 < split->graph.n_nodes) {
                 // Scan for the next cache mul_mat_id at or after j0.
@@ -2142,33 +2121,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         break;
                     }
                     ++j2;
-                }
-                {
-                    static int dchk_s = 0, dchk_b = 0;
-                    ggml_tensor * s2 = split->graph.nodes[j1]->src[2];
-                    const bool is_big = s2 && s2->ne[1] > 100;
-                    const bool show = is_big ? (dchk_b++ < 12) : (dchk_s++ < 8);
-                    if (show && s2) {
-                        int32_t chk[4] = {0,0,0,0};
-                        ggml_backend_tensor_get(s2, chk, 0, sizeof(chk));
-                        // scan the WHOLE split for nodes touching s2's buffer
-                        char writers[256]; int wl = 0; writers[0] = 0;
-                        for (int t = 0; t < split->graph.n_nodes && wl < 230; ++t) {
-                            ggml_tensor * nt = split->graph.nodes[t];
-                            const bool hit = (nt->data == s2->data) ||
-                                (nt->src[1] && nt->src[1]->data == s2->data);
-                            if (hit) {
-                                wl += snprintf(writers + wl, sizeof(writers) - wl,
-                                               "%s%d:op%d%s", wl ? "," : "", t, (int) nt->op,
-                                               t >= j1 ? "(>=j1!)" : "");
-                            }
-                        }
-                        fprintf(stderr, "DBG chunk: j1=%d j2=%d L%d B%d nbig=%lld src2=%p name='%s' "
-                                "postremap_first4=%d,%d,%d,%d touch=[%s]\n",
-                                j1, j2, moe_layer, (int) moe_bucket,
-                                (long long) s2->ne[1], (void *) s2->data, s2->name,
-                                chk[0], chk[1], chk[2], chk[3], writers);
-                    }
                 }
                 // Compute [j1, j2): the remapped cache op j1 plus every
                 // node up to the next cache op — including that next op's

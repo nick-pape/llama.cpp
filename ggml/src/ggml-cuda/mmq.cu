@@ -178,27 +178,6 @@ void ggml_cuda_mul_mat_q(
         const int si1  = ids->nb[1] / ggml_element_size(ids);
         const int sis1 = nb12 / nb11;
 
-        {
-            static int dbg = 0;
-            if (dbg < 48) {
-                int32_t hids[256];
-                size_t nb_read = ggml_nbytes(ids);
-                if (nb_read > sizeof(hids)) nb_read = sizeof(hids);
-                cudaMemcpy(hids, ids->data, nb_read, cudaMemcpyDeviceToHost);
-                cudaDeviceSynchronize();
-                const int n_read = (int)(nb_read / sizeof(int32_t));
-                int32_t mn = 1<<30, mx = -(1<<30);
-                for (int i = 0; i < n_read; ++i) { if (hids[i] < mn) mn = hids[i]; if (hids[i] > mx) mx = hids[i]; }
-                fprintf(stderr, "DBG mmq: ids='%s' ne=[%lld,%lld] nb1=%zu si1=%d sis1=%d ne02=%lld ne12=%lld ne11=%lld neu=%lld src0='%s' s0ne2=%lld n_read=%d val[%d..%d] first8=%d,%d,%d,%d,%d,%d,%d,%d\n",
-                    ids->name, (long long)ids->ne[0], (long long)ids->ne[1], ids->nb[1], si1, sis1,
-                    (long long)ne02, (long long)ne12, (long long)ne11, (long long)n_expert_used,
-                    src0->name, (long long)src0->ne[2], n_read, mn, mx,
-                    n_read>0?hids[0]:-1, n_read>1?hids[1]:-1, n_read>2?hids[2]:-1, n_read>3?hids[3]:-1,
-                    n_read>4?hids[4]:-1, n_read>5?hids[5]:-1, n_read>6?hids[6]:-1, n_read>7?hids[7]:-1);
-                ++dbg;
-            }
-        }
-
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
             ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
         CUDA_CHECK(cudaGetLastError());

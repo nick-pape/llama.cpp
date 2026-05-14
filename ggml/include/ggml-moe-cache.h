@@ -215,28 +215,6 @@ int ggml_moe_cache_node_topk_layer(
     ggml_moe_cache_t           cache,
     const struct ggml_tensor * node);
 
-// Remap a cache mul_mat_id's src[2] ids tensor IN PLACE: D2H the live
-// current-pass expert ids from `ids_tensor`, classify used experts,
-// evict + H2D missing experts into the slot pool, then H2D the remapped
-// slot ids (mapping[expert_id]) back into the SAME `ids_tensor` buffer.
-//
-// `ids_tensor` is the per-bucket ids_c — ggml_cont(selected_experts),
-// contiguous int32 [top_k, n_tokens] — recomputed fresh by its ggml_cont
-// node every pass, so the in-place overwrite never persists across
-// passes. The MoE op then reads slot ids directly from src[2]; the
-// scheduler does NOT repoint src[2]. Robust across graph reserve/reuse/
-// rebuild with no persistent pointer state.
-//
-// `backend` is the compute backend running the MoE op (H2Ds go on its
-// stream; the expert-weight H2Ds are async, the slot-ids write-back is
-// synchronous so the host slot_ids buffer is safe to free on return).
-void ggml_moe_cache_remap_ids_inplace(
-    ggml_moe_cache_t        cache,
-    int                     layer_idx,
-    enum ggml_moe_bucket    bucket,
-    ggml_backend_t          backend,
-    struct ggml_tensor *    ids_tensor);
-
 // Per-op miss handling for ONE cache mul_mat_id `node`, with prefill-
 // overflow fallback. D2Hs the current-pass expert ids from node->src[2],
 // dedups the used experts, then:
