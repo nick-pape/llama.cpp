@@ -1492,34 +1492,22 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             min_useful_topk = (e && *e) ? atoi(e) : 4;
             if (min_useful_topk < 1) min_useful_topk = 1;
         }
-        // Contiguous current-pass ids, created lazily by the first caching
-        // bucket and shared by all buckets of this layer. This is the node
-        // the Phase 2 compute_splits walk intercepts: it's contiguous
-        // [top_k, n_tokens] (unlike selected_experts, which is the
-        // non-contiguous argsort_top_k view), so the D2H there is simple.
-        // It is force-expanded into the graph below even though nothing
-        // consumes it — it exists purely as the node-walk's per-layer
-        // miss-handling trigger point.
-        ggml_tensor * ids_c = nullptr;
-        // bind_and_gather: on a caching bucket, returns the cache's per-cell
-        // ids tensor (handle_layer_miss fills it via set_ids with CURRENT-
-        // pass slot_ids) AND rebinds `weight_io` to the cache's pool tensor.
-        // Using pool_tensor (GPU-resident, cache-owned buffer) as
-        // mul_mat_id's src[0] means there is no host-resident input at the
-        // MoE op — split_graph creates no split boundary there, so the
-        // per-op split overhead (~15%) is gone. On a non-caching bucket,
-        // `weight_io` is left as the host model weight and selected_experts
-        // is returned unchanged (baseline path).
+        // bind_and_gather: on a caching bucket, returns this bucket's own
+        // contiguous current-pass ids tensor AND rebinds `weight_io` to the
+        // cache's pool tensor. Using pool_tensor (GPU-resident, cache-owned
+        // buffer) as mul_mat_id's src[0] means there is no host-resident
+        // input at the MoE op — split_graph creates no split boundary
+        // there, so the per-op split overhead (~15%) is gone. On a
+        // non-caching bucket, `weight_io` is left as the host model weight
+        // and selected_experts is returned unchanged (baseline path).
         //
         // src[2] is set to ids_c — a contiguous ggml_cont of the current-
-        // pass selected_experts, with the correct live [top_k, n_tokens]
-        // shape. The compute_splits node-walk intercepts the mul_mat_id,
-        // reads top_k/n_tokens straight from this live src[2], runs
-        // handle_op_miss (which set_ids-reshapes the persistent per-cell
-        // ids tensor to exactly this op), then patches src[2] to that
-        // ids tensor. Reading everything from the live node is what makes
-        // it robust — the persistent ids tensor is never baked into the
-        // graph at build time (that desynced across reserve/reuse builds).
+        // pass selected_experts. The Phase 2 compute_splits node-walk D2Hs
+        // it, remaps expert-ids -> slot-ids, and H2Ds the slot-ids back
+        // into the same buffer in place. ids_c is recomputed fresh by its
+        // ggml_cont node every pass, so the in-place overwrite never
+        // persists across passes — no stale-tensor recovery is needed
+        // across graph reserve/reuse, and src[2] is never repointed.
         auto bind_and_gather = [&](ggml_tensor *& weight_io, ggml_moe_bucket b) -> ggml_tensor * {
             ggml_tensor * w = weight_io;
             if (!w) return selected_experts;
@@ -1530,12 +1518,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             if (!pool || pool->ne[2] < (int64_t) min_useful_topk * top_k) {
                 return selected_experts;
             }
-            // Contiguous current-pass ids, created once per layer, shared
-            // as src[2] by all of this layer's cache mul_mat_id ops.
+            // This bucket's OWN contiguous current-pass ids tensor.
             // selected_experts is the non-contiguous argsort_top_k view;
             // ggml_cont gives a contiguous [top_k, n_tokens] tensor the
-            // node-walk can D2H directly.
-            if (!ids_c) ids_c = ggml_cont(ctx0, selected_experts);
+            // node-walk D2Hs, remaps, and H2Ds slot-ids back into in
+            // place. Per-bucket (not shared) because each bucket's pool
+            // has its own expert->slot mapping.
+            ggml_tensor * ids_c = ggml_cont(ctx0, selected_experts);
+            cb(ids_c, "ffn_moe_slot_ids", il);
             weight_io = pool;   // route mul_mat_id through the GPU slot pool
             return ids_c;
         };
@@ -1543,7 +1533,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         slot_ids_gate    = bind_and_gather(gate_exps,    GGML_MOE_BUCKET_GATE);
         slot_ids_down    = bind_and_gather(down_exps,    GGML_MOE_BUCKET_DOWN);
         slot_ids_gate_up = bind_and_gather(gate_up_exps, GGML_MOE_BUCKET_GATE_UP);
-        if (ids_c) cb(ids_c, "ffn_moe_slot_ids", il);
     }
 
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {

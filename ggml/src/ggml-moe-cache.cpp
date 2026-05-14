@@ -750,6 +750,65 @@ void ggml_moe_cache_handle_op_miss(
                            slot_ids.data(), top_k, n_tokens);
 }
 
+void ggml_moe_cache_remap_ids_inplace(
+        ggml_moe_cache_t c, int layer_idx, ggml_moe_bucket bucket,
+        ggml_backend_t backend, ggml_tensor * ids_tensor) {
+    if (!c || !backend || !ids_tensor) return;
+    if (bucket < 0 || bucket >= GGML_MOE_BUCKET_COUNT) return;
+    if (layer_idx < 0 || layer_idx >= c->n_layers) return;
+
+    auto & cell = c->cells[cell_idx(layer_idx, bucket)];
+    if (!cell.bound || !cell.host_weight || !cell.pool_tensor) return;
+
+    const int top_k    = (int) ids_tensor->ne[0];
+    const int n_tokens = (int) ids_tensor->ne[1];
+    if (top_k <= 0 || n_tokens <= 0) return;
+    const size_t n_ids = (size_t) top_k * n_tokens;
+
+    // D2H the current-pass expert ids straight from the live ids_c tensor
+    // (ggml_cont of the argsort top-k, just computed in the prefix chunk).
+    std::vector<int32_t> ids(n_ids);
+    ggml_backend_tensor_get(ids_tensor, ids.data(), 0, n_ids * sizeof(int32_t));
+
+    // Dedup the experts used by this op.
+    std::vector<uint8_t> used((size_t) cell.n_experts, 0);
+    for (size_t i = 0; i < n_ids; ++i) {
+        const int32_t e = ids[i];
+        if (e >= 0 && e < cell.n_experts) used[e] = 1;
+    }
+
+    // Classify: hits update LRU state; misses evict + H2D + record. The
+    // expert-weight H2Ds are async (source is the persistent host model
+    // weight) on the compute backend's stream, ordered before the chunk
+    // compute that follows in the node-walk.
+    const uint8_t * w_base = (const uint8_t *) cell.host_weight->data;
+    for (int32_t e = 0; e < (int32_t) cell.n_experts; ++e) {
+        if (!used[e]) continue;
+        int slot = ggml_moe_cache_lookup(c, layer_idx, bucket, e);
+        if (slot >= 0) continue;   // already resident
+        slot = ggml_moe_cache_select_slot_for_miss(c, layer_idx, bucket, e);
+        if (slot < 0) continue;
+        ggml_backend_tensor_set_async(backend, cell.pool_tensor,
+            w_base + (size_t) e * cell.expert_size,
+            (size_t) slot * cell.slot_stride,
+            cell.expert_size);
+        ggml_moe_cache_record_slot(c, layer_idx, bucket, slot, e);
+    }
+
+    // Build slot_ids = mapping[expert_id] from the CURRENT-pass ids + the
+    // now-current mapping, and H2D them back into the SAME ids tensor in
+    // place. Synchronous H2D: the host slot_ids buffer is a local that
+    // must outlive the copy. ids_tensor is recomputed fresh by its
+    // ggml_cont node every pass, so this overwrite never persists.
+    std::vector<int32_t> slot_ids(n_ids);
+    for (size_t i = 0; i < n_ids; ++i) {
+        const int32_t e = ids[i];
+        slot_ids[i] = (e >= 0 && e < cell.n_experts) ? cell.mapping_host[e] : 0;
+    }
+    ggml_backend_tensor_set(ids_tensor, slot_ids.data(), 0,
+                            n_ids * sizeof(int32_t));
+}
+
 // -----------------------------------------------------------------------------
 // Per-op overflow scratch (small-cache prefill fallback)
 // -----------------------------------------------------------------------------
