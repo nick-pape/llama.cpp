@@ -1498,7 +1498,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // [top_k, n_tokens] (unlike selected_experts, which is the
         // non-contiguous argsort_top_k view), so the D2H there is simple.
         ggml_tensor * ids_c = nullptr;
-        auto bind_and_gather = [&](ggml_tensor * w, ggml_moe_bucket b) -> ggml_tensor * {
+        // bind_and_gather: on a caching bucket, returns the GPU-side slot_ids
+        // (get_rows output) AND rebinds `weight_io` to the cache's pool
+        // tensor. Using pool_tensor (GPU-resident, cache-owned buffer) as
+        // mul_mat_id's src[0] means there is no host-resident input at the
+        // MoE op — split_graph creates no split boundary there, so the
+        // per-op split overhead (~15%) is gone. On a non-caching bucket,
+        // `weight_io` is left as the host model weight and selected_experts
+        // is returned unchanged (baseline path).
+        auto bind_and_gather = [&](ggml_tensor *& weight_io, ggml_moe_bucket b) -> ggml_tensor * {
+            ggml_tensor * w = weight_io;
             if (!w) return selected_experts;
             if (!ggml_moe_cache_bind_bucket(moe_cache, il, b, w, top_k, max_n_tokens)) {
                 return selected_experts;
@@ -1523,6 +1532,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             // get_rows output is [1, top_k*n_tokens, 1, 1]; mul_mat_id needs
             // ids 2D [top_k, n_tokens]. Reshape (view-only).
             sids = ggml_reshape_2d(ctx0, sids, top_k, n_tokens);
+            weight_io = pool;   // route mul_mat_id through the GPU slot pool
             return sids;
         };
         slot_ids_up      = bind_and_gather(up_exps,      GGML_MOE_BUCKET_UP);
