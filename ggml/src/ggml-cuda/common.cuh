@@ -159,6 +159,9 @@ void ggml_cuda_error(const char * stmt, const char * func, const char * file, in
      do {                                                                           \
         auto err_ = (err);                                                          \
         if (err_ != (success)) {                                                    \
+            fprintf(stderr, "DBG CUDA_CHECK fail: err_=%d (%s) at %s:%d in %s\n",   \
+                    (int) err_, cudaGetErrorName(err_),                             \
+                    __FILE__, __LINE__, __func__);                                  \
             ggml_cuda_error(#err, __func__, __FILE__, __LINE__, error_fn(err_));    \
         }                                                                           \
     } while (0)
