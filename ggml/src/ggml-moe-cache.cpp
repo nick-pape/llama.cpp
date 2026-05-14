@@ -722,22 +722,35 @@ void ggml_moe_cache_handle_layer_miss(
         // the downstream get_rows for this layer reads current slot ids.
         ggml_moe_cache_flush_mapping_to_device(c, layer_idx, (ggml_moe_bucket) b, backend);
 
-        // DEBUG: verify every mapping entry for a used expert is in
-        // [0, n_slots). If this fires, mapping has out-of-range values
-        // and the get_rows downstream produces OOB slot_ids.
+        // DEBUG: after flush, D2H the device mapping tensor and compare
+        // to the host shadow. If they differ, the flush/device path is
+        // broken; if they match, get_rows reads the wrong tensor.
         {
-            int n_used = 0, bad = 0, max_map = -1;
+            int n_used = 0, host_max = -1;
             for (int32_t e = 0; e < (int32_t) cell.n_experts; ++e) {
                 if (!used[e]) continue;
                 ++n_used;
-                const int32_t m = cell.mapping_host[e];
-                if (m > max_map) max_map = m;
-                if (m < 0 || m >= cell.n_slots) ++bad;
+                if (cell.mapping_host[e] > host_max) host_max = cell.mapping_host[e];
             }
             static int dbg_n = 0;
-            if (bad > 0 || dbg_n < 6) {
-                fprintf(stderr, "DBG handle_layer_miss L%d B%d: n_used=%d n_slots=%d max_map=%d BAD=%d\n",
-                        layer_idx, b, n_used, cell.n_slots, max_map, bad);
+            if (dbg_n < 6) {
+                std::vector<int32_t> dev((size_t) cell.n_experts, -999);
+                ggml_backend_synchronize(backend);
+                ggml_backend_tensor_get(cell.mapping_tensor, dev.data(), 0,
+                                        (size_t) cell.n_experts * sizeof(int32_t));
+                int dev_max = -1, dev_min = 999999, mism = 0;
+                for (int32_t e = 0; e < (int32_t) cell.n_experts; ++e) {
+                    if (dev[e] > dev_max) dev_max = dev[e];
+                    if (dev[e] < dev_min) dev_min = dev[e];
+                    if (dev[e] != cell.mapping_host[e]) ++mism;
+                }
+                fprintf(stderr, "DBG handle_layer_miss L%d B%d: n_used=%d n_slots=%d "
+                        "host_max=%d | DEVICE min=%d max=%d mismatch_vs_host=%d "
+                        "map_tensor=%p data=%p\n",
+                        layer_idx, b, n_used, cell.n_slots, host_max,
+                        dev_min, dev_max, mism,
+                        (void *) cell.mapping_tensor,
+                        cell.mapping_tensor ? cell.mapping_tensor->data : nullptr);
                 ++dbg_n;
             }
         }
