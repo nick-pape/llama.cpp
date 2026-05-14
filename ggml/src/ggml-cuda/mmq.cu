@@ -180,10 +180,10 @@ void ggml_cuda_mul_mat_q(
             int32_t mn = INT32_MAX, mx = INT32_MIN;
             for (int32_t v : hids) { mn = v < mn ? v : mn; mx = v > mx ? v : mx; }
             fprintf(stderr,
-                "mmq.cu DBG3: src0=%s ne02=%lld | ids=%s ne=[%lld,%lld] nelem=%zu min=%d max=%d "
+                "mmq.cu DBG3: src0=%s ne02=%lld | ids=%s ne=[%lld,%lld] data=%p nelem=%zu min=%d max=%d "
                 "| sample=[%d %d %d %d %d %d %d %d]\n",
                 src0->name, (long long) ne02,
-                ids->name, (long long) ids->ne[0], (long long) ids->ne[1], hids.size(),
+                ids->name, (long long) ids->ne[0], (long long) ids->ne[1], ids->data, hids.size(),
                 mn, mx,
                 hids.size()>0?hids[0]:-1, hids.size()>1?hids[1]:-1, hids.size()>2?hids[2]:-1, hids.size()>3?hids[3]:-1,
                 hids.size()>4?hids[4]:-1, hids.size()>5?hids[5]:-1, hids.size()>6?hids[6]:-1, hids.size()>7?hids[7]:-1);

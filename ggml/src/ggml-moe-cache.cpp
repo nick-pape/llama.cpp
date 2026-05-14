@@ -729,12 +729,28 @@ void ggml_moe_cache_handle_layer_miss(
         // cache<256). set_ids writes a plain per-cell device buffer.
         {
             std::vector<int32_t> slot_ids(n_ids);
+            int smin = 999999, smax = -1;
             for (size_t i = 0; i < n_ids; ++i) {
                 const int32_t e = ids[i];
-                slot_ids[i] = (e >= 0 && e < cell.n_experts) ? cell.mapping_host[e] : 0;
+                const int32_t s = (e >= 0 && e < cell.n_experts) ? cell.mapping_host[e] : 0;
+                slot_ids[i] = s;
+                if (s < smin) smin = s;
+                if (s > smax) smax = s;
             }
             ggml_moe_cache_set_ids(c, layer_idx, (ggml_moe_bucket) b, backend,
                                    slot_ids.data(), top_k, n_tokens);
+            static int dbg_hlm = 0;
+            if (dbg_hlm < 9) {
+                ggml_tensor * idst = ggml_moe_cache_ids_tensor(c, layer_idx, (ggml_moe_bucket) b);
+                fprintf(stderr, "DBG hlm L%d B%d: n_ids=%zu top_k=%d n_tokens=%d "
+                        "slot_ids min=%d max=%d | idst=%p ne=[%lld,%lld] data=%p\n",
+                        layer_idx, b, n_ids, top_k, n_tokens, smin, smax,
+                        (void *) idst,
+                        idst ? (long long) idst->ne[0] : -1,
+                        idst ? (long long) idst->ne[1] : -1,
+                        idst ? idst->data : nullptr);
+                ++dbg_hlm;
+            }
         }
     }
 }
