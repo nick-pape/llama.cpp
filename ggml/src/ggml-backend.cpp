@@ -1667,10 +1667,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             if (cur->op == GGML_OP_GET_ROWS && cur->src[1]) {
                                 cur = cur->src[1];
                             } else if ((cur->op == GGML_OP_RESHAPE ||
-                                        cur->op == GGML_OP_VIEW ||
-                                        cur->op == GGML_OP_CONT ||
-                                        cur->op == GGML_OP_TRANSPOSE ||
-                                        cur->op == GGML_OP_PERMUTE) && cur->src[0]) {
+                                        cur->op == GGML_OP_CONT) && cur->src[0]) {
+                                // Walk RESHAPE + CONT (ops I inserted in
+                                // build_moe_ffn). Do NOT walk VIEW —
+                                // argsort_top_k builds selected_experts as
+                                // view_4d(argsort, k, ...), so unwrapping
+                                // VIEW exposes the full n_expert-sized sort
+                                // and the cache hook D2Hs the wrong slice.
                                 cur = cur->src[0];
                             } else {
                                 break;
