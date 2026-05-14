@@ -1512,7 +1512,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             // a->ne[2..3] == b->ne[1..2] == 1, no broadcast needed.
             const int64_t n_experts = map->ne[0];
             ggml_tensor * map_2d = ggml_reshape_2d(ctx0, map, 1, n_experts);
-            ggml_tensor * ids_1d = ggml_reshape_1d(ctx0, selected_experts, top_k * n_tokens);
+            // selected_experts can be a non-contiguous view (e.g., when
+            // argsort_top_k wraps argsort with a slice); reshape_1d
+            // asserts contiguity. ggml_cont is a no-op if already
+            // contiguous and a cheap copy otherwise.
+            ggml_tensor * ids_c  = ggml_cont(ctx0, selected_experts);
+            ggml_tensor * ids_1d = ggml_reshape_1d(ctx0, ids_c, top_k * n_tokens);
             ggml_tensor * sids   = ggml_get_rows(ctx0, map_2d, ids_1d);
             // get_rows output is [1, top_k*n_tokens, 1, 1]; mul_mat_id needs
             // ids 2D [top_k, n_tokens]. Reshape (view-only).
