@@ -2077,6 +2077,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             // then compute the op. Everything comes from the live node —
             // robust against graph reserve/reuse and ubatch-size changes.
             ggml_moe_cache_t cache = (ggml_moe_cache_t) sched->moe_cache;
+            // DEBUG: dump src[0] names of MUL_MAT_ID nodes + node_cache_op result.
+            {
+                static int dbg_mm = 0;
+                for (int k = 0; k < split->graph.n_nodes && dbg_mm < 12; ++k) {
+                    ggml_tensor * nd = split->graph.nodes[k];
+                    if (nd->op != GGML_OP_MUL_MAT_ID) continue;
+                    int dl = -1; enum ggml_moe_bucket db = GGML_MOE_BUCKET_INVALID;
+                    bool m = ggml_moe_cache_node_cache_op(cache, nd, &dl, &db);
+                    fprintf(stderr, "DBG mmid node[%d] '%s' src0='%s' src2='%s' match=%d (L%d B%d)\n",
+                            k, nd->name,
+                            nd->src[0] ? nd->src[0]->name : "(null)",
+                            nd->src[2] ? nd->src[2]->name : "(null)",
+                            (int) m, dl, (int) db);
+                    ++dbg_mm;
+                }
+            }
             for (int j0 = 0; j0 < split->graph.n_nodes; ) {
                 int j1 = j0;
                 int moe_layer = -1;
