@@ -1497,15 +1497,26 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // the Phase 2 compute_splits walk intercepts: it's contiguous
         // [top_k, n_tokens] (unlike selected_experts, which is the
         // non-contiguous argsort_top_k view), so the D2H there is simple.
+        // It is force-expanded into the graph below even though nothing
+        // consumes it — it exists purely as the node-walk's per-layer
+        // miss-handling trigger point.
         ggml_tensor * ids_c = nullptr;
-        // bind_and_gather: on a caching bucket, returns the GPU-side slot_ids
-        // (get_rows output) AND rebinds `weight_io` to the cache's pool
-        // tensor. Using pool_tensor (GPU-resident, cache-owned buffer) as
+        // bind_and_gather: on a caching bucket, returns the cache's per-cell
+        // ids tensor (handle_layer_miss fills it via set_ids with CURRENT-
+        // pass slot_ids) AND rebinds `weight_io` to the cache's pool tensor.
+        // Using pool_tensor (GPU-resident, cache-owned buffer) as
         // mul_mat_id's src[0] means there is no host-resident input at the
         // MoE op — split_graph creates no split boundary there, so the
         // per-op split overhead (~15%) is gone. On a non-caching bucket,
         // `weight_io` is left as the host model weight and selected_experts
         // is returned unchanged (baseline path).
+        //
+        // The earlier graph-side get_rows(mapping, selected_experts) was
+        // dropped: a reshape/view of the cache-context mapping tensor used
+        // as a get_rows source was not robustly handled by gallocr (worked
+        // at cache=256, garbage slot_ids at cache<256). The ids tensor is
+        // a plain per-cell device buffer used DIRECTLY as src[2] — the same
+        // way pool_tensor is used directly as src[0], which is robust.
         auto bind_and_gather = [&](ggml_tensor *& weight_io, ggml_moe_bucket b) -> ggml_tensor * {
             ggml_tensor * w = weight_io;
             if (!w) return selected_experts;
@@ -1516,24 +1527,21 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             if (!pool || pool->ne[2] < (int64_t) min_useful_topk * top_k) {
                 return selected_experts;
             }
-            ggml_tensor * map = ggml_moe_cache_mapping_tensor(moe_cache, il, b);
-            if (!map) return selected_experts;
-            // ggml_get_rows requires a->ne[2] == b->ne[1] (batched source).
-            // Cleaner shape: reshape mapping to [1, n_experts] and flatten
-            // ids to [top_k*n_tokens]. Then a->ne[2..3] == b->ne[1..2] == 1,
-            // no broadcast needed.
-            const int64_t n_experts = map->ne[0];
-            ggml_tensor * map_2d = ggml_reshape_2d(ctx0, map, 1, n_experts);
-            // selected_experts is the non-contiguous argsort_top_k view;
-            // reshape_1d asserts contiguity. ggml_cont once per layer.
-            if (!ids_c) ids_c = ggml_cont(ctx0, selected_experts);
-            ggml_tensor * ids_1d = ggml_reshape_1d(ctx0, ids_c, top_k * n_tokens);
-            ggml_tensor * sids   = ggml_get_rows(ctx0, map_2d, ids_1d);
-            // get_rows output is [1, top_k*n_tokens, 1, 1]; mul_mat_id needs
-            // ids 2D [top_k, n_tokens]. Reshape (view-only).
-            sids = ggml_reshape_2d(ctx0, sids, top_k, n_tokens);
+            ggml_tensor * idst = ggml_moe_cache_ids_tensor(moe_cache, il, b);
+            if (!idst) return selected_experts;
+            // idst is allocated [top_k, max_n_tokens]; mul_mat_id requires
+            // src[2]->ne[1] == src[1]->ne[2] == n_tokens. Set it here for
+            // graph build; set_ids re-sets it identically at compute time.
+            idst->ne[0] = top_k;
+            idst->ne[1] = n_tokens;
+            // Force a contiguous copy of the current-pass ids into the
+            // graph as the node-walk's per-layer trigger point.
+            if (!ids_c) {
+                ids_c = ggml_cont(ctx0, selected_experts);
+                ggml_build_forward_expand(gf, ids_c);
+            }
             weight_io = pool;   // route mul_mat_id through the GPU slot pool
-            return sids;
+            return idst;
         };
         slot_ids_up      = bind_and_gather(up_exps,      GGML_MOE_BUCKET_UP);
         slot_ids_gate    = bind_and_gather(gate_exps,    GGML_MOE_BUCKET_GATE);

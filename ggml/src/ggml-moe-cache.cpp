@@ -718,41 +718,23 @@ void ggml_moe_cache_handle_layer_miss(
                 cell.expert_size);
             ggml_moe_cache_record_slot(c, layer_idx, (ggml_moe_bucket) b, slot, e);
         }
-        // Push the (expert -> slot) updates to the device mapping tensor so
-        // the downstream get_rows for this layer reads current slot ids.
-        ggml_moe_cache_flush_mapping_to_device(c, layer_idx, (ggml_moe_bucket) b, backend);
-
-        // DEBUG: after flush, D2H the device mapping tensor and compare
-        // to the host shadow. If they differ, the flush/device path is
-        // broken; if they match, get_rows reads the wrong tensor.
+        // Build slot_ids from the CURRENT-pass ids + the now-current
+        // mapping and push them to this cell's ids tensor via set_ids.
+        // This is v2's proven host-built-slot_ids mechanism — but fed
+        // current-pass ids by the node-walk (it runs after argsort),
+        // not the stale prep-time ids. Replaces the fragile graph-side
+        // get_rows: a reshape/view of the cache-context mapping tensor
+        // used as a get_rows source was not robustly handled by
+        // gallocr (worked at cache=256, produced garbage slot_ids at
+        // cache<256). set_ids writes a plain per-cell device buffer.
         {
-            int n_used = 0, host_max = -1;
-            for (int32_t e = 0; e < (int32_t) cell.n_experts; ++e) {
-                if (!used[e]) continue;
-                ++n_used;
-                if (cell.mapping_host[e] > host_max) host_max = cell.mapping_host[e];
+            std::vector<int32_t> slot_ids(n_ids);
+            for (size_t i = 0; i < n_ids; ++i) {
+                const int32_t e = ids[i];
+                slot_ids[i] = (e >= 0 && e < cell.n_experts) ? cell.mapping_host[e] : 0;
             }
-            static int dbg_n = 0;
-            if (dbg_n < 6) {
-                std::vector<int32_t> dev((size_t) cell.n_experts, -999);
-                ggml_backend_synchronize(backend);
-                ggml_backend_tensor_get(cell.mapping_tensor, dev.data(), 0,
-                                        (size_t) cell.n_experts * sizeof(int32_t));
-                int dev_max = -1, dev_min = 999999, mism = 0;
-                for (int32_t e = 0; e < (int32_t) cell.n_experts; ++e) {
-                    if (dev[e] > dev_max) dev_max = dev[e];
-                    if (dev[e] < dev_min) dev_min = dev[e];
-                    if (dev[e] != cell.mapping_host[e]) ++mism;
-                }
-                fprintf(stderr, "DBG handle_layer_miss L%d B%d: n_used=%d n_slots=%d "
-                        "host_max=%d | DEVICE min=%d max=%d mismatch_vs_host=%d "
-                        "map_tensor=%p data=%p\n",
-                        layer_idx, b, n_used, cell.n_slots, host_max,
-                        dev_min, dev_max, mism,
-                        (void *) cell.mapping_tensor,
-                        cell.mapping_tensor ? cell.mapping_tensor->data : nullptr);
-                ++dbg_n;
-            }
+            ggml_moe_cache_set_ids(c, layer_idx, (ggml_moe_bucket) b, backend,
+                                   slot_ids.data(), top_k, n_tokens);
         }
     }
 }
