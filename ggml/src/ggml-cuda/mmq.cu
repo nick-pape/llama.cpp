@@ -167,22 +167,29 @@ void ggml_cuda_mul_mat_q(
 
     const int64_t n_expert_used = ids->ne[0];
     const int64_t ne_get_rows = ne12 * n_expert_used;
-    if (ne1 != n_expert_used) {
-        fprintf(stderr,
-            "mmq.cu DBG2: ne1=%lld n_expert_used=%lld\n"
-            "  dst  name=%s ne=[%lld,%lld,%lld,%lld]\n"
-            "  ids  name=%s op=%d ne=[%lld,%lld,%lld,%lld] src0=%s\n"
-            "  src0 name=%s ne=[%lld,%lld,%lld,%lld]\n"
-            "  src1 name=%s ne=[%lld,%lld,%lld,%lld]\n",
-            (long long) ne1, (long long) n_expert_used,
-            dst->name, (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2], (long long) dst->ne[3],
-            ids->name, (int) ids->op,
-            (long long) ids->ne[0], (long long) ids->ne[1], (long long) ids->ne[2], (long long) ids->ne[3],
-            (ids->src[0] ? ids->src[0]->name : "(null)"),
-            src0->name, (long long) src0->ne[0], (long long) src0->ne[1], (long long) src0->ne[2], (long long) src0->ne[3],
-            src1->name, (long long) src1->ne[0], (long long) src1->ne[1], (long long) src1->ne[2], (long long) src1->ne[3]);
-    }
     GGML_ASSERT(ne1 == n_expert_used);
+
+    // DEBUG: dump the ids the kernel actually sees, for the first few
+    // MoE mul_mat_q calls. D2H ids, report range + a sample, alongside
+    // src0->ne[2] (the slot-pool expert count = the valid id bound).
+    {
+        static int dbg_n = 0;
+        if (dbg_n < 9) {
+            std::vector<int32_t> hids(ggml_nelements(ids));
+            cudaMemcpy(hids.data(), ids->data, hids.size() * sizeof(int32_t), cudaMemcpyDeviceToHost);
+            int32_t mn = INT32_MAX, mx = INT32_MIN;
+            for (int32_t v : hids) { mn = v < mn ? v : mn; mx = v > mx ? v : mx; }
+            fprintf(stderr,
+                "mmq.cu DBG3: src0=%s ne02=%lld | ids=%s ne=[%lld,%lld] nelem=%zu min=%d max=%d "
+                "| sample=[%d %d %d %d %d %d %d %d]\n",
+                src0->name, (long long) ne02,
+                ids->name, (long long) ids->ne[0], (long long) ids->ne[1], hids.size(),
+                mn, mx,
+                hids.size()>0?hids[0]:-1, hids.size()>1?hids[1]:-1, hids.size()>2?hids[2]:-1, hids.size()>3?hids[3]:-1,
+                hids.size()>4?hids[4]:-1, hids.size()>5?hids[5]:-1, hids.size()>6?hids[6]:-1, hids.size()>7?hids[7]:-1);
+            ++dbg_n;
+        }
+    }
 
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
     ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
