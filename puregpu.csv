@@ -1,0 +1,1016 @@
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.8.0
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+==PROF== Connected to process 90 (/work/build/bin/llama-completion)
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 32133 MiB):
+  Device 0: NVIDIA Graphics Device, compute capability 12.0, VMM: yes, VRAM: 32133 MiB
+main: llama backend init
+main: load the model and apply lora adapter, if any
+common_init_result: fitting params to device memory, for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on
+common_params_fit_impl: getting device memory data for initial parameters:
+common_memory_breakdown_print: | memory breakdown [MiB]      | total    free     self   model   context   compute    unaccounted |
+common_memory_breakdown_print: |   - CUDA0 (Graphics Device) | 32133 = 31363 + (22294 = 20174 +     147 +    1972) +      -21525 |
+common_memory_breakdown_print: |   - Host                    |                    611 =   515 +       0 +      96                |
+common_params_fit_impl: projected to use 22294 MiB of device memory vs. 31363 MiB of free device memory
+common_params_fit_impl: will leave 9068 >= 1024 MiB of free device memory, no changes needed
+common_fit_params: successfully fit params to free device memory
+common_fit_params: fitting params to free memory took 0.55 seconds
+llama_model_loader: loaded meta data with 54 key-value pairs and 733 tensors from /cache/gguf/Qwen3.6-35B-A3B-MXFP4_MOE.gguf (version GGUF V3 (latest))
+llama_model_loader: Dumping metadata keys/values. Note: KV overrides do not apply in this output.
+llama_model_loader: - kv   0:                       general.architecture str              = qwen35moe
+llama_model_loader: - kv   1:                               general.type str              = model
+llama_model_loader: - kv   2:                     general.sampling.top_k i32              = 20
+llama_model_loader: - kv   3:                     general.sampling.top_p f32              = 0.950000
+llama_model_loader: - kv   4:                      general.sampling.temp f32              = 1.000000
+llama_model_loader: - kv   5:                               general.name str              = Qwen3.6-35B-A3B
+llama_model_loader: - kv   6:                           general.basename str              = Qwen3.6-35B-A3B
+llama_model_loader: - kv   7:                       general.quantized_by str              = Unsloth
+llama_model_loader: - kv   8:                         general.size_label str              = 35B-A3B
+llama_model_loader: - kv   9:                            general.license str              = apache-2.0
+llama_model_loader: - kv  10:                       general.license.link str              = https://huggingface.co/Qwen/Qwen3.6-3...
+llama_model_loader: - kv  11:                           general.repo_url str              = https://huggingface.co/unsloth
+llama_model_loader: - kv  12:                   general.base_model.count u32              = 1
+llama_model_loader: - kv  13:                  general.base_model.0.name str              = Qwen3.6 35B A3B
+llama_model_loader: - kv  14:          general.base_model.0.organization str              = Qwen
+llama_model_loader: - kv  15:              general.base_model.0.repo_url str              = https://huggingface.co/Qwen/Qwen3.6-3...
+llama_model_loader: - kv  16:                               general.tags arr[str,3]       = ["qwen3_5_moe", "qwen", "image-text-t...
+llama_model_loader: - kv  17:                      qwen35moe.block_count u32              = 40
+llama_model_loader: - kv  18:                   qwen35moe.context_length u32              = 262144
+llama_model_loader: - kv  19:                 qwen35moe.embedding_length u32              = 2048
+llama_model_loader: - kv  20:             qwen35moe.attention.head_count u32              = 16
+llama_model_loader: - kv  21:          qwen35moe.attention.head_count_kv u32              = 2
+llama_model_loader: - kv  22:          qwen35moe.rope.dimension_sections arr[i32,4]       = [11, 11, 10, 0]
+llama_model_loader: - kv  23:                   qwen35moe.rope.freq_base f32              = 10000000.000000
+llama_model_loader: - kv  24: qwen35moe.attention.layer_norm_rms_epsilon f32              = 0.000001
+llama_model_loader: - kv  25:                     qwen35moe.expert_count u32              = 256
+llama_model_loader: - kv  26:                qwen35moe.expert_used_count u32              = 8
+llama_model_loader: - kv  27:             qwen35moe.attention.key_length u32              = 256
+llama_model_loader: - kv  28:           qwen35moe.attention.value_length u32              = 256
+llama_model_loader: - kv  29:       qwen35moe.expert_feed_forward_length u32              = 512
+llama_model_loader: - kv  30: qwen35moe.expert_shared_feed_forward_length u32              = 512
+llama_model_loader: - kv  31:                  qwen35moe.ssm.conv_kernel u32              = 4
+llama_model_loader: - kv  32:                   qwen35moe.ssm.state_size u32              = 128
+llama_model_loader: - kv  33:                  qwen35moe.ssm.group_count u32              = 16
+llama_model_loader: - kv  34:               qwen35moe.ssm.time_step_rank u32              = 32
+llama_model_loader: - kv  35:                   qwen35moe.ssm.inner_size u32              = 4096
+llama_model_loader: - kv  36:          qwen35moe.full_attention_interval u32              = 4
+llama_model_loader: - kv  37:             qwen35moe.rope.dimension_count u32              = 64
+llama_model_loader: - kv  38:                       tokenizer.ggml.model str              = gpt2
+llama_model_loader: - kv  39:                         tokenizer.ggml.pre str              = qwen35
+llama_model_loader: - kv  40:                      tokenizer.ggml.tokens arr[str,248320]  = ["!", "\"", "#", "$", "%", "&", "'", ...
+llama_model_loader: - kv  41:                  tokenizer.ggml.token_type arr[i32,248320]  = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, ...
+llama_model_loader: - kv  42:                      tokenizer.ggml.merges arr[str,247587]  = ["Ġ Ġ", "ĠĠ ĠĠ", "i n", "Ġ t",...
+llama_model_loader: - kv  43:                tokenizer.ggml.eos_token_id u32              = 248046
+llama_model_loader: - kv  44:            tokenizer.ggml.padding_token_id u32              = 248055
+llama_model_loader: - kv  45:                tokenizer.ggml.bos_token_id u32              = 248044
+llama_model_loader: - kv  46:               tokenizer.ggml.add_bos_token bool             = false
+llama_model_loader: - kv  47:                    tokenizer.chat_template str              = {%- set image_count = namespace(value...
+llama_model_loader: - kv  48:               general.quantization_version u32              = 2
+llama_model_loader: - kv  49:                          general.file_type u32              = 38
+llama_model_loader: - kv  50:                      quantize.imatrix.file str              = Qwen3.6-35B-A3B-GGUF/imatrix_unsloth....
+llama_model_loader: - kv  51:                   quantize.imatrix.dataset str              = unsloth_calibration_Qwen3.6-35B-A3B.txt
+llama_model_loader: - kv  52:             quantize.imatrix.entries_count u32              = 510
+llama_model_loader: - kv  53:              quantize.imatrix.chunks_count u32              = 76
+llama_model_loader: - type  f32:  361 tensors
+llama_model_loader: - type q8_0:  252 tensors
+llama_model_loader: - type q5_K:   38 tensors
+llama_model_loader: - type q6_K:    4 tensors
+llama_model_loader: - type mxfp4:   78 tensors
+print_info: file format = GGUF V3 (latest)
+print_info: file type   = MXFP4 MoE
+print_info: file size   = 20.21 GiB (5.01 BPW) 
+llama_prepare_model_devices: using device CUDA0 (NVIDIA Graphics Device) (0000:2d:00.0) - 31427 MiB free
+load: 0 unused tokens
+load: printing all EOG tokens:
+load:   - 248044 ('<|endoftext|>')
+load:   - 248046 ('<|im_end|>')
+load:   - 248063 ('<|fim_pad|>')
+load:   - 248064 ('<|repo_name|>')
+load:   - 248065 ('<|file_sep|>')
+load: special tokens cache size = 33
+load: token to piece cache size = 1.7581 MB
+print_info: arch                  = qwen35moe
+print_info: vocab_only            = 0
+print_info: no_alloc              = 0
+print_info: n_ctx_train           = 262144
+print_info: n_embd                = 2048
+print_info: n_embd_inp            = 2048
+print_info: n_layer               = 40
+print_info: n_head                = 16
+print_info: n_head_kv             = 2
+print_info: n_rot                 = 64
+print_info: n_swa                 = 0
+print_info: is_swa_any            = 0
+print_info: n_embd_head_k         = 256
+print_info: n_embd_head_v         = 256
+print_info: n_gqa                 = 8
+print_info: n_embd_k_gqa          = 512
+print_info: n_embd_v_gqa          = 512
+print_info: f_norm_eps            = 0.0e+00
+print_info: f_norm_rms_eps        = 1.0e-06
+print_info: f_clamp_kqv           = 0.0e+00
+print_info: f_max_alibi_bias      = 0.0e+00
+print_info: f_logit_scale         = 0.0e+00
+print_info: f_attn_scale          = 0.0e+00
+print_info: f_attn_value_scale    = 0.0000
+print_info: n_ff                  = 0
+print_info: n_expert              = 256
+print_info: n_expert_used         = 8
+print_info: n_expert_groups       = 0
+print_info: n_group_used          = 0
+print_info: causal attn           = 1
+print_info: pooling type          = -1
+print_info: rope type             = 40
+print_info: rope scaling          = linear
+print_info: freq_base_train       = 10000000.0
+print_info: freq_scale_train      = 1
+print_info: n_ctx_orig_yarn       = 262144
+print_info: rope_yarn_log_mul     = 0.0000
+print_info: rope_finetuned        = unknown
+print_info: mrope sections        = [11, 11, 10, 0]
+print_info: ssm_d_conv            = 4
+print_info: ssm_d_inner           = 4096
+print_info: ssm_d_state           = 128
+print_info: ssm_dt_rank           = 32
+print_info: ssm_n_group           = 16
+print_info: ssm_dt_b_c_rms        = 0
+print_info: model type            = 35B.A3B
+print_info: model params          = 34.66 B
+print_info: general.name          = Qwen3.6-35B-A3B
+print_info: vocab type            = BPE
+print_info: n_vocab               = 248320
+print_info: n_merges              = 247587
+print_info: BOS token             = 248044 '<|endoftext|>'
+print_info: EOS token             = 248046 '<|im_end|>'
+print_info: EOT token             = 248046 '<|im_end|>'
+print_info: PAD token             = 248055 '<|vision_pad|>'
+print_info: LF token              = 198 'Ċ'
+print_info: FIM PRE token         = 248060 '<|fim_prefix|>'
+print_info: FIM SUF token         = 248062 '<|fim_suffix|>'
+print_info: FIM MID token         = 248061 '<|fim_middle|>'
+print_info: FIM PAD token         = 248063 '<|fim_pad|>'
+print_info: FIM REP token         = 248064 '<|repo_name|>'
+print_info: FIM SEP token         = 248065 '<|file_sep|>'
+print_info: EOG token             = 248044 '<|endoftext|>'
+print_info: EOG token             = 248046 '<|im_end|>'
+print_info: EOG token             = 248063 '<|fim_pad|>'
+print_info: EOG token             = 248064 '<|repo_name|>'
+print_info: EOG token             = 248065 '<|file_sep|>'
+print_info: max token length      = 256
+load_tensors: loading model tensors, this can take a while... (mmap = true, direct_io = false)
+load_tensors: offloading output layer to GPU
+load_tensors: offloading 39 repeating layers to GPU
+load_tensors: offloaded 41/41 layers to GPU
+load_tensors:   CPU_Mapped model buffer size =   515.31 MiB
+load_tensors:        CUDA0 model buffer size = 20174.80 MiB
+..................................................................................................
+common_init_result: added <|endoftext|> logit bias = -inf
+common_init_result: added <|im_end|> logit bias = -inf
+common_init_result: added <|fim_pad|> logit bias = -inf
+common_init_result: added <|repo_name|> logit bias = -inf
+common_init_result: added <|file_sep|> logit bias = -inf
+llama_context: constructing llama_context
+llama_context: n_seq_max     = 1
+llama_context: n_ctx         = 8192
+llama_context: n_ctx_seq     = 8192
+llama_context: n_batch       = 2048
+llama_context: n_ubatch      = 2048
+llama_context: causal_attn   = 1
+llama_context: flash_attn    = enabled
+llama_context: kv_unified    = false
+llama_context: freq_base     = 10000000.0
+llama_context: freq_scale    = 1
+llama_context: n_ctx_seq (8192) < n_ctx_train (262144) -- the full capacity of the model will not be utilized
+llama_context:  CUDA_Host  output buffer size =     0.95 MiB
+llama_kv_cache:      CUDA0 KV buffer size =    85.00 MiB
+llama_kv_cache: size =   85.00 MiB (  8192 cells,  10 layers,  1/1 seqs), K (q8_0):   42.50 MiB, V (q8_0):   42.50 MiB
+llama_kv_cache: attn_rot_k = 1, n_embd_head_k_all = 256
+llama_kv_cache: attn_rot_v = 1, n_embd_head_k_all = 256
+llama_memory_recurrent:      CUDA0 RS buffer size =    62.81 MiB
+llama_memory_recurrent: size =   62.81 MiB (     1 cells,  40 layers,  1 seqs), R (f32):    2.81 MiB, S (f32):   60.00 MiB
+sched_reserve: reserving ...
+sched_reserve: resolving fused Gated Delta Net support:
+sched_reserve: fused Gated Delta Net (autoregressive) enabled
+sched_reserve: fused Gated Delta Net (chunked) enabled
+sched_reserve:      CUDA0 compute buffer size =  1972.00 MiB
+sched_reserve:  CUDA_Host compute buffer size =    96.34 MiB
+sched_reserve: graph nodes  = 3849
+sched_reserve: graph splits = 2
+sched_reserve: reserve took 106.35 ms, sched copies = 1
+main: llama threadpool init, n_threads = 4
+main: chat template is available, enabling conversation mode (disable it with -no-cnv)
+*** User-specified prompt will pre-start conversation, did you mean to set --system-prompt (-sys) instead?
+main: chat template example:
+<|im_start|>system
+You are a helpful assistant<|im_end|>
+<|im_start|>user
+Hello<|im_end|>
+<|im_start|>assistant
+Hi there<|im_end|>
+<|im_start|>user
+How are you?<|im_end|>
+<|im_start|>assistant
+
+
+system_info: n_threads = 4 (n_threads_batch = 12) / 32 | CUDA : ARCHS = 1200 | USE_GRAPHS = 1 | PEER_MAX_BATCH_SIZE = 128 | BLACKWELL_NATIVE_FP4 = 1 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+
+main: interactive mode on.
+sampler seed: 782603738
+sampler params: 
+	repeat_last_n = 64, repeat_penalty = 1.000, frequency_penalty = 0.000, presence_penalty = 0.000
+	dry_multiplier = 0.000, dry_base = 1.750, dry_allowed_length = 2, dry_penalty_last_n = -1
+	top_k = 20, top_p = 0.950, min_p = 0.050, xtc_probability = 0.000, xtc_threshold = 0.100, typical_p = 1.000, top_n_sigma = -1.000, temp = 1.000
+	mirostat = 0, mirostat_lr = 0.100, mirostat_ent = 5.000, adaptive_target = -1.000, adaptive_decay = 0.900
+sampler chain: logits -> ?penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> min-p -> ?xtc -> ?temp-ext -> dist 
+generate: n_ctx = 8192, n_batch = 2048, n_predict = 20, n_keep = 0
+
+== Running in interactive mode. ==
+ - Press Ctrl+C to interject at any time.
+ - Press Return to return control to the AI.
+ - To return control without starting a new line, end your input with '/'.
+ - If you want to submit another line, end your input with '\'.
+ - Not using system message. To change it, set a different value via -sys PROMPT
+
+user
+Review the following C++ source code for a CUDA-accelerated MoE expert cache. Identify bugs, performance issues, and code quality problems. Suggest specific improvements with code examples where appropriate. Be thorough — examine the data structures, eviction policy, concurrency model, error handling, and API design. The code is below:
+
+// SPDX-License-Identifier: MIT
+// MoE per-expert GPU slot cache — Phase 1 implementation.
+// See ggml-moe-cache.h for the public API + design notes.
+//
+// Layout: each (layer, bucket) gets its own backing ggml_backend_buffer.
+// Required because models like Qwen3.6 MXFP4_MOE use mixed quantization
+// across layers (q5_K, q6_K, mxfp4 mixed), so expert_size_bytes varies
+// per layer. A single contiguous buffer with one size-per-bucket fails
+// bind for every layer after the first that has a different quant.
+// Trade-off: O(n_layers * n_buckets) buffer objects instead of 1 —
+// at 40*4 = 160 buffers on Qwen3.6 the overhead is negligible.
+
+#include "ggml-moe-cache.h"
+
+#include "ggml.h"
+#include "ggml-backend.h"
+
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+#include <cstdarg>
+
+// -----------------------------------------------------------------------------
+// Internal types
+// -----------------------------------------------------------------------------
+
+struct ggml_moe_cache {
+    ggml_backend_t backend     = nullptr;
+    size_t total_bytes         = 0;          // sum of all allocated cell buffers
+
+    int n_layers           = 0;
+    int slots_per_bucket   = 0;
+    size_t max_bytes_cap   = 0;
+    ggml_moe_cache_policy policy = GGML_MOE_CACHE_POLICY_LFRU;
+
+    // Per-(layer, bucket) cell. Indexed by [layer * GGML_MOE_BUCKET_COUNT + bucket].
+    // Allocated lazily on first bind for that cell.
+    //
+    // Eviction policy: LFRU (LFU with LRU tiebreak).
+    //
+    //   - Each slot keeps a `freq` counter (lookups that hit this slot) and
+    //     a `last_tick` (monotonically-increasing access stamp).
+    //   - On lookup hit: cell.freq[s]++; cell.last_tick[s] = ++c->lfru_tick
+    //   - On populate (record_slot): freq=1, last_tick = ++c->lfru_tick.
+    //     Newly-installed entries enter at the highest tick so they aren't
+    //     immediately evicted when several slots share freq=1.
+    //   - On miss-evict: scan for slot with smallest freq. If multiple slots
+    //     tie at the same freq (common during warmup), tiebreak by smallest
+    //     last_tick (i.e., LRU among the ties).
+    //
+    // Pure LFU without the LRU tiebreak is degenerate in practice: every
+    // newly-populated slot has freq=1, every fresh miss sees a cell full of
+    // freq=1 slots, and the tiebreaker decides everything. Vanilla LFU
+    // tiebreaks by slot index → effectively evicts the just-populated slot
+    // every time → hit rate collapses (measured 14% at cache=16 vs LRU's 48%).
+    // The LRU tiebreak rescues this without giving up LFU's long-tail
+    // protection of genuinely-frequently-used experts.
+    //
+    // O(slots) eviction (linear scan) is fine at slots <= 128 — a single
+    // cache-line walk. A bucket-indexed structure could give O(1) but would
+    // be more code and harder to validate; revisit if profiles flag this loop.
+    struct cell_state {
+        bool   bound              = false;
+        size_t expert_size_bytes  = 0;        // size of one expert weight in this cell
+        size_t slot_stride        = 0;        // padded expert size, slot-aligned
+        ggml_backend_buffer_t buf = nullptr;  // own backing buffer for this cell's slots
+        uint8_t * base            = nullptr;  // buf base pointer
+        std::vector<int32_t>  slot_map;       // [slots]: expert_id resident in each slot
+        std::vector<uint32_t> freq;           // [slots]: hit count since populate
+        std::vector<uint64_t> last_tick;      // [slots]: tick of last access (LRU tiebreak)
+        int next_unused = 0;                  // slots [0, next_unused) have been touched
+
+        // S3 telemetry + adaptive offload routing.
+        //   - n_lookups / n_hits          : lookup-level statistics for this cell
+        //   - n_dispatches                : how many MUL_MAT_ID ops touched this cell
+        //                                   (one per layer+bucket per token)
+        //   - n_dispatches_to_cpu         : of those, how many were routed to CPU
+        //                                   (the GPU offload was declined for cold cells)
+        //   - misses_in_dispatch_sum      : sum of miss_count across all dispatches;
+        //                                   avg-misses-per-op = .../n_dispatches
+        // These are 64-bit so they don't wrap during a long decode.
+        uint64_t n_lookups               = 0;
+        uint64_t n_hits                  = 0;
+        uint64_t n_dispatches            = 0;
+        uint64_t n_dispatches_to_cpu     = 0;
+        uint64_t misses_in_dispatch_sum  = 0;
+    };
+    std::vector<cell_state> cells;            // n_layers * GGML_MOE_BUCKET_COUNT
+    uint64_t lfru_tick = 0;                   // monotonic stamp for LRU tiebreak
+
+    // Diagnostic env-var flags
+    bool force_noop      = false;   // GGML_MOE_CACHE_FORCE_NOOP
+    bool force_skip_even = false;   // GGML_MOE_CACHE_FORCE_SKIP_EVEN
+
+    // Stats
+    ggml_moe_cache_stats stats{};
+};
+
+// -----------------------------------------------------------------------------
+// Logging helper
+// -----------------------------------------------------------------------------
+
+static void moe_cache_log(const char * fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    fprintf(stderr, "moe-cache: ");
+    vfprintf(stderr, fmt, args);
+    fprintf(stderr, "
+");
+    va_end(args);
+}
+
+// -----------------------------------------------------------------------------
+// Bucket / layer identification from tensor name
+// -----------------------------------------------------------------------------
+
+static ggml_moe_bucket bucket_from_name(const char * name) {
+    if (!name) return GGML_MOE_BUCKET_INVALID;
+    // Order matters: "gate_up_exps" matches before "gate_exps" or "up_exps".
+    if (strstr(name, "gate_up_exps")) return GGML_MOE_BUCKET_GATE_UP;
+    if (strstr(name, "down_exps"))    return GGML_MOE_BUCKET_DOWN;
+    if (strstr(name, "gate_exps"))    return GGML_MOE_BUCKET_GATE;
+    if (strstr(name, "up_exps"))      return GGML_MOE_BUCKET_UP;
+    return GGML_MOE_BUCKET_INVALID;
+}
+
+static int layer_from_name(const char * name) {
+    if (!name) return -1;
+    int layer = -1;
+    if (sscanf(name, "blk.%d.", &layer) == 1 && layer >= 0) {
+        return layer;
+    }
+    return -1;
+}
+
+static inline int cell_idx(int layer_idx, ggml_moe_bucket bucket) {
+    return layer_idx * GGML_MOE_BUCKET_COUNT + (int) bucket;
+}
+
+// -----------------------------------------------------------------------------
+// Lifecycle
+// -----------------------------------------------------------------------------
+
+ggml_moe_cache_t ggml_moe_cache_init(
+        ggml_backend_t backend,
+        int            n_layers,
+        int            slots_per_bucket,
+        size_t         max_bytes,
+        ggml_moe_cache_policy policy) {
+    if (!backend || n_layers <= 0 || slots_per_bucket <= 0) {
+        return nullptr;
+    }
+
+    auto * c = new ggml_moe_cache();
+    c->backend          = backend;
+    c->n_layers         = n_layers;
+    c->slots_per_bucket = slots_per_bucket;
+    c->max_bytes_cap    = max_bytes;
+    c->policy           = (policy == GGML_MOE_CACHE_POLICY_DEFAULT)
+                            ? GGML_MOE_CACHE_POLICY_LFRU : policy;
+
+    c->force_noop      = getenv("GGML_MOE_CACHE_FORCE_NOOP")      != nullptr;
+    c->force_skip_even = getenv("GGML_MOE_CACHE_FORCE_SKIP_EVEN") != nullptr;
+
+    // One cell per (layer, bucket). All per-slot vectors are sized here so
+    // the LFU counters are valid before the first bind_bucket call (the
+    // buffer itself stays unallocated until bind, but the bookkeeping is
+    // cheap and lets bind_bucket be branch-free w.r.t. counter init).
+    c->cells.resize((size_t) n_layers * GGML_MOE_BUCKET_COUNT);
+    for (auto & cell : c->cells) {
+        cell.slot_map.assign(slots_per_bucket, -1);
+        cell.freq.assign(slots_per_bucket, 0);
+        cell.last_tick.assign(slots_per_bucket, 0);
+    }
+
+    if (c->force_noop) {
+        moe_cache_log("GGML_MOE_CACHE_FORCE_NOOP set; cache will return miss on every lookup (diagnostic)");
+    }
+    if (c->force_skip_even) {
+        moe_cache_log("GGML_MOE_CACHE_FORCE_SKIP_EVEN set; faking hits on even expert_ids (output GARBAGE; diagnostic only)");
+    }
+
+    const char * policy_name =
+        c->policy == GGML_MOE_CACHE_POLICY_LRU  ? "LRU" :
+        c->policy == GGML_MOE_CACHE_POLICY_LFRU ? "LFRU" : "unknown";
+    moe_cache_log("init: %d layers x %d buckets, %d slots/bucket (%s eviction); buffers allocated lazily per (layer, bucket)",
+                  n_layers, (int) GGML_MOE_BUCKET_COUNT, slots_per_bucket, policy_name);
+
+    return c;
+}
+
+void ggml_moe_cache_free(ggml_moe_cache_t c) {
+    if (!c) return;
+
+    // Dump final stats so we can see whether the cache was actually being used.
+    if (c->stats.total_lookups > 0) {
+        const double hit_rate = (double) c->stats.total_hits / (double) c->stats.total_lookups;
+        int bound_cells = 0;
+        uint64_t total_dispatches      = 0;
+        uint64_t total_dispatches_cpu  = 0;
+        uint64_t total_misses_in_disp  = 0;
+        for (const auto & cell : c->cells) {
+            if (cell.bound) ++bound_cells;
+            total_dispatches      += cell.n_dispatches;
+            total_dispatches_cpu  += cell.n_dispatches_to_cpu;
+            total_misses_in_disp  += cell.misses_in_dispatch_sum;
+        }
+        moe_cache_log("final stats: %lld lookups, %lld hits, %lld misses (%.1f%% hit rate); %d / %d cells bound; %.2f MiB total",
+                      (long long) c->stats.total_lookups,
+                      (long long) c->stats.total_hits,
+                      (long long) c->stats.total_misses,
+                      hit_rate * 100.0,
+                      bound_cells, (int) c->cells.size(),
+                      c->total_bytes / (1024.0 * 1024.0));
+        if (total_dispatches > 0) {
+            const uint64_t gpu_dispatches = total_dispatches - total_dispatches_cpu;
+            const double cpu_pct = 100.0 * (double) total_dispatches_cpu / (double) total_dispatches;
+            const double avg_misses_when_gpu = gpu_dispatches > 0
+                ? (double) total_misses_in_disp / (double) gpu_dispatches
+                : 0.0;
+            moe_cache_log("dispatch breakdown: %lld total ops, %lld on CPU (%.1f%%), %lld on GPU (%.1f%%); avg misses-per-op when on GPU = %.2f",
+                          (long long) total_dispatches,
+                          (long long) total_dispatches_cpu, cpu_pct,
+                          (long long) gpu_dispatches, 100.0 - cpu_pct,
+                          avg_misses_when_gpu);
+        }
+    } else {
+        moe_cache_log("final stats: no lookups recorded — cache code path never executed");
+    }
+
+    for (auto & cell : c->cells) {
+        if (cell.buf) {
+            ggml_backend_buffer_free(cell.buf);
+            cell.buf = nullptr;
+        }
+    }
+    delete c;
+}
+
+// -----------------------------------------------------------------------------
+// Lazy per-cell buffer allocation
+// -----------------------------------------------------------------------------
+
+static bool ensure_cell_allocated(ggml_moe_cache * c, ggml_moe_cache::cell_state & cell, size_t expert_size_bytes) {
+    if (cell.bound) return true;
+
+    // Pad each slot to 512 alignment for MMQ kernel safety (matches the existing
+    // copy_experts padding in ggml-backend.cpp).
+    const size_t slot_stride = ((expert_size_bytes + 511) / 512) * 512 + 512;
+    const size_t total       = (size_t) c->slots_per_bucket * slot_stride;
+
+    if (c->max_bytes_cap > 0 && c->total_bytes + total > c->max_bytes_cap) {
+        moe_cache_log("cell alloc would push total to %zu bytes, exceeds cap of %zu",
+                      c->total_bytes + total, c->max_bytes_cap);
+        return false;
+    }
+
+    auto * buft = ggml_backend_get_default_buffer_type(c->backend);
+    cell.buf = ggml_backend_buft_alloc_buffer(buft, total);
+    if (!cell.buf) {
+        moe_cache_log("failed to allocate %zu bytes for cell on backend", total);
+        return false;
+    }
+    cell.base              = (uint8_t *) ggml_backend_buffer_get_base(cell.buf);
+    cell.expert_size_bytes = expert_size_bytes;
+    cell.slot_stride       = slot_stride;
+    cell.bound             = true;
+    c->total_bytes        += total;
+
+    return true;
+}
+
+bool ggml_moe_cache_bind_bucket(
+        ggml_moe_cache_t      c,
+        int                    layer_idx,
+        ggml_moe_bucket       bucket,
+        size_t                 expert_size_bytes,
+        int64_t                /*n_experts_total*/) {
+    if (!c || bucket < 0 || bucket >= GGML_MOE_BUCKET_COUNT) return false;
+    if (layer_idx < 0 || layer_idx >= c->n_layers)            return false;
+    if (expert_size_bytes == 0)                                return false;
+
+    auto & cell = c->cells[cell_idx(layer_idx, bucket)];
+    if (cell.bound) {
+        if (cell.expert_size_bytes != expert_size_bytes) {
+            // Same (layer, bucket) cell observed at two different sizes —
+            // shouldn't happen because tensor shape is fixed at load time.
+            moe_cache_log("cell (layer=%d, bucket=%d) expert size changed: bound=%zu, got=%zu",
+                          layer_idx, (int) bucket, cell.expert_size_bytes, expert_size_bytes);
+            return false;
+        }
+        return true;
+    }
+    bool ok = ensure_cell_allocated(c, cell, expert_size_bytes);
+    if (ok) {
+        // Diagnostic: log the first few cell binds so we can verify the path is hit.
+        static int n_bound = 0;
+        if (n_bound < 8) {
+            moe_cache_log("cell bound (layer=%d, bucket=%d, expert_size=%zu, slot_stride=%zu)",
+                          layer_idx, (int) bucket, cell.expert_size_bytes, cell.slot_stride);
+            ++n_bound;
+        }
+    }
+    return ok;
+}
+
+// -----------------------------------------------------------------------------
+// Tensor identification
+// -----------------------------------------------------------------------------
+
+bool ggml_moe_cache_identify_tensor(
+        ggml_moe_cache_t        c,
+        const struct ggml_tensor * input,
+        int                       n_layers,
+        int *                     out_layer_idx,
+        ggml_moe_bucket *        out_bucket) {
+    if (!c || !input || !out_layer_idx || !out_bucket) return false;
+    if (c->slots_per_bucket <= 0)                       return false;
+
+    const auto bucket = bucket_from_name(input->name);
+    if (bucket == GGML_MOE_BUCKET_INVALID) return false;
+
+    const int layer = layer_from_name(input->name);
+    if (layer < 0 || layer >= n_layers) return false;
+
+    *out_layer_idx = layer;
+    *out_bucket    = bucket;
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// Lookup + slot selection — SLRU policy (Phase 1.3).
+//
+// All operations are O(1) via the SLRU helpers above. The linear scan in
+// lookup() is O(slots) but is unavoidable without a per-cell hashmap; for
+// slots_per_bucket <= 128 (the practical range) it's a single cache-line
+// walk and faster than a hashmap probe.
+// -----------------------------------------------------------------------------
+
+int ggml_moe_cache_lookup(
+        ggml_moe_cache_t c, int layer_idx, ggml_moe_bucket bucket, int32_t expert_id) {
+    if (!c) return -1;
+    auto & cell = c->cells[cell_idx(layer_idx, bucket)];
+    if (!cell.bound) return -1;
+
+    c->stats.total_lookups++;
+
+    // Periodic hit-rate progress so we can see the cache warming up even if
+    // the process is killed before the destructor stats fire.
+    if ((c->stats.total_lookups % 10000) == 0) {
+        const double hit_rate = (double) c->stats.total_hits / (double) c->stats.total_lookups;
+        moe_cache_log("progress: %lld lookups, %.1f%% hit rate, %.1f MiB allocated",
+                      (long long) c->stats.total_lookups,
+                      hit_rate * 100.0,
+                      c->total_bytes / (1024.0 * 1024.0));
+    }
+
+    if (c->force_noop) {
+        c->stats.total_misses++;
+        return -1;
+    }
+    if (c->force_skip_even && (expert_id % 2 == 0)) {
+        c->stats.total_hits++;
+        return 0;
+    }
+
+    // Linear scan to locate the expert. With slots_per_bucket <= 128 this is
+    // ~1 cache line of data per scan and dwarfs any hashmap overhead.
+    cell.n_lookups++;
+    for (int s = 0; s < c->slots_per_bucket; s++) {
+        if (cell.slot_map[s] == expert_id) {
+            c->stats.total_hits++;
+            cell.n_hits++;                       // S3 telemetry
+            cell.freq[s]++;                      // LFRU: bump usage count
+            cell.last_tick[s] = ++c->lfru_tick;  // and recency stamp (LRU tiebreak)
+            return s;
+        }
+    }
+    c->stats.total_misses++;
+    return -1;
+}
+
+int ggml_moe_cache_select_slot_for_miss(
+        ggml_moe_cache_t c, int layer_idx, ggml_moe_bucket bucket, int32_t /*expert_id*/) {
+    if (!c) return -1;
+    auto & cell = c->cells[cell_idx(layer_idx, bucket)];
+    if (!cell.bound) return -1;
+
+    // Cold-start: take the next never-used slot.
+    if (cell.next_unused < c->slots_per_bucket) {
+        return cell.next_unused++;
+    }
+
+    // Eviction depends on the cache's configured policy.
+    int      victim_slot = 0;
+    uint64_t victim_tick = cell.last_tick[0];
+    uint32_t victim_freq = cell.freq[0];
+    if (c->policy == GGML_MOE_CACHE_POLICY_LRU) {
+        // LRU: evict slot with smallest last_tick.
+        for (int s = 1; s < c->slots_per_bucket; s++) {
+            if (cell.last_tick[s] < victim_tick) {
+                victim_tick = cell.last_tick[s];
+                victim_slot = s;
+            }
+        }
+    } else {
+        // LFRU: evict slot with smallest freq; tiebreak by smallest last_tick.
+        for (int s = 1; s < c->slots_per_bucket; s++) {
+            if (cell.freq[s] < victim_freq ||
+                (cell.freq[s] == victim_freq && cell.last_tick[s] < victim_tick)) {
+                victim_freq = cell.freq[s];
+                victim_tick = cell.last_tick[s];
+                victim_slot = s;
+            }
+        }
+    }
+    return victim_slot;
+}
+
+void ggml_moe_cache_record_slot(
+        ggml_moe_cache_t c, int layer_idx, ggml_moe_bucket bucket, int slot_idx, int32_t expert_id) {
+    if (!c) return;
+    if (slot_idx < 0 || slot_idx >= c->slots_per_bucket) return;
+    auto & cell = c->cells[cell_idx(layer_idx, bucket)];
+    cell.slot_map[slot_idx]  = expert_id;
+    cell.freq[slot_idx]      = 1;                    // counts the access that caused this populate
+    cell.last_tick[slot_idx] = ++c->lfru_tick;       // newest -> escapes immediate LRU eviction
+}
+
+// -----------------------------------------------------------------------------
+// S3 adaptive routing
+// -----------------------------------------------------------------------------
+
+bool ggml_moe_cache_should_offload_to_gpu(
+        ggml_moe_cache_t c, int layer_idx, ggml_moe_bucket bucket) {
+    if (!c) return true;  // no cache => normal scheduler behavior
+    if (bucket < 0 || bucket >= GGML_MOE_BUCKET_COUNT) return true;
+    if (layer_idx < 0 || layer_idx >= c->n_layers)     return true;
+
+    const auto & cell = c->cells[cell_idx(layer_idx, bucket)];
+
+    // Not yet bound: let GPU run so the cache code path allocates this cell's
+    // backing buffer on first touch. After that, normal warmup applies.
+    if (!cell.bound) return true;
+
+    // Warming up: slots are still being populated from never-touched. Force
+    // GPU so the cache fills. Once full, fall through to the hit-rate check.
+    if (cell.next_unused < c->slots_per_bucket) return true;
+
+    // Need enough recent data to make a decision. With 8 lookups per dispatch
+    // (top_k=8 routing), a few dispatches' worth of samples is plenty.
+    if (cell.n_lookups < 64) return true;  // default GPU early on
+
+    // Hit-rate threshold (env-tunable for experiments).
+    // Default 0.5: if at least half of expert lookups in this cell are hits,
+    // the cache D2D path beats the CPU path. Below that, CPU wins because it
+    // avoids the per-miss PCIe stall.
+    static const double threshold = []() {
+        const char * env = getenv("GGML_MOE_CACHE_GPU_HIT_THRESHOLD");
+        return env ? std::atof(env) : 0.5;
+    }();
+
+    const double hit_rate = (double) cell.n_hits / (double) cell.n_lookups;
+    return hit_rate >= threshold;
+}
+
+void ggml_moe_cache_record_dispatch(
+        ggml_moe_cache_t c, int layer_idx, ggml_moe_bucket bucket,
+        int miss_count, bool on_cpu) {
+    if (!c) return;
+    if (bucket < 0 || bucket >= GGML_MOE_BUCKET_COUNT) return;
+    if (layer_idx < 0 || layer_idx >= c->n_layers)     return;
+
+    auto & cell = c->cells[cell_idx(layer_idx, bucket)];
+    cell.n_dispatches++;
+    if (on_cpu) {
+        cell.n_dispatches_to_cpu++;
+        // miss_count is N/A for CPU dispatches (we never ran a lookup), so we
+        // don't accumulate it.
+    } else if (miss_count > 0) {
+        cell.misses_in_dispatch_sum += (uint64_t) miss_count;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Slot data pointer — layout is just (cell.base + slot * stride).
+// -----------------------------------------------------------------------------
+
+void * ggml_moe_cache_slot_data(
+        ggml_moe_cache_t c, int layer_idx, ggml_moe_bucket bucket, int slot_idx) {
+    if (!c) return nullptr;
+    auto & cell = c->cells[cell_idx(layer_idx, bucket)];
+    if (!cell.bound || !cell.base) return nullptr;
+    return cell.base + (size_t) slot_idx * cell.slot_stride;
+}
+
+// -----------------------------------------------------------------------------
+// D2D copy primitive — actual CUDA call lives in ggml-cuda.cu and is looked up
+// at runtime via the backend reg's proc address table. We can't link directly
+// against ggml_cuda_moe_cache_d2d_copy_async because ggml-base and ggml-cuda
+// are separate shared libraries: a strong reference would force ggml-base to
+// link against ggml-cuda (breaking non-CUDA builds) and even with both built
+// the cross-DSO strong symbol may not resolve. The reg proc address table is
+// the standard ggml mechanism for backend-specific entry points.
+// -----------------------------------------------------------------------------
+
+typedef bool (*moe_d2d_copy_fn_t)(ggml_backend_t, void *, const void *, size_t);
+typedef bool (*moe_wait_fn_t)(ggml_backend_t);
+
+// Generic one-shot resolver; templated on the symbol name. The function
+// pointer is cached after first lookup so we pay reg traversal cost once
+// per process. Returns nullptr if the symbol isn't exported by this backend.
+template <typename F>
+static F resolve_backend_fn(ggml_backend_t backend, const char * symbol_name, F & cache_slot, bool & looked_up_slot) {
+    if (looked_up_slot) return cache_slot;
+    auto * dev = ggml_backend_get_device(backend);
+    auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (reg) {
+        cache_slot = (F) ggml_backend_reg_get_proc_address(reg, symbol_name);
+    }
+    looked_up_slot = true;
+    return cache_slot;
+}
+
+bool ggml_moe_cache_copy_d2d_async(
+        ggml_backend_t backend, void * dst, const void * src, size_t size) {
+    static moe_d2d_copy_fn_t cached_fn = nullptr;
+    static bool              looked_up = false;
+    auto fn = resolve_backend_fn(backend, "ggml_cuda_moe_cache_d2d_copy_async",
+                                 cached_fn, looked_up);
+    if (!fn) {
+        // First-call warning only (looked_up_slot guards repeat).
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            moe_cache_log("backend reg does not expose ggml_cuda_moe_cache_d2d_copy_async — "
+                          "all copies will fall back to the existing H2D path (cache disabled effectively)");
+        }
+        return false;
+    }
+    return fn(backend, dst, src, size);
+}
+
+bool ggml_moe_cache_copy_async_on_copy_stream(
+        ggml_backend_t backend, void * dst, const void * src, size_t size) {
+    static moe_d2d_copy_fn_t cached_fn = nullptr;
+    static bool              looked_up = false;
+    auto fn = resolve_backend_fn(backend, "ggml_cuda_moe_cache_copy_async_on_copy_stream",
+                                 cached_fn, looked_up);
+    if (!fn) return false;
+    return fn(backend, dst, src, size);
+}
+
+bool ggml_moe_cache_compute_wait_for_copies(ggml_backend_t backend) {
+    static moe_wait_fn_t cached_fn = nullptr;
+    static bool          looked_up = false;
+    auto fn = resolve_backend_fn(backend, "ggml_cuda_moe_cache_compute_wait_for_copies",
+                                 cached_fn, looked_up);
+    if (!fn) return false;
+    return fn(backend);
+}
+
+bool ggml_moe_cache_copy_stream_wait_for_compute(ggml_backend_t backend) {
+    static moe_wait_fn_t cached_fn = nullptr;
+    static bool          looked_up = false;
+    auto fn = resolve_backend_fn(backend, "ggml_cuda_moe_cache_copy_stream_wait_for_compute",
+                                 cached_fn, looked_up);
+    if (!fn) return false;
+    return fn(backend);
+}
+
+int ggml_moe_cache_n_layers(ggml_moe_cache_t c) {
+    return c ? c->n_layers : 0;
+}
+
+// -----------------------------------------------------------------------------
+// Stats accessors
+// -----------------------------------------------------------------------------
+
+size_t ggml_moe_cache_total_bytes(ggml_moe_cache_t c) {
+    return c ? c->total_bytes : 0;
+}
+
+void ggml_moe_cache_get_stats(ggml_moe_cache_t c, ggml_moe_cache_stats * out) {
+    if (!c || !out) return;
+    *out = c->stats;
+}
+
+void ggml_moe_cache_reset_stats(ggml_moe_cache_t c) {
+    if (!c) return;
+    c->stats = {};
+}
+
+Provide your review with concrete code suggestions.
+assistant
+<think>
+
+</think>
+
+Here is a thorough review of the provided CUDA-accelerated MoE expert cache
+> EOF by user
+
+
+common_perf_print:    sampling time =       5.70 ms
+common_perf_print:    samplers time =       1.85 ms /  6834 tokens
+common_perf_print:        load time =  429480.85 ms
+common_perf_print: prompt eval time =  429467.09 ms /  6814 tokens (   63.03 ms per token,    15.87 tokens per second)
+common_perf_print:        eval time =     840.97 ms /    19 runs   (   44.26 ms per token,    22.59 tokens per second)
+common_perf_print:       total time =  430362.38 ms /  6833 tokens
+common_perf_print: unaccounted time =      48.63 ms /   0.0 %      (total - sampling - prompt eval - eval) / (total)
+common_perf_print:    graphs reused =         19
+common_memory_breakdown_print: | memory breakdown [MiB]      | total   free     self   model   context   compute    unaccounted |
+common_memory_breakdown_print: |   - CUDA0 (Graphics Device) | 32133 = 9137 + (22294 = 20174 +     147 +    1972) +         700 |
+common_memory_breakdown_print: |   - Host                    |                   611 =   515 +       0 +      96                |
+==PROF== Disconnected from process 90
+"ID","Process ID","Process Name","Host Name","Kernel Name","Context","Stream","Block Size","Grid Size","Device","CC","Section Name","Metric Name","Metric Unit","Metric Value"
+"0","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","dram__bytes.sum","byte","3358720"
+"0","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","gpu__time_duration.sum","ns","68512"
+"0","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","l1tex__t_sector_hit_rate.pct","%","54.62"
+"0","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","lts__t_sector_hit_rate.pct","%","87.27"
+"0","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","sm__cycles_active.avg.pct_of_peak_sustained_elapsed","%","88.18"
+"1","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","dram__bytes.sum","byte","5264384"
+"1","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","gpu__time_duration.sum","ns","23904"
+"1","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","l1tex__t_sector_hit_rate.pct","%","33.32"
+"1","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","lts__t_sector_hit_rate.pct","%","35.07"
+"1","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","sm__cycles_active.avg.pct_of_peak_sustained_elapsed","%","47.92"
+"2","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(1024, 1, 1)","0","12.0","Command line profiler metrics","dram__bytes.sum","byte","67027712"
+"2","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(1024, 1, 1)","0","12.0","Command line profiler metrics","gpu__time_duration.sum","ns","755456"
+"2","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(1024, 1, 1)","0","12.0","Command line profiler metrics","l1tex__t_sector_hit_rate.pct","%","50.60"
+"2","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(1024, 1, 1)","0","12.0","Command line profiler metrics","lts__t_sector_hit_rate.pct","%","94.35"
+"2","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(1024, 1, 1)","0","12.0","Command line profiler metrics","sm__cycles_active.avg.pct_of_peak_sustained_elapsed","%","95.73"
+"3","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","dram__bytes.sum","byte","29726720"
+"3","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","gpu__time_duration.sum","ns","370816"
+"3","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","l1tex__t_sector_hit_rate.pct","%","50.25"
+"3","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","lts__t_sector_hit_rate.pct","%","93.33"
+"3","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","sm__cycles_active.avg.pct_of_peak_sustained_elapsed","%","98.40"
+"4","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","dram__bytes.sum","byte","9195776"
+"4","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","gpu__time_duration.sum","ns","26400"
+"4","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","l1tex__t_sector_hit_rate.pct","%","33.33"
+"4","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","lts__t_sector_hit_rate.pct","%","34.19"
+"4","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","sm__cycles_active.avg.pct_of_peak_sustained_elapsed","%","78.94"
+"5","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","dram__bytes.sum","byte","19668480"
+"5","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","gpu__time_duration.sum","ns","357600"
+"5","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","l1tex__t_sector_hit_rate.pct","%","49.33"
+"5","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","lts__t_sector_hit_rate.pct","%","92.90"
+"5","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","sm__cycles_active.avg.pct_of_peak_sustained_elapsed","%","98.05"
+"6","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","dram__bytes.sum","byte","9982976"
+"6","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","gpu__time_duration.sum","ns","27232"
+"6","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","l1tex__t_sector_hit_rate.pct","%","33.33"
+"6","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","lts__t_sector_hit_rate.pct","%","34.12"
+"6","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","sm__cycles_active.avg.pct_of_peak_sustained_elapsed","%","84.73"
+"7","90","llama-completion","127.0.0.1","void mul_mat_q<39, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(16384, 1, 1)","0","12.0","Command line profiler metrics","dram__bytes.sum","byte","177700096"
+"7","90","llama-completion","127.0.0.1","void mul_mat_q<39, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(16384, 1, 1)","0","12.0","Command line profiler metrics","gpu__time_duration.sum","ns","845952"
+"7","90","llama-completion","127.0.0.1","void mul_mat_q<39, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(16384, 1, 1)","0","12.0","Command line profiler metrics","l1tex__t_sector_hit_rate.pct","%","87.97"
+"7","90","llama-completion","127.0.0.1","void mul_mat_q<39, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(16384, 1, 1)","0","12.0","Command line profiler metrics","lts__t_sector_hit_rate.pct","%","81.23"
+"7","90","llama-completion","127.0.0.1","void mul_mat_q<39, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(16384, 1, 1)","0","12.0","Command line profiler metrics","sm__cycles_active.avg.pct_of_peak_sustained_elapsed","%","92.79"
+"8","90","llama-completion","127.0.0.1","void mul_mat_q<39, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(16384, 1, 1)","0","12.0","Command line profiler metrics","dram__bytes.sum","byte","175751680"
+"8","90","llama-completion","127.0.0.1","void mul_mat_q<39, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(16384, 1, 1)","0","12.0","Command line profiler metrics","gpu__time_duration.sum","ns","845152"
+"8","90","llama-completion","127.0.0.1","void mul_mat_q<39, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(16384, 1, 1)","0","12.0","Command line profiler metrics","l1tex__t_sector_hit_rate.pct","%","87.98"
+"8","90","llama-completion","127.0.0.1","void mul_mat_q<39, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(16384, 1, 1)","0","12.0","Command line profiler metrics","lts__t_sector_hit_rate.pct","%","81.46"
+"8","90","llama-completion","127.0.0.1","void mul_mat_q<39, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(16384, 1, 1)","0","12.0","Command line profiler metrics","sm__cycles_active.avg.pct_of_peak_sustained_elapsed","%","92.85"
+"9","90","llama-completion","127.0.0.1","void mul_mat_q<13, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(65536, 1, 1)","0","12.0","Command line profiler metrics","dram__bytes.sum","byte","278900992"
+"9","90","llama-completion","127.0.0.1","void mul_mat_q<13, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(65536, 1, 1)","0","12.0","Command line profiler metrics","gpu__time_duration.sum","ns","1890240"
+"9","90","llama-completion","127.0.0.1","void mul_mat_q<13, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(65536, 1, 1)","0","12.0","Command line profiler metrics","l1tex__t_sector_hit_rate.pct","%","37.57"
+"9","90","llama-completion","127.0.0.1","void mul_mat_q<13, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(65536, 1, 1)","0","12.0","Command line profiler metrics","lts__t_sector_hit_rate.pct","%","71.85"
+"9","90","llama-completion","127.0.0.1","void mul_mat_q<13, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(65536, 1, 1)","0","12.0","Command line profiler metrics","sm__cycles_active.avg.pct_of_peak_sustained_elapsed","%","91.83"
+"10","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","dram__bytes.sum","byte","5942016"
+"10","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","gpu__time_duration.sum","ns","59040"
+"10","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","l1tex__t_sector_hit_rate.pct","%","50.49"
+"10","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","lts__t_sector_hit_rate.pct","%","83.17"
+"10","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","sm__cycles_active.avg.pct_of_peak_sustained_elapsed","%","86.20"
+"11","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","dram__bytes.sum","byte","8802816"
+"11","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","gpu__time_duration.sum","ns","27200"
+"11","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","l1tex__t_sector_hit_rate.pct","%","32.32"
+"11","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","lts__t_sector_hit_rate.pct","%","33.33"
+"11","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","sm__cycles_active.avg.pct_of_peak_sustained_elapsed","%","70.21"
+"12","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","dram__bytes.sum","byte","5937408"
+"12","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","gpu__time_duration.sum","ns","58976"
+"12","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","l1tex__t_sector_hit_rate.pct","%","50.44"
+"12","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","lts__t_sector_hit_rate.pct","%","83.12"
+"12","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","sm__cycles_active.avg.pct_of_peak_sustained_elapsed","%","86.16"
+"13","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","dram__bytes.sum","byte","8803072"
+"13","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","gpu__time_duration.sum","ns","26464"
+"13","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","l1tex__t_sector_hit_rate.pct","%","32.32"
+"13","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","lts__t_sector_hit_rate.pct","%","33.30"
+"13","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","sm__cycles_active.avg.pct_of_peak_sustained_elapsed","%","70.97"
+"14","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","dram__bytes.sum","byte","3330816"
+"14","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","gpu__time_duration.sum","ns","68544"
+"14","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","l1tex__t_sector_hit_rate.pct","%","54.50"
+"14","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","lts__t_sector_hit_rate.pct","%","87.26"
+"14","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","sm__cycles_active.avg.pct_of_peak_sustained_elapsed","%","88.40"
+"15","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","dram__bytes.sum","byte","5264128"
+"15","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","gpu__time_duration.sum","ns","23776"
+"15","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","l1tex__t_sector_hit_rate.pct","%","33.33"
+"15","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","lts__t_sector_hit_rate.pct","%","34.83"
+"15","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","sm__cycles_active.avg.pct_of_peak_sustained_elapsed","%","47.67"
+"16","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(1024, 1, 1)","0","12.0","Command line profiler metrics","dram__bytes.sum","byte","66997504"
+"16","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(1024, 1, 1)","0","12.0","Command line profiler metrics","gpu__time_duration.sum","ns","751616"
+"16","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(1024, 1, 1)","0","12.0","Command line profiler metrics","l1tex__t_sector_hit_rate.pct","%","50.61"
+"16","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(1024, 1, 1)","0","12.0","Command line profiler metrics","lts__t_sector_hit_rate.pct","%","93.86"
+"16","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(1024, 1, 1)","0","12.0","Command line profiler metrics","sm__cycles_active.avg.pct_of_peak_sustained_elapsed","%","95.72"
+"17","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","dram__bytes.sum","byte","5936896"
+"17","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","gpu__time_duration.sum","ns","59136"
+"17","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","l1tex__t_sector_hit_rate.pct","%","50.49"
+"17","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","lts__t_sector_hit_rate.pct","%","83.04"
+"17","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","sm__cycles_active.avg.pct_of_peak_sustained_elapsed","%","86.71"
+"18","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","dram__bytes.sum","byte","8803072"
+"18","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","gpu__time_duration.sum","ns","26848"
+"18","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","l1tex__t_sector_hit_rate.pct","%","32.32"
+"18","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","lts__t_sector_hit_rate.pct","%","33.31"
+"18","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","sm__cycles_active.avg.pct_of_peak_sustained_elapsed","%","70.15"
+"19","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","dram__bytes.sum","byte","5937152"
+"19","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","gpu__time_duration.sum","ns","58784"
+"19","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","l1tex__t_sector_hit_rate.pct","%","50.46"
+"19","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","lts__t_sector_hit_rate.pct","%","83.14"
+"19","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","sm__cycles_active.avg.pct_of_peak_sustained_elapsed","%","86.24"
+"20","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","dram__bytes.sum","byte","8803072"
+"20","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","gpu__time_duration.sum","ns","27040"
+"20","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","l1tex__t_sector_hit_rate.pct","%","32.32"
+"20","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","lts__t_sector_hit_rate.pct","%","33.26"
+"20","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","sm__cycles_active.avg.pct_of_peak_sustained_elapsed","%","70.03"
+"21","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","dram__bytes.sum","byte","19680000"
+"21","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","gpu__time_duration.sum","ns","358144"
+"21","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","l1tex__t_sector_hit_rate.pct","%","49.33"
+"21","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","lts__t_sector_hit_rate.pct","%","92.86"
+"21","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","sm__cycles_active.avg.pct_of_peak_sustained_elapsed","%","97.99"
+"22","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","dram__bytes.sum","byte","9984512"
+"22","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","gpu__time_duration.sum","ns","27168"
+"22","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","l1tex__t_sector_hit_rate.pct","%","33.33"
+"22","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","lts__t_sector_hit_rate.pct","%","34.06"
+"22","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","sm__cycles_active.avg.pct_of_peak_sustained_elapsed","%","85.00"
+"23","90","llama-completion","127.0.0.1","void mul_mat_q<39, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(16384, 1, 1)","0","12.0","Command line profiler metrics","dram__bytes.sum","byte","177834752"
+"23","90","llama-completion","127.0.0.1","void mul_mat_q<39, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(16384, 1, 1)","0","12.0","Command line profiler metrics","gpu__time_duration.sum","ns","845312"
+"23","90","llama-completion","127.0.0.1","void mul_mat_q<39, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(16384, 1, 1)","0","12.0","Command line profiler metrics","l1tex__t_sector_hit_rate.pct","%","87.99"
+"23","90","llama-completion","127.0.0.1","void mul_mat_q<39, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(16384, 1, 1)","0","12.0","Command line profiler metrics","lts__t_sector_hit_rate.pct","%","81.24"
+"23","90","llama-completion","127.0.0.1","void mul_mat_q<39, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(16384, 1, 1)","0","12.0","Command line profiler metrics","sm__cycles_active.avg.pct_of_peak_sustained_elapsed","%","93.00"
+"24","90","llama-completion","127.0.0.1","void mul_mat_q<39, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(16384, 1, 1)","0","12.0","Command line profiler metrics","dram__bytes.sum","byte","177315072"
+"24","90","llama-completion","127.0.0.1","void mul_mat_q<39, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(16384, 1, 1)","0","12.0","Command line profiler metrics","gpu__time_duration.sum","ns","841920"
+"24","90","llama-completion","127.0.0.1","void mul_mat_q<39, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(16384, 1, 1)","0","12.0","Command line profiler metrics","l1tex__t_sector_hit_rate.pct","%","87.98"
+"24","90","llama-completion","127.0.0.1","void mul_mat_q<39, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(16384, 1, 1)","0","12.0","Command line profiler metrics","lts__t_sector_hit_rate.pct","%","81.28"
+"24","90","llama-completion","127.0.0.1","void mul_mat_q<39, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(16384, 1, 1)","0","12.0","Command line profiler metrics","sm__cycles_active.avg.pct_of_peak_sustained_elapsed","%","92.95"
+"25","90","llama-completion","127.0.0.1","void mul_mat_q<13, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(65536, 1, 1)","0","12.0","Command line profiler metrics","dram__bytes.sum","byte","279124736"
+"25","90","llama-completion","127.0.0.1","void mul_mat_q<13, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(65536, 1, 1)","0","12.0","Command line profiler metrics","gpu__time_duration.sum","ns","1888416"
+"25","90","llama-completion","127.0.0.1","void mul_mat_q<13, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(65536, 1, 1)","0","12.0","Command line profiler metrics","l1tex__t_sector_hit_rate.pct","%","37.01"
+"25","90","llama-completion","127.0.0.1","void mul_mat_q<13, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(65536, 1, 1)","0","12.0","Command line profiler metrics","lts__t_sector_hit_rate.pct","%","71.84"
+"25","90","llama-completion","127.0.0.1","void mul_mat_q<13, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(65536, 1, 1)","0","12.0","Command line profiler metrics","sm__cycles_active.avg.pct_of_peak_sustained_elapsed","%","91.87"
+"26","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","dram__bytes.sum","byte","5937152"
+"26","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","gpu__time_duration.sum","ns","58912"
+"26","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","l1tex__t_sector_hit_rate.pct","%","50.51"
+"26","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","lts__t_sector_hit_rate.pct","%","83.13"
+"26","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","sm__cycles_active.avg.pct_of_peak_sustained_elapsed","%","86.53"
+"27","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","dram__bytes.sum","byte","8803328"
+"27","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","gpu__time_duration.sum","ns","26624"
+"27","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","l1tex__t_sector_hit_rate.pct","%","32.32"
+"27","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","lts__t_sector_hit_rate.pct","%","33.32"
+"27","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","sm__cycles_active.avg.pct_of_peak_sustained_elapsed","%","70.85"
+"28","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","dram__bytes.sum","byte","5937408"
+"28","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","gpu__time_duration.sum","ns","58624"
+"28","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","l1tex__t_sector_hit_rate.pct","%","50.52"
+"28","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","lts__t_sector_hit_rate.pct","%","83.08"
+"28","90","llama-completion","127.0.0.1","void mul_mat_q<8, 128, 0>(const char *, const int *, const int *, const int *, float *, float *, uint3, int, int, int, int, int, uint3, uint3, int, int, int, uint3, uint3, int, int, int, uint3)","1","15","(32, 8, 1)","(82, 1, 1)","0","12.0","Command line profiler metrics","sm__cycles_active.avg.pct_of_peak_sustained_elapsed","%","86.80"
+"29","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","dram__bytes.sum","byte","8803072"
+"29","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","gpu__time_duration.sum","ns","27008"
+"29","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","l1tex__t_sector_hit_rate.pct","%","32.32"
+"29","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","lts__t_sector_hit_rate.pct","%","33.27"
+"29","90","llama-completion","127.0.0.1","void mul_mat_q_stream_k_fixup<8, 128, 0>(const int *, const int *, float *, float *, uint3, int, int, int, uint3, int, uint3, int, uint3)","1","15","(32, 4, 1)","(82, 4, 1)","0","12.0","Command line profiler metrics","sm__cycles_active.avg.pct_of_peak_sustained_elapsed","%","69.86"

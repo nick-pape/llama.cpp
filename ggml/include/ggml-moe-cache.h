@@ -203,6 +203,35 @@ void ggml_moe_cache_release_overflow_scratches(
     ggml_moe_cache_t        cache,
     ggml_backend_t          backend);
 
+// Phase 2 hijack: if cell (layer, bucket) is fully resident (every
+// expert has been H2D'd into its identity-mapped slot), override the
+// given model weight tensor's buffer + data to point at the cache
+// pool. After this, the scheduler treats the model's expert weight
+// as GPU-resident — subsequent split_graph calls skip creating a
+// split boundary for this op, and the cache machinery never runs
+// again for this cell. Returns true on first successful hijack,
+// false if not yet ready or already hijacked.
+bool ggml_moe_cache_try_hijack_model_tensor(
+    ggml_moe_cache_t        cache,
+    int                     layer_idx,
+    enum ggml_moe_bucket    bucket,
+    struct ggml_tensor *    model_weight);
+
+// Phase 2 eager preload: H2D all `n_experts` experts from
+// model_weight->data into the cache pool with identity mapping
+// (expert E -> slot E), updating slot_to_expert / expert_to_slot
+// accordingly. Per-expert calls (avoids the single-large-H2D issue
+// that fails at sched_reserve time). Caller is expected to invoke
+// this on first compute_splits encounter for cells in preload_pending
+// state, before the cache hit/miss classify pass runs. Returns true
+// on success.
+bool ggml_moe_cache_force_full_preload(
+    ggml_moe_cache_t        cache,
+    int                     layer_idx,
+    enum ggml_moe_bucket    bucket,
+    const struct ggml_tensor * model_weight,
+    ggml_backend_t          backend);
+
 // Number of layers the cache was sized for.
 int ggml_moe_cache_n_layers(ggml_moe_cache_t cache);
 

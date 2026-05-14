@@ -1761,6 +1761,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
                     }
 
+                    // Phase 2 force-preload: when n_slots >= n_experts,
+                    // populate the pool eagerly on first encounter and
+                    // hijack the model tensor immediately. After this,
+                    // the very next compute_splits (next token) skips
+                    // the split boundary for this op.
+                    if (use_moe_cache && moe_cache) {
+                        if (ggml_moe_cache_force_full_preload(
+                                moe_cache, moe_layer_idx, moe_bucket,
+                                input, split_backend)) {
+                            ggml_moe_cache_try_hijack_model_tensor(
+                                moe_cache, moe_layer_idx, moe_bucket, input);
+                        }
+                    }
+
                     // Detect prefill overflow: if this op uses more unique
                     // experts than the pool has slots, route through a
                     // per-op cudaMallocAsync scratch buffer (full-size,
@@ -1973,6 +1987,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             snprintf(tag, sizeof(tag), "@%lld", (long long) prof.n_ops);
                             prof.dump(tag);
                         }
+                        // Phase 2: after the cache machinery has populated
+                        // this op's experts, if the cell is fully resident
+                        // (all experts at identity slots), hijack the
+                        // model weight tensor so subsequent passes skip
+                        // the split boundary entirely.
+                        ggml_moe_cache_try_hijack_model_tensor(
+                            moe_cache, moe_layer_idx, moe_bucket, input);
                     }
 
                     if (!moe_handled) {

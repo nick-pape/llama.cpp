@@ -60,6 +60,11 @@ struct ggml_moe_cache {
         // boundary at this op → no per-op cache machinery → cache cell
         // runs at pure-GPU speed for this (layer, bucket).
         bool   fully_resident = false;
+        // Set in bind_bucket when n_slots >= n_experts. compute_splits
+        // performs the preload H2D + tensor hijack on its first
+        // invocation for this cell (deferred from bind time because
+        // sched_reserve's mmap'd memory isn't reliably CUDA-addressable).
+        bool   preload_pending = false;
         size_t expert_size = 0;       // bytes per expert in this (layer, bucket)
         size_t slot_stride = 0;       // padded expert_size, multiple of 512 for MMQ safety
         int    n_slots = 0;           // min(slots_per_bucket, n_experts)
@@ -399,52 +404,15 @@ bool ggml_moe_cache_bind_bucket(
     cell.bound       = true;
     c->total_bytes  += pool_bytes + ids_bytes;
 
-    // Phase 2: full-cache hijack. When the pool can hold every expert
-    // (n_slots >= n_experts), pre-load all experts into the pool with
-    // identity mapping (slot[i] = expert i), then override the model's
-    // weight tensor to point at the pool. The scheduler will then see
-    // a GPU-resident input on subsequent split_graph calls → no split
-    // boundary for this op → no compute_splits cache machinery → this
-    // cell runs at pure-GPU speed.
-    if (cell.n_slots >= (int) cell.n_experts) {
-        // Pre-populate pool with all experts at their canonical slots.
-        // This is a one-time cost paid at bind time; for Qwen3.6 with
-        // 256 experts × ~600 KiB each × 40 layers × 3 buckets ≈ 18 GiB
-        // total H2D, done once. Subsequent forward passes pay zero
-        // per-op H2D for this cell.
-        const uint8_t * src_base = (const uint8_t *) weight->data;
-        // Mark hits for every expert; identity mapping.
-        for (int i = 0; i < (int) cell.n_experts; ++i) {
-            cell.slot_to_expert[i] = i;
-            cell.expert_to_slot[i] = i;
-        }
-        // Tensor wrapper to receive the H2D (must have a backend
-        // buffer for ggml_backend_tensor_set to work).
-        ggml_tensor preload = *cell.pool_tensor;
-        preload.ne[0] = weight->ne[0];
-        preload.ne[1] = weight->ne[1];
-        preload.ne[2] = cell.n_experts;
-        preload.nb[0] = weight->nb[0];
-        preload.nb[1] = weight->nb[1];
-        preload.nb[2] = cell.slot_stride;
-        preload.nb[3] = cell.slot_stride * cell.n_experts;
-        preload.data   = cell.pool_base;
-        preload.buffer = cell.pool_buf;
-        ggml_backend_tensor_set(&preload, src_base, 0,
-                                (size_t) cell.n_experts * cell.slot_stride);
-        // Hijack the model's expert weight tensor — overwrite its
-        // buffer + data so subsequent scheduler passes see this as
-        // GPU-resident. Cast away const: we own the model tensor's
-        // lifetime via the cache for as long as the cache lives.
-        struct ggml_tensor * model_weight = const_cast<struct ggml_tensor *>(weight);
-        model_weight->buffer = cell.pool_buf;
-        model_weight->data   = cell.pool_base;
-        cell.fully_resident = true;
-        moe_cache_log("cell HIJACKED (layer=%d, bucket=%d): preloaded %lld experts × %zu B = %.1f MiB, model tensor now GPU-resident",
-                      layer_idx, (int) bucket, (long long) cell.n_experts,
-                      cell.expert_size,
-                      (cell.n_experts * cell.slot_stride) / (1024.0 * 1024.0));
-    }
+    // Phase 2 (incremental): when the cache can hold every expert,
+    // enforce identity slot assignment (expert E -> slot E) via the
+    // miss-selection path so the pool fills with identity mapping as
+    // misses arrive normally. After all experts are seen, the cell
+    // becomes "fully_resident" and the next compute_splits invocation
+    // overrides the model weight tensor to point at the pool —
+    // subsequent splits see GPU-resident input and the cache machinery
+    // is bypassed entirely (close cache=256 → pure-GPU ceiling).
+    cell.preload_pending = (cell.n_slots >= (int) cell.n_experts);
 
     static int n_bound = 0;
     if (n_bound < 8) {
@@ -532,12 +500,22 @@ static int evict_lfru_decay(ggml_moe_cache & c, ggml_moe_cache::cell & cell) {
 }
 
 int ggml_moe_cache_select_slot_for_miss(
-        ggml_moe_cache_t c, int layer_idx, ggml_moe_bucket bucket, int32_t /*expert_id*/) {
+        ggml_moe_cache_t c, int layer_idx, ggml_moe_bucket bucket, int32_t expert_id) {
     if (!c) return -1;
     if (bucket < 0 || bucket >= GGML_MOE_BUCKET_COUNT) return -1;
     if (layer_idx < 0 || layer_idx >= c->n_layers)     return -1;
     auto & cell = c->cells[cell_idx(layer_idx, bucket)];
     if (!cell.bound || cell.n_slots <= 0) return -1;
+
+    // Identity slot assignment when the cache can hold all experts:
+    // expert E always lives at slot E. Required for Phase 2 hijack —
+    // after warmup, the model tensor (which is just an expert-id
+    // indexed n_experts buffer) can be aliased to the cache pool
+    // and the kernel reads pool[expert_id] correctly without any
+    // remap.
+    if (cell.preload_pending && expert_id >= 0 && expert_id < cell.n_slots) {
+        return expert_id;
+    }
 
     switch (c->policy) {
         case GGML_MOE_CACHE_POLICY_RR: {
@@ -574,6 +552,14 @@ void ggml_moe_cache_record_slot(
     cell.last_tick[slot_idx] = ++c->tick;
     cell.tier[slot_idx]      = 0;   // new entry starts probationary (SLRU)
 
+    // Phase 2 ready check: when in full-cache identity mode, mark the
+    // cell as fully_resident the moment all experts have been seen
+    // (compute_splits then performs the model-tensor override).
+    if (cell.preload_pending && !cell.fully_resident &&
+        (int) cell.expert_to_slot.size() == (int) cell.n_experts) {
+        cell.fully_resident = true;
+    }
+
     c->stats.total_h2d_bytes += (int64_t) cell.expert_size;
 }
 
@@ -607,6 +593,91 @@ ggml_tensor * ggml_moe_cache_ids_tensor(
     if (layer_idx < 0 || layer_idx >= c->n_layers)     return nullptr;
     auto & cell = c->cells[cell_idx(layer_idx, bucket)];
     return cell.bound ? cell.ids_tensor : nullptr;
+}
+
+bool ggml_moe_cache_force_full_preload(
+        ggml_moe_cache_t c, int layer_idx, ggml_moe_bucket bucket,
+        const struct ggml_tensor * model_weight, ggml_backend_t backend) {
+    if (!c || !model_weight || !backend) return false;
+    if (bucket < 0 || bucket >= GGML_MOE_BUCKET_COUNT) return false;
+    if (layer_idx < 0 || layer_idx >= c->n_layers)     return false;
+    auto & cell = c->cells[cell_idx(layer_idx, bucket)];
+    if (!cell.bound || !cell.preload_pending) return false;
+    if (cell.fully_resident) return true;  // already done
+
+    const size_t expert_size = cell.expert_size;
+    const uint8_t * src_base = (const uint8_t *) model_weight->data;
+    if (!src_base) return false;
+
+    // Build a one-slot tensor wrapper that we reposition per-expert
+    // to drive ggml_backend_tensor_set into the right slot. Per-expert
+    // calls instead of one big H2D — the single-shot 142 MiB version
+    // failed at sched_reserve time; per-expert calls succeed in
+    // compute_splits because mmap'd pages have been faulted in.
+    ggml_tensor one;
+    memset(&one, 0, sizeof(one));
+    one.type = model_weight->type;
+    one.ne[0] = model_weight->ne[0];
+    one.ne[1] = model_weight->ne[1];
+    one.ne[2] = 1;
+    one.ne[3] = 1;
+    one.nb[0] = model_weight->nb[0];
+    one.nb[1] = model_weight->nb[1];
+    one.nb[2] = expert_size;
+    one.nb[3] = expert_size;
+    one.buffer = cell.pool_buf;
+
+    for (int i = 0; i < (int) cell.n_experts; ++i) {
+        one.data = cell.pool_base + (size_t) i * cell.slot_stride;
+        ggml_backend_tensor_set_async(backend, &one,
+            src_base + (size_t) i * expert_size, 0, expert_size);
+        // Maintain identity mapping; clear any prior LRU state.
+        const int prev_holder = cell.slot_to_expert[i];
+        if (prev_holder >= 0 && prev_holder != i) {
+            cell.expert_to_slot.erase(prev_holder);
+        }
+        cell.slot_to_expert[i] = i;
+        cell.expert_to_slot[i] = i;
+    }
+    cell.next_unused = cell.n_slots;   // cap; no more warmup slots
+    cell.fully_resident = true;
+    // Sync once so the H2Ds complete before the kernel runs this op.
+    ggml_backend_synchronize(backend);
+    moe_cache_log("cell PRELOADED (layer=%d, bucket=%d): all %lld experts H2D'd identity, ready for hijack",
+                  layer_idx, (int) bucket, (long long) cell.n_experts);
+    return true;
+}
+
+bool ggml_moe_cache_try_hijack_model_tensor(
+        ggml_moe_cache_t c, int layer_idx, ggml_moe_bucket bucket,
+        struct ggml_tensor * model_weight) {
+    if (!c || !model_weight) return false;
+    if (bucket < 0 || bucket >= GGML_MOE_BUCKET_COUNT) return false;
+    if (layer_idx < 0 || layer_idx >= c->n_layers)     return false;
+    auto & cell = c->cells[cell_idx(layer_idx, bucket)];
+    if (!cell.bound) return false;
+    if (!cell.fully_resident || !cell.preload_pending) return false;
+
+    // Validate that the cell's slot mapping is identity. Required so
+    // that after hijack, the kernel reads pool[expert_id] and lands
+    // on the correct expert.
+    for (int i = 0; i < (int) cell.n_experts; ++i) {
+        if (cell.slot_to_expert[i] != i) {
+            moe_cache_log("try_hijack: identity check failed at slot %d (holds expert %d); aborting hijack",
+                          i, cell.slot_to_expert[i]);
+            return false;
+        }
+    }
+
+    // Override the model weight's buffer + data to point at the
+    // cache pool. After this, the scheduler sees this as a
+    // GPU-resident input → no split boundary at this op.
+    model_weight->buffer = cell.pool_buf;
+    model_weight->data   = cell.pool_base;
+    cell.preload_pending = false;   // single-shot, don't re-hijack
+    moe_cache_log("cell HIJACKED (layer=%d, bucket=%d): all %lld experts at identity slots, model tensor now GPU-resident; subsequent splits will bypass cache machinery",
+                  layer_idx, (int) bucket, (long long) cell.n_experts);
+    return true;
 }
 
 // -----------------------------------------------------------------------------
