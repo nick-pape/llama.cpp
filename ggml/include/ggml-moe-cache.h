@@ -183,46 +183,42 @@ void ggml_moe_cache_flush_mapping_to_device(
     enum ggml_moe_bucket    bucket,
     ggml_backend_t          backend);
 
-// --- Phase 2: in-graph miss handling -------------------------------------
+// --- Phase 2: per-op in-graph miss handling ------------------------------
 //
-// Phase 1's get_rows reads mapping[selected_experts] with the CURRENT pass's
-// ids, but the compute_splits prep-time hook can only populate mapping from
-// the PREVIOUS pass's ids (argsort runs later, inside graph_compute). The
-// mismatch produces wrong slot_ids. Phase 2 fixes this: compute_splits walks
-// the split node-by-node and, right after each layer's selected_experts node
-// is computed + synced, calls handle_layer_miss with the CURRENT ids — so
-// mapping is correct before the downstream get_rows reads it.
+// The compute_splits node-walk intercepts each MoE mul_mat_id node right
+// before it computes. At that point all upstream nodes (incl. argsort)
+// have run, so node->src[2] holds the CURRENT-pass expert ids. The walk
+// reads top_k/n_tokens straight from that live node, D2Hs the ids,
+// classifies + H2Ds misses, calls set_ids (which reshapes the persistent
+// per-cell ids tensor to exactly this op), then patches node->src[2] to
+// that ids tensor. Everything comes from the live node — robust against
+// graph reserve/reuse and varying ubatch sizes.
 
-// Register a layer's selected_experts (argsort/topk) tensor so the
-// compute_splits node-walk can recognise it as a miss-handling point.
-// Called from build_moe_ffn once per layer per graph build; overwrites
-// the previous registration for that layer (graph reuse keeps pointers
-// stable, fresh builds re-register).
-void ggml_moe_cache_register_topk(
-    ggml_moe_cache_t        cache,
-    int                     layer_idx,
-    struct ggml_tensor *    selected_experts);
-
-// If `node` is a registered selected_experts tensor, return its layer
-// index; otherwise -1. O(n_layers) scan, called per graph node in the
-// compute_splits node-walk.
-int ggml_moe_cache_node_topk_layer(
+// If `node` is a MoE mul_mat_id whose src[0] is one of the cache's slot
+// pool tensors (named "moe-cache-pool-L{layer}-B{bucket}"), fill
+// out_layer_idx + out_bucket and return true. Otherwise return false.
+// Called per graph node in the compute_splits node-walk; O(1) (parses
+// the pool tensor's name).
+bool ggml_moe_cache_node_cache_op(
     ggml_moe_cache_t           cache,
-    const struct ggml_tensor * node);
+    const struct ggml_tensor * node,
+    int *                      out_layer_idx,
+    enum ggml_moe_bucket *     out_bucket);
 
-// Handle misses for ALL buckets of `layer_idx` using the current-pass
-// expert ids (D2H'd from the just-computed selected_experts node). For
-// each bucket: classify used experts, evict+H2D missing experts into
-// slot pool from the bound host weight, record slots, flush mapping to
-// device on `backend`'s stream. After this returns, every bound cell's
-// mapping_tensor is correct for `ids` and the downstream get_rows for
-// this layer will produce valid slot_ids.
+// Handle misses for ONE (layer, bucket) using the current-pass expert
+// ids D2H'd from the live mul_mat_id node's src[2]. Classifies used
+// experts, evicts+H2Ds missing experts into the slot pool from the
+// bound host weight, records slots, then builds slot_ids = mapping[ids]
+// and pushes them via set_ids (which also reshapes the per-cell ids
+// tensor to [top_k, n_tokens]). The caller then patches the node's
+// src[2] to ggml_moe_cache_ids_tensor(layer, bucket).
 //
 // `ids` is top_k*n_tokens int32 values in [0, n_experts). `backend` is
-// the compute backend running the MoE ops (H2Ds + flush go on its stream).
-void ggml_moe_cache_handle_layer_miss(
+// the compute backend running the MoE op (H2Ds go on its stream).
+void ggml_moe_cache_handle_op_miss(
     ggml_moe_cache_t        cache,
     int                     layer_idx,
+    enum ggml_moe_bucket    bucket,
     ggml_backend_t          backend,
     const int32_t *         ids,
     int                     top_k,

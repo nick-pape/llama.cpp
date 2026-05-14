@@ -1511,12 +1511,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // `weight_io` is left as the host model weight and selected_experts
         // is returned unchanged (baseline path).
         //
-        // The earlier graph-side get_rows(mapping, selected_experts) was
-        // dropped: a reshape/view of the cache-context mapping tensor used
-        // as a get_rows source was not robustly handled by gallocr (worked
-        // at cache=256, garbage slot_ids at cache<256). The ids tensor is
-        // a plain per-cell device buffer used DIRECTLY as src[2] — the same
-        // way pool_tensor is used directly as src[0], which is robust.
+        // src[2] is set to ids_c — a contiguous ggml_cont of the current-
+        // pass selected_experts, with the correct live [top_k, n_tokens]
+        // shape. The compute_splits node-walk intercepts the mul_mat_id,
+        // reads top_k/n_tokens straight from this live src[2], runs
+        // handle_op_miss (which set_ids-reshapes the persistent per-cell
+        // ids tensor to exactly this op), then patches src[2] to that
+        // ids tensor. Reading everything from the live node is what makes
+        // it robust — the persistent ids tensor is never baked into the
+        // graph at build time (that desynced across reserve/reuse builds).
         auto bind_and_gather = [&](ggml_tensor *& weight_io, ggml_moe_bucket b) -> ggml_tensor * {
             ggml_tensor * w = weight_io;
             if (!w) return selected_experts;
@@ -1527,39 +1530,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             if (!pool || pool->ne[2] < (int64_t) min_useful_topk * top_k) {
                 return selected_experts;
             }
-            ggml_tensor * idst = ggml_moe_cache_ids_tensor(moe_cache, il, b);
-            if (!idst) return selected_experts;
-            // idst is allocated [top_k, max_n_tokens]; mul_mat_id requires
-            // src[2]->ne[1] == src[1]->ne[2] == n_tokens. Set it here for
-            // graph build; set_ids re-sets it identically at compute time.
-            idst->ne[0] = top_k;
-            idst->ne[1] = n_tokens;
-            // Force a contiguous copy of the current-pass ids into the
-            // graph as the node-walk's per-layer trigger point.
-            if (!ids_c) {
-                ids_c = ggml_cont(ctx0, selected_experts);
-                ggml_build_forward_expand(gf, ids_c);
-            }
+            // Contiguous current-pass ids, created once per layer, shared
+            // as src[2] by all of this layer's cache mul_mat_id ops.
+            // selected_experts is the non-contiguous argsort_top_k view;
+            // ggml_cont gives a contiguous [top_k, n_tokens] tensor the
+            // node-walk can D2H directly.
+            if (!ids_c) ids_c = ggml_cont(ctx0, selected_experts);
             weight_io = pool;   // route mul_mat_id through the GPU slot pool
-            return idst;
+            return ids_c;
         };
         slot_ids_up      = bind_and_gather(up_exps,      GGML_MOE_BUCKET_UP);
         slot_ids_gate    = bind_and_gather(gate_exps,    GGML_MOE_BUCKET_GATE);
         slot_ids_down    = bind_and_gather(down_exps,    GGML_MOE_BUCKET_DOWN);
         slot_ids_gate_up = bind_and_gather(gate_up_exps, GGML_MOE_BUCKET_GATE_UP);
-        if (slot_ids_up      != selected_experts) cb(slot_ids_up,      "ffn_moe_slot_ids_up",      il);
-        if (slot_ids_gate    != selected_experts) cb(slot_ids_gate,    "ffn_moe_slot_ids_gate",    il);
-        if (slot_ids_down    != selected_experts) cb(slot_ids_down,    "ffn_moe_slot_ids_down",    il);
-        if (slot_ids_gate_up != selected_experts) cb(slot_ids_gate_up, "ffn_moe_slot_ids_gate_up", il);
-
-        // Phase 2: register this layer's contiguous ids tensor (ids_c) so
-        // the compute_splits node-walk recognises it as a miss-handling
-        // point and populates the mapping with CURRENT-pass ids before the
-        // get_rows above is computed. ids_c is non-null iff at least one
-        // bucket actually uses the cache.
-        if (ids_c) {
-            ggml_moe_cache_register_topk(moe_cache, il, ids_c);
-        }
+        if (ids_c) cb(ids_c, "ffn_moe_slot_ids", il);
     }
 
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {

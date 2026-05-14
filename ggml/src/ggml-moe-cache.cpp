@@ -122,12 +122,6 @@ struct ggml_moe_cache {
     std::vector<cell> cells;
     uint64_t          tick = 0;  // monotonic, for LFRU LRU-tiebreak
 
-    // Phase 2: per-layer selected_experts (argsort/topk) tensor pointers,
-    // registered by build_moe_ffn. The compute_splits node-walk matches
-    // graph nodes against these to find miss-handling points. Indexed by
-    // layer; nullptr if not registered.
-    std::vector<ggml_tensor *> topk_by_layer;
-
     // Shared overflow scratch buffer. Allocated lazily on first overflow,
     // grown to fit the largest expert tensor seen. A real
     // ggml_backend_buffer_t — needed because ggml_cuda_mul_mat_id
@@ -229,7 +223,6 @@ ggml_moe_cache_t ggml_moe_cache_init(
     }
 
     c->cells.resize((size_t) n_layers * GGML_MOE_BUCKET_COUNT);
-    c->topk_by_layer.assign((size_t) n_layers, nullptr);
 
     const char * policy_name = "rr";
     switch (policy) {
@@ -667,101 +660,75 @@ void ggml_moe_cache_flush_mapping_to_device(
 // Phase 2: in-graph miss handling
 // -----------------------------------------------------------------------------
 
-void ggml_moe_cache_register_topk(
-        ggml_moe_cache_t c, int layer_idx, ggml_tensor * selected_experts) {
-    if (!c) return;
-    if (layer_idx < 0 || layer_idx >= c->n_layers) return;
-    c->topk_by_layer[layer_idx] = selected_experts;
+bool ggml_moe_cache_node_cache_op(
+        ggml_moe_cache_t c, const ggml_tensor * node,
+        int * out_layer_idx, ggml_moe_bucket * out_bucket) {
+    if (!c || !node || !out_layer_idx || !out_bucket) return false;
+    if (node->op != GGML_OP_MUL_MAT_ID) return false;
+    const ggml_tensor * w = node->src[0];
+    if (!w) return false;
+    // build_moe_ffn rebinds the MoE weight to the cache slot pool, named
+    // "moe-cache-pool-L{layer}-B{bucket}" in bind_bucket. Parse it.
+    const char * p = strstr(w->name, "moe-cache-pool-L");
+    if (!p) return false;
+    p += 16 /* strlen("moe-cache-pool-L") */;
+    char * end = nullptr;
+    const long layer = strtol(p, &end, 10);
+    if (!end || end[0] != '-' || end[1] != 'B') return false;
+    const long bucket = strtol(end + 2, nullptr, 10);
+    if (layer < 0 || layer >= c->n_layers) return false;
+    if (bucket < 0 || bucket >= GGML_MOE_BUCKET_COUNT) return false;
+    *out_layer_idx = (int) layer;
+    *out_bucket    = (ggml_moe_bucket) bucket;
+    return true;
 }
 
-int ggml_moe_cache_node_topk_layer(
-        ggml_moe_cache_t c, const ggml_tensor * node) {
-    if (!c || !node) return -1;
-    // Structural match, NOT a pointer match. build_moe_ffn creates the
-    // per-layer trigger node as ggml_cont(selected_experts); selected_experts
-    // is named "ffn_moe_topk-{layer}" by cb(), and ggml_cont names its
-    // result "{src} (cont)". Matching by op+name is robust across graph
-    // reserve/reuse/rebuild — a registered pointer goes stale (and points
-    // at a differently-sized ids_c), which fed handle_layer_miss the wrong
-    // n_tokens (max_n_tokens instead of the live ubatch count).
-    if (node->op != GGML_OP_CONT) return -1;
-    const char * p = strstr(node->name, "ffn_moe_topk-");
-    if (!p) return -1;
-    const int layer = atoi(p + 13 /* strlen("ffn_moe_topk-") */);
-    if (layer < 0 || layer >= c->n_layers) return -1;
-    return layer;
-}
-
-void ggml_moe_cache_handle_layer_miss(
-        ggml_moe_cache_t c, int layer_idx, ggml_backend_t backend,
-        const int32_t * ids, int top_k, int n_tokens) {
+void ggml_moe_cache_handle_op_miss(
+        ggml_moe_cache_t c, int layer_idx, ggml_moe_bucket bucket,
+        ggml_backend_t backend, const int32_t * ids, int top_k, int n_tokens) {
     if (!c || !backend || !ids) return;
+    if (bucket < 0 || bucket >= GGML_MOE_BUCKET_COUNT) return;
     if (layer_idx < 0 || layer_idx >= c->n_layers) return;
     if (top_k <= 0 || n_tokens <= 0) return;
 
+    auto & cell = c->cells[cell_idx(layer_idx, bucket)];
+    if (!cell.bound || !cell.host_weight || !cell.pool_tensor) return;
+
     const size_t n_ids = (size_t) top_k * n_tokens;
 
-    for (int b = 0; b < GGML_MOE_BUCKET_COUNT; ++b) {
-        auto & cell = c->cells[cell_idx(layer_idx, (ggml_moe_bucket) b)];
-        if (!cell.bound || !cell.host_weight || !cell.pool_tensor) continue;
-
-        // Dedup the experts used by this op (current-pass ids).
-        std::vector<uint8_t> used((size_t) cell.n_experts, 0);
-        for (size_t i = 0; i < n_ids; ++i) {
-            const int32_t e = ids[i];
-            if (e >= 0 && e < cell.n_experts) used[e] = 1;
-        }
-
-        // Classify: hits update LRU state; misses evict + H2D + record.
-        const uint8_t * w_base = (const uint8_t *) cell.host_weight->data;
-        for (int32_t e = 0; e < (int32_t) cell.n_experts; ++e) {
-            if (!used[e]) continue;
-            int slot = ggml_moe_cache_lookup(c, layer_idx, (ggml_moe_bucket) b, e);
-            if (slot >= 0) continue;   // already resident
-            slot = ggml_moe_cache_select_slot_for_miss(c, layer_idx, (ggml_moe_bucket) b, e);
-            if (slot < 0) continue;
-            // H2D the expert's bytes from the host weight into its slot.
-            ggml_backend_tensor_set_async(backend, cell.pool_tensor,
-                w_base + (size_t) e * cell.expert_size,
-                (size_t) slot * cell.slot_stride,
-                cell.expert_size);
-            ggml_moe_cache_record_slot(c, layer_idx, (ggml_moe_bucket) b, slot, e);
-        }
-        // Build slot_ids from the CURRENT-pass ids + the now-current
-        // mapping and push them to this cell's ids tensor via set_ids.
-        // This is v2's proven host-built-slot_ids mechanism — but fed
-        // current-pass ids by the node-walk (it runs after argsort),
-        // not the stale prep-time ids. Replaces the fragile graph-side
-        // get_rows: a reshape/view of the cache-context mapping tensor
-        // used as a get_rows source was not robustly handled by
-        // gallocr (worked at cache=256, produced garbage slot_ids at
-        // cache<256). set_ids writes a plain per-cell device buffer.
-        {
-            std::vector<int32_t> slot_ids(n_ids);
-            int smin = 999999, smax = -1;
-            for (size_t i = 0; i < n_ids; ++i) {
-                const int32_t e = ids[i];
-                const int32_t s = (e >= 0 && e < cell.n_experts) ? cell.mapping_host[e] : 0;
-                slot_ids[i] = s;
-                if (s < smin) smin = s;
-                if (s > smax) smax = s;
-            }
-            ggml_moe_cache_set_ids(c, layer_idx, (ggml_moe_bucket) b, backend,
-                                   slot_ids.data(), top_k, n_tokens);
-            static int dbg_hlm = 0;
-            if (dbg_hlm < 9) {
-                ggml_tensor * idst = ggml_moe_cache_ids_tensor(c, layer_idx, (ggml_moe_bucket) b);
-                fprintf(stderr, "DBG hlm L%d B%d: n_ids=%zu top_k=%d n_tokens=%d "
-                        "slot_ids min=%d max=%d | idst=%p ne=[%lld,%lld] data=%p\n",
-                        layer_idx, b, n_ids, top_k, n_tokens, smin, smax,
-                        (void *) idst,
-                        idst ? (long long) idst->ne[0] : -1,
-                        idst ? (long long) idst->ne[1] : -1,
-                        idst ? idst->data : nullptr);
-                ++dbg_hlm;
-            }
-        }
+    // Dedup the experts used by this op (current-pass ids from the live node).
+    std::vector<uint8_t> used((size_t) cell.n_experts, 0);
+    for (size_t i = 0; i < n_ids; ++i) {
+        const int32_t e = ids[i];
+        if (e >= 0 && e < cell.n_experts) used[e] = 1;
     }
+
+    // Classify: hits update LRU state; misses evict + H2D + record.
+    const uint8_t * w_base = (const uint8_t *) cell.host_weight->data;
+    for (int32_t e = 0; e < (int32_t) cell.n_experts; ++e) {
+        if (!used[e]) continue;
+        int slot = ggml_moe_cache_lookup(c, layer_idx, bucket, e);
+        if (slot >= 0) continue;   // already resident
+        slot = ggml_moe_cache_select_slot_for_miss(c, layer_idx, bucket, e);
+        if (slot < 0) continue;
+        ggml_backend_tensor_set_async(backend, cell.pool_tensor,
+            w_base + (size_t) e * cell.expert_size,
+            (size_t) slot * cell.slot_stride,
+            cell.expert_size);
+        ggml_moe_cache_record_slot(c, layer_idx, bucket, slot, e);
+    }
+
+    // Build slot_ids = mapping[ids] from the CURRENT-pass ids + the now-current
+    // mapping, push via set_ids. set_ids reshapes the per-cell ids tensor to
+    // exactly [top_k, n_tokens] for THIS op, so the persistent tensor always
+    // matches the live node the caller is about to patch + compute.
+    std::vector<int32_t> slot_ids(n_ids);
+    for (size_t i = 0; i < n_ids; ++i) {
+        const int32_t e = ids[i];
+        slot_ids[i] = (e >= 0 && e < cell.n_experts) ? cell.mapping_host[e] : 0;
+    }
+    ggml_moe_cache_set_ids(c, layer_idx, bucket, backend,
+                           slot_ids.data(), top_k, n_tokens);
 }
 
 // -----------------------------------------------------------------------------

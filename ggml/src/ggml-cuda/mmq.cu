@@ -169,28 +169,6 @@ void ggml_cuda_mul_mat_q(
     const int64_t ne_get_rows = ne12 * n_expert_used;
     GGML_ASSERT(ne1 == n_expert_used);
 
-    // DEBUG: dump the ids the kernel actually sees, for the first few
-    // MoE mul_mat_q calls. D2H ids, report range + a sample, alongside
-    // src0->ne[2] (the slot-pool expert count = the valid id bound).
-    {
-        static int dbg_n = 0;
-        if (dbg_n < 9) {
-            std::vector<int32_t> hids(ggml_nelements(ids));
-            cudaMemcpy(hids.data(), ids->data, hids.size() * sizeof(int32_t), cudaMemcpyDeviceToHost);
-            int32_t mn = INT32_MAX, mx = INT32_MIN;
-            for (int32_t v : hids) { mn = v < mn ? v : mn; mx = v > mx ? v : mx; }
-            fprintf(stderr,
-                "mmq.cu DBG3: src0=%s ne02=%lld | ids=%s ne=[%lld,%lld] data=%p nelem=%zu min=%d max=%d "
-                "| sample=[%d %d %d %d %d %d %d %d]\n",
-                src0->name, (long long) ne02,
-                ids->name, (long long) ids->ne[0], (long long) ids->ne[1], ids->data, hids.size(),
-                mn, mx,
-                hids.size()>0?hids[0]:-1, hids.size()>1?hids[1]:-1, hids.size()>2?hids[2]:-1, hids.size()>3?hids[3]:-1,
-                hids.size()>4?hids[4]:-1, hids.size()>5?hids[5]:-1, hids.size()>6?hids[6]:-1, hids.size()>7?hids[7]:-1);
-            ++dbg_n;
-        }
-    }
-
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
     ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
