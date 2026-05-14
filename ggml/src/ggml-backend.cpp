@@ -2141,6 +2141,27 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                     ++j2;
                 }
+                {
+                    static int dchk = 0;
+                    if (dchk < 20) {
+                        ggml_tensor * s2 = split->graph.nodes[j1]->src[2];
+                        int32_t chk[4] = {0,0,0,0};
+                        ggml_backend_tensor_get(s2, chk, 0, sizeof(chk));
+                        int n_cont_alias = 0, n_any_alias = 0;
+                        for (int t = j1; t < j2; ++t) {
+                            ggml_tensor * nt = split->graph.nodes[t];
+                            if (nt->data == s2->data && t != j1) {
+                                ++n_any_alias;
+                                if (nt->op == GGML_OP_CONT) ++n_cont_alias;
+                            }
+                        }
+                        fprintf(stderr, "DBG chunk: j1=%d j2=%d L%d B%d src2=%p name='%s' "
+                                "postremap_first4=%d,%d,%d,%d n_cont_alias=%d n_any_alias=%d\n",
+                                j1, j2, moe_layer, (int) moe_bucket, (void *) s2->data, s2->name,
+                                chk[0], chk[1], chk[2], chk[3], n_cont_alias, n_any_alias);
+                        ++dchk;
+                    }
+                }
                 // Compute [j1, j2): the remapped cache op j1 plus every
                 // node up to the next cache op — including that next op's
                 // ids_c. Multi-node (the FFN always has activation/glu ops
