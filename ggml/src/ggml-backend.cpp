@@ -2066,23 +2066,25 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         if (sched->moe_cache && !sched->callback_eval) {
-            // iter6 moe-cache node-walk. Compute the split in per-layer
-            // chunks. Each cache mul_mat_id's src[2] is this bucket's own
-            // contiguous current-pass ids tensor (ggml_cont of the argsort
-            // top-k). When the scan reaches a layer's first cache op, the
-            // prefix [j0, j1) has already computed every ids_c of that
-            // layer; we sync, then for each cache op of the layer call
-            // remap_ids_inplace (D2H expert-ids, classify + H2D misses
-            // into the slot pool, H2D slot-ids back into the same buffer
-            // in place — no src[2] repointing). The remapped ops are then
-            // computed as a single multi-node chunk [j1, k) — never a
-            // lone 1-node view (a lone mul_mat_id breaks the CUDA MMQ-ids
-            // gather path: the ids_src1 gather buffer is read out of
-            // bounds). No persistent pointer state — ids_c is recomputed
-            // fresh every pass, robust across reserve / reuse / rebuild.
+            // iter6 moe-cache node-walk. Per-OP chunking. Each cache
+            // mul_mat_id's src[2] is its OWN contiguous current-pass ids
+            // tensor (ggml_cont of the argsort top-k); in DFS graph order
+            // that ids_c node sits just before its mul_mat_id — NOT all
+            // before the layer's first cache op. So for EACH cache op we:
+            //   1. compute the prefix [j0, j1) — this computes j1's ids_c,
+            //   2. sync + remap_ids_inplace (D2H expert-ids, classify +
+            //      H2D misses into the slot pool, H2D slot-ids back into
+            //      the same ids_c buffer in place — no src[2] repointing),
+            //   3. compute [j1, j2) where j2 is the NEXT cache op — a
+            //      multi-node chunk that runs the remapped op j1 and also
+            //      computes j2's ids_c for the next iteration.
+            // Never a lone 1-node view. No persistent pointer state —
+            // ids_c is recomputed fresh every pass, robust across graph
+            // reserve / reuse / rebuild.
             ggml_moe_cache_t cache = (ggml_moe_cache_t) sched->moe_cache;
-            for (int j0 = 0; j0 < split->graph.n_nodes; ) {
-                // Scan for the next cache mul_mat_id.
+            int j0 = 0;
+            while (j0 < split->graph.n_nodes) {
+                // Scan for the next cache mul_mat_id at or after j0.
                 int j1 = j0;
                 int moe_layer = -1;
                 enum ggml_moe_bucket moe_bucket = GGML_MOE_BUCKET_INVALID;
@@ -2091,9 +2093,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                                      &moe_layer, &moe_bucket)) {
                     ++j1;
                 }
-                // Compute the prefix [j0, j1): everything up to this
-                // layer's first cache op, including the layer's ids_c
-                // tensors. Multi-node.
+                // Compute the prefix [j0, j1): everything up to this cache
+                // op — which includes its ids_c (DFS-adjacent, index < j1).
                 if (j1 > j0) {
                     struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1);
                     enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
@@ -2102,55 +2103,33 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                 }
                 if (j1 >= split->graph.n_nodes) {
-                    break;  // no more cache ops in this split
+                    break;  // no more cache ops — tail already computed
                 }
-                // The layer's ids_c tensors are computed. Sync, then remap
-                // every cache op of this layer in place.
+                // j1's ids_c is computed. Sync, remap it in place.
                 ggml_backend_synchronize(split_backend);
-                {
-                    static int dbg = 0;
-                    if (dbg < 8) {
-                        int n_cache = 0;
-                        for (int t = 0; t < split->graph.n_nodes; ++t) {
-                            int dl = -1; enum ggml_moe_bucket db = GGML_MOE_BUCKET_INVALID;
-                            if (ggml_moe_cache_node_cache_op(cache, split->graph.nodes[t], &dl, &db)) ++n_cache;
-                        }
-                        ggml_tensor * fn = split->graph.nodes[j1];
-                        fprintf(stderr, "DBG walk: split n_nodes=%d j1=%d L%d B%d "
-                                "src0='%s' src2='%s' src2_ne=[%lld,%lld] n_cache_ops=%d\n",
-                                split->graph.n_nodes, j1, moe_layer, (int) moe_bucket,
-                                fn->src[0] ? fn->src[0]->name : "(null)",
-                                fn->src[2] ? fn->src[2]->name : "(null)",
-                                fn->src[2] ? (long long) fn->src[2]->ne[0] : -1,
-                                fn->src[2] ? (long long) fn->src[2]->ne[1] : -1,
-                                n_cache);
-                        ++dbg;
+                ggml_moe_cache_remap_ids_inplace(cache, moe_layer, moe_bucket,
+                                                 split_backend,
+                                                 split->graph.nodes[j1]->src[2]);
+                // Scan for the cache op AFTER j1.
+                int j2 = j1 + 1;
+                while (j2 < split->graph.n_nodes) {
+                    int l2 = -1;
+                    enum ggml_moe_bucket b2 = GGML_MOE_BUCKET_INVALID;
+                    if (ggml_moe_cache_node_cache_op(cache, split->graph.nodes[j2], &l2, &b2)) {
+                        break;
                     }
+                    ++j2;
                 }
-                int k = j1;
-                while (k < split->graph.n_nodes) {
-                    int op_layer = -1;
-                    enum ggml_moe_bucket op_bucket = GGML_MOE_BUCKET_INVALID;
-                    if (ggml_moe_cache_node_cache_op(cache, split->graph.nodes[k],
-                                                     &op_layer, &op_bucket)) {
-                        if (op_layer != moe_layer) {
-                            break;  // next layer's cache op — next chunk
-                        }
-                        ggml_moe_cache_remap_ids_inplace(cache, op_layer, op_bucket,
-                                                         split_backend,
-                                                         split->graph.nodes[k]->src[2]);
-                    }
-                    ++k;
-                }
-                // Compute [j1, k): this layer's remapped cache ops plus
-                // interleaved / trailing nodes up to the next layer's
-                // first cache op. Multi-node.
-                struct ggml_cgraph gv = ggml_graph_view(&split->graph, j1, k);
+                // Compute [j1, j2): the remapped cache op j1 plus every
+                // node up to the next cache op — including that next op's
+                // ids_c. Multi-node (the FFN always has activation/glu ops
+                // between two mul_mat_ids).
+                struct ggml_cgraph gv = ggml_graph_view(&split->graph, j1, j2);
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {
                     return ec;
                 }
-                j0 = k;
+                j0 = j2;
             }
         } else if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
