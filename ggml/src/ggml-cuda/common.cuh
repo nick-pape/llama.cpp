@@ -159,14 +159,22 @@ void ggml_cuda_error(const char * stmt, const char * func, const char * file, in
      do {                                                                           \
         auto err_ = (err);                                                          \
         if (err_ != (success)) {                                                    \
-            fprintf(stderr, "DBG CUDA_CHECK fail: err_=%d (%s) at %s:%d in %s\n",   \
-                    (int) err_, cudaGetErrorName(err_),                             \
-                    __FILE__, __LINE__, __func__);                                  \
             ggml_cuda_error(#err, __func__, __FILE__, __LINE__, error_fn(err_));    \
         }                                                                           \
     } while (0)
 
-#define CUDA_CHECK(err) CUDA_CHECK_GEN(err, cudaSuccess, cudaGetErrorString)
+// DEBUG variant: also prints numeric err + cudaGetErrorName before aborting.
+#define CUDA_CHECK(err)                                                             \
+     do {                                                                           \
+        cudaError_t err_ = (err);                                                   \
+        if (err_ != cudaSuccess) {                                                  \
+            fprintf(stderr, "DBG CUDA_CHECK fail: err_=%d (%s) at %s:%d in %s\n",   \
+                    (int) err_, cudaGetErrorName(err_),                             \
+                    __FILE__, __LINE__, __func__);                                  \
+            ggml_cuda_error(#err, __func__, __FILE__, __LINE__,                     \
+                            cudaGetErrorString(err_));                              \
+        }                                                                           \
+    } while (0)
 
 #if CUDART_VERSION >= 12000 || defined(GGML_USE_MUSA)
     static const char * cublas_get_error_str(const cublasStatus_t err) {
