@@ -1518,13 +1518,26 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             if (!pool || pool->ne[2] < (int64_t) min_useful_topk * top_k) {
                 return selected_experts;
             }
-            // This bucket's OWN contiguous current-pass ids tensor.
-            // selected_experts is the non-contiguous argsort_top_k view;
-            // ggml_cont gives a contiguous [top_k, n_tokens] tensor the
-            // node-walk D2Hs, remaps, and H2Ds slot-ids back into in
-            // place. Per-bucket (not shared) because each bucket's pool
-            // has its own expert->slot mapping.
-            ggml_tensor * ids_c = ggml_cont(ctx0, selected_experts);
+            // This bucket's current-pass ids tensor. selected_experts is
+            // the non-contiguous argsort_top_k view; copy it into a
+            // [top_k, n_tokens] view of the cache's OWN per-(layer,bucket)
+            // ids buffer (allocated outside ggml_gallocr -> stable
+            // address, never aliased). The Phase 2 compute_splits node-
+            // walk D2Hs this, remaps expert-ids -> slot-ids, and H2Ds the
+            // slot-ids back into the same buffer in place.
+            //
+            // A plain ggml_cont here would let gallocr alias the three
+            // per-bucket ids tensors to ONE address (their lifetimes
+            // don't overlap), so a later bucket's ggml_cont clobbers an
+            // earlier bucket's just-remapped slot-ids before its kernel
+            // reads them.
+            ggml_tensor * cache_ids = ggml_moe_cache_ids_tensor(moe_cache, il, b);
+            if (!cache_ids) {
+                return selected_experts;
+            }
+            ggml_tensor * ids_view = ggml_view_2d(ctx0, cache_ids, top_k, n_tokens,
+                                                  (size_t) top_k * sizeof(int32_t), 0);
+            ggml_tensor * ids_c = ggml_cpy(ctx0, selected_experts, ids_view);
             cb(ids_c, "ffn_moe_slot_ids", il);
             weight_io = pool;   // route mul_mat_id through the GPU slot pool
             return ids_c;
