@@ -677,10 +677,19 @@ void ggml_moe_cache_register_topk(
 int ggml_moe_cache_node_topk_layer(
         ggml_moe_cache_t c, const ggml_tensor * node) {
     if (!c || !node) return -1;
-    for (int l = 0; l < c->n_layers; ++l) {
-        if (c->topk_by_layer[l] == node) return l;
-    }
-    return -1;
+    // Structural match, NOT a pointer match. build_moe_ffn creates the
+    // per-layer trigger node as ggml_cont(selected_experts); selected_experts
+    // is named "ffn_moe_topk-{layer}" by cb(), and ggml_cont names its
+    // result "{src} (cont)". Matching by op+name is robust across graph
+    // reserve/reuse/rebuild — a registered pointer goes stale (and points
+    // at a differently-sized ids_c), which fed handle_layer_miss the wrong
+    // n_tokens (max_n_tokens instead of the live ubatch count).
+    if (node->op != GGML_OP_CONT) return -1;
+    const char * p = strstr(node->name, "ffn_moe_topk-");
+    if (!p) return -1;
+    const int layer = atoi(p + 13 /* strlen("ffn_moe_topk-") */);
+    if (layer < 0 || layer >= c->n_layers) return -1;
+    return layer;
 }
 
 void ggml_moe_cache_handle_layer_miss(
