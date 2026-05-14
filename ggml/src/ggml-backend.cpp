@@ -2142,24 +2142,30 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ++j2;
                 }
                 {
-                    static int dchk = 0;
-                    if (dchk < 20) {
-                        ggml_tensor * s2 = split->graph.nodes[j1]->src[2];
+                    static int dchk_s = 0, dchk_b = 0;
+                    ggml_tensor * s2 = split->graph.nodes[j1]->src[2];
+                    const bool is_big = s2 && s2->ne[1] > 100;
+                    const bool show = is_big ? (dchk_b++ < 12) : (dchk_s++ < 8);
+                    if (show && s2) {
                         int32_t chk[4] = {0,0,0,0};
                         ggml_backend_tensor_get(s2, chk, 0, sizeof(chk));
-                        int n_cont_alias = 0, n_any_alias = 0;
-                        for (int t = j1; t < j2; ++t) {
+                        // scan the WHOLE split for nodes touching s2's buffer
+                        char writers[256]; int wl = 0; writers[0] = 0;
+                        for (int t = 0; t < split->graph.n_nodes && wl < 230; ++t) {
                             ggml_tensor * nt = split->graph.nodes[t];
-                            if (nt->data == s2->data && t != j1) {
-                                ++n_any_alias;
-                                if (nt->op == GGML_OP_CONT) ++n_cont_alias;
+                            const bool hit = (nt->data == s2->data) ||
+                                (nt->src[1] && nt->src[1]->data == s2->data);
+                            if (hit) {
+                                wl += snprintf(writers + wl, sizeof(writers) - wl,
+                                               "%s%d:op%d%s", wl ? "," : "", t, (int) nt->op,
+                                               t >= j1 ? "(>=j1!)" : "");
                             }
                         }
-                        fprintf(stderr, "DBG chunk: j1=%d j2=%d L%d B%d src2=%p name='%s' "
-                                "postremap_first4=%d,%d,%d,%d n_cont_alias=%d n_any_alias=%d\n",
-                                j1, j2, moe_layer, (int) moe_bucket, (void *) s2->data, s2->name,
-                                chk[0], chk[1], chk[2], chk[3], n_cont_alias, n_any_alias);
-                        ++dchk;
+                        fprintf(stderr, "DBG chunk: j1=%d j2=%d L%d B%d nbig=%lld src2=%p name='%s' "
+                                "postremap_first4=%d,%d,%d,%d touch=[%s]\n",
+                                j1, j2, moe_layer, (int) moe_bucket,
+                                (long long) s2->ne[1], (void *) s2->data, s2->name,
+                                chk[0], chk[1], chk[2], chk[3], writers);
                     }
                 }
                 // Compute [j1, j2): the remapped cache op j1 plus every
