@@ -721,6 +721,26 @@ void ggml_moe_cache_handle_layer_miss(
         // Push the (expert -> slot) updates to the device mapping tensor so
         // the downstream get_rows for this layer reads current slot ids.
         ggml_moe_cache_flush_mapping_to_device(c, layer_idx, (ggml_moe_bucket) b, backend);
+
+        // DEBUG: verify every mapping entry for a used expert is in
+        // [0, n_slots). If this fires, mapping has out-of-range values
+        // and the get_rows downstream produces OOB slot_ids.
+        {
+            int n_used = 0, bad = 0, max_map = -1;
+            for (int32_t e = 0; e < (int32_t) cell.n_experts; ++e) {
+                if (!used[e]) continue;
+                ++n_used;
+                const int32_t m = cell.mapping_host[e];
+                if (m > max_map) max_map = m;
+                if (m < 0 || m >= cell.n_slots) ++bad;
+            }
+            static int dbg_n = 0;
+            if (bad > 0 || dbg_n < 6) {
+                fprintf(stderr, "DBG handle_layer_miss L%d B%d: n_used=%d n_slots=%d max_map=%d BAD=%d\n",
+                        layer_idx, b, n_used, cell.n_slots, max_map, bad);
+                ++dbg_n;
+            }
+        }
     }
 }
 
