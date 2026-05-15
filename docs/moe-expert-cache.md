@@ -309,7 +309,7 @@ should be empirical.
 
 ## 6. Measured results (llama.cpp / Qwen3.6-A3B-MXFP4_MOE / RTX PRO 4500)
 
-Source: [`RESULTS.md`](../RESULTS.md). Workload: `realistic-sweep.sh`,
+Source: [`docs/v2-results.md`](./v2-results.md). Workload: `realistic-sweep.sh`,
 6814-token prompt, 499 decode tokens.
 
 | Metric | v0 baseline (cache=0) | v1 (cache=256 LRU) | **v2 cache=256** | GPU ceiling |

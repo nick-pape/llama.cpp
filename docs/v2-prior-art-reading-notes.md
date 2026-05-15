@@ -1,6 +1,6 @@
 # Day-1 reading notes — llama.cpp H5 expert cache CUDA
 
-Reading work for the implementation plan at `nick-pape/ai-pape-house:llama-cpp-moe-cache-plan.md`.
+Reading work that preceded the v2 implementation. The original v1 plan in `nick-pape/ai-pape-house:llama-cpp-moe-cache-plan.md` referenced by this note has been retired; the v2 implementation plan now lives at [`docs/v2-implementation-plan.md`](./v2-implementation-plan.md), and the canonical architecture + port-to-vLLM guide at [`docs/moe-expert-cache.md`](./moe-expert-cache.md). This file is preserved as historical context — the exploration that informed the v2 design.
 
 ## Environment
 
