@@ -720,11 +720,23 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
     GGML_UNUSED(flags);
 
     // [TAG_RS_STATE_ROLLBACK_SUPPORT]
+    // Only abort if the sequence we're actually serializing has a pending
+    // rollback snapshot. The upstream check iterates ALL sequences, which
+    // makes llama-server's prompt-cache update abort whenever any concurrent
+    // slot mid-spec-decode has rs_idx != 0 — guaranteed to fire under load
+    // with `--parallel N > 1` + MTP. The per-sequence snapshot data is
+    // independent, so serializing one seq is safe even if others have
+    // pending rollbacks. seq_id == -1 (serialize all) keeps the strict
+    // check because we'd write everyone's snapshots in one blob.
     if (n_rs_seq != 0) {
-        for (uint32_t i = 0; i < rs_idx.size(); ++i) {
-            if (rs_idx[i] != 0) {
-                GGML_ABORT("recurrent state read/write is not supported with partial rollback");
+        if (seq_id == -1) {
+            for (uint32_t i = 0; i < rs_idx.size(); ++i) {
+                if (rs_idx[i] != 0) {
+                    GGML_ABORT("recurrent state read/write is not supported with partial rollback");
+                }
             }
+        } else if ((size_t) seq_id < rs_idx.size() && rs_idx[seq_id] != 0) {
+            GGML_ABORT("recurrent state read/write is not supported with partial rollback");
         }
     }
 
