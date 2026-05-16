@@ -848,6 +848,15 @@ void llm_graph_result::set_outputs() {
     if (t_embd_pooled != nullptr) {
         ggml_set_output(t_embd_pooled);
     }
+    if (t_h_pre_norm != nullptr) {
+        // h_pre_norm is consumed by the MTP draft (async D2H via embd_pre_norm
+        // buffer). Without this flag, the scheduler frees the allocator slot
+        // after the last in-graph consumer runs — the late get_rows that
+        // qwen35moe inserts when cparams.embeddings_pre_norm is true — and the
+        // subsequent slot reuse can overwrite the data before the D2H completes.
+        // Marking as output keeps the tensor allocated for the whole decode call.
+        ggml_set_output(t_h_pre_norm);
+    }
     for (auto & [seq_id, t] : t_sampled) {
         if (t != nullptr) {
             ggml_set_output(t);
