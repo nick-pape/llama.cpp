@@ -806,14 +806,14 @@ private:
             cparams_mtp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
             cparams_mtp.n_rs_seq = 0;
 
-            // MTP head only ever processes verify batches (~n_seq_max * (1 + n_max)),
-            // never the full prompt. Default n_ubatch=2048 makes sched_reserve()
-            // allocate a multi-GiB PP-graph compute buffer that's never used.
-            const uint32_t mtp_max =
-                cparams_mtp.n_seq_max *
-                (1u + (uint32_t) params_base.speculative.draft.n_max);
-            cparams_mtp.n_ubatch = std::max<uint32_t>(64u, mtp_max + 4u);
-            cparams_mtp.n_batch  = cparams_mtp.n_ubatch;
+            // MTP head processes the prompt in target-ubatch-sized chunks
+            // (so n_batch must stay large enough to receive them — leave it
+            // at the inherited value) but its own n_ubatch only drives
+            // sched_reserve()'s worst-case compute buffer. Default n_ubatch=2048
+            // reserves multi-GiB; chunking the MTP graph in smaller sub-batches
+            // reclaims that with only modest PP overhead on the MTP head.
+            cparams_mtp.n_ubatch = std::max<uint32_t>(64u,
+                cparams_mtp.n_seq_max * (1u + (uint32_t) params_base.speculative.draft.n_max) + 4u);
 
             ctx_dft.reset(llama_init_from_model(model_tgt, cparams_mtp));
             if (ctx_dft == nullptr) {
