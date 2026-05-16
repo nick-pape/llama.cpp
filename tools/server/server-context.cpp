@@ -2931,7 +2931,13 @@ private:
                 slot_batched->lora[alora_disabled_id].scale = alora_scale;
             }
 
-            llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
+            // Use task->need_embd() (true only for embedding/rerank tasks), NOT slot.need_embd()
+            // (which OR's in MTP's hardcoded true). Setting cparams.embeddings=true for MTP
+            // forces output_all=true in llama-context.cpp (line ~1701), which makes n_outputs ==
+            // n_tokens regardless of per-token output flags — defeating the whole point of
+            // capturing h_pre_norm full-rank and shrinking the LM head matmul. MTP does NOT need
+            // the embd output (it uses t_h_pre_norm via cparams.embeddings_pre_norm, set elsewhere).
+            llama_set_embeddings(ctx_tgt, slot_batched->task->need_embd());
         }
 
         if (batch.n_tokens == 0) {
