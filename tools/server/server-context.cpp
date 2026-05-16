@@ -3064,11 +3064,18 @@ private:
             //        }
             //    }
             //}
-            if (!common_speculative_process(spec.get(), batch_view)) {
-                SRV_ERR("%s", "failed to process speculative batch\n");
+            // DIAGNOSTIC (LLAMA_MTP_SKIP_PP_GRAPH=1): skip the MTP draft graph entirely
+            // during PP. This BREAKS MTP correctness (accept rate will crater) but lets us
+            // measure whether the per-PP-ubatch MTP graph run is actually the bottleneck.
+            // If PP jumps significantly with this flag, build the proper "snapshot h_pre_norm
+            // per ubatch and flush MTP state once at end of PP" patch (see VR17 task).
+            if (!getenv("LLAMA_MTP_SKIP_PP_GRAPH")) {
+                if (!common_speculative_process(spec.get(), batch_view)) {
+                    SRV_ERR("%s", "failed to process speculative batch\n");
 
-                // TODO: handle error
-                break;
+                    // TODO: handle error
+                    break;
+                }
             }
 
             // move the head of the batch forward with the number of tokens we just processed
