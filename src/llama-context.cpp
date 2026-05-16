@@ -1816,6 +1816,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     };
 
     int64_t n_outputs_prev = 0;
+    int64_t n_tokens_prev  = 0;  // separate accumulator for h_pre_norm extraction (full-ubatch)
 
     do {
         const auto & ubatch = mctx->get_ubatch();
@@ -1961,16 +1962,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         // extract pre-norm embeddings (hidden state before the final output norm)
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
-        if (embd_pre_norm.data && t_h_pre_norm && n_outputs > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+        //
+        // The graph captures h_pre_norm at FULL ubatch rank (before any inp_out_ids subset),
+        // so the extraction here is over n_tokens, not n_outputs. Accumulator is n_tokens_prev.
+        if (embd_pre_norm.data && t_h_pre_norm && ubatch.n_tokens > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
             ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_pre_norm);
             GGML_ASSERT(backend_h != nullptr);
 
-            const uint32_t n_embd = hparams.n_embd;
-            float * embd_pre_norm_out = embd_pre_norm.data + n_outputs_prev*n_embd;
+            const uint32_t n_embd     = hparams.n_embd;
+            const int64_t  n_h_rows   = (int64_t) ubatch.n_tokens;
+            float * embd_pre_norm_out = embd_pre_norm.data + n_tokens_prev*n_embd;
 
-            GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
-            GGML_ASSERT((n_outputs_prev + n_outputs)*n_embd <= (int64_t) embd_pre_norm.size);
-            ggml_backend_tensor_get_async(backend_h, t_h_pre_norm, embd_pre_norm_out, 0, n_outputs*n_embd*sizeof(float));
+            GGML_ASSERT((n_tokens_prev + n_h_rows)*n_embd <= (int64_t) embd_pre_norm.size);
+            ggml_backend_tensor_get_async(backend_h, t_h_pre_norm, embd_pre_norm_out, 0, n_h_rows*n_embd*sizeof(float));
         }
 
         // Copy backend sampling output if this ubatch produced any sampling tensors.
@@ -1987,6 +1991,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         n_outputs_prev += n_outputs;
+        n_tokens_prev  += (int64_t) ubatch.n_tokens;
     } while (mctx->next());
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
@@ -2074,9 +2079,14 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     size_t backend_float_count = 0;
     size_t backend_token_count = 0;
 
+    // embd_pre_norm sizing: when set, the MTP path needs h_pre_norm for EVERY token in the
+    // ubatch (not just the n_outputs rows). The graph captures full-rank h_pre_norm; the buffer
+    // here must match. n_batch is the upper bound on tokens per decode call.
+    const int64_t embd_pre_norm_rows = has_embd_pre_norm ? std::max<int64_t>((int64_t) n_batch, n_outputs_max) : 0;
+
     logits.size        = has_logits        ? n_vocab*n_outputs_max     : 0;
     embd.size          = has_embd          ? n_embd_out*n_outputs_max  : 0;
-    embd_pre_norm.size = has_embd_pre_norm ? n_embd*n_outputs_max      : 0;
+    embd_pre_norm.size = has_embd_pre_norm ? n_embd*embd_pre_norm_rows : 0;
 
     // Allocate backend sampling output buffers if there are backend samplers configured.
     const bool has_sampling = !sampling.samplers.empty();

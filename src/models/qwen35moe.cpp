@@ -199,7 +199,13 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
         }
 
-        if (il == n_transformer_layers - 1 && inp_out_ids) {
+        // When the MTP path needs h_pre_norm for every prompt token (cparams.embeddings_pre_norm),
+        // defer the inp_out_ids subset to AFTER h_pre_norm capture so the residual stream stays
+        // full-rank. The post-attention norm + MoE FFN of the last layer become slightly more
+        // expensive (full ubatch rather than n_outputs rows) but this lets the server stop
+        // marking every PP token as output, which otherwise forces the LM head matmul over the
+        // entire 248K-vocab × n_tokens range and a multi-GiB logits D2H per ubatch.
+        if (il == n_transformer_layers - 1 && inp_out_ids && !cparams.embeddings_pre_norm) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -233,6 +239,12 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
 
     cb(cur, "h_pre_norm", -1);
     res->t_h_pre_norm = cur;
+
+    // Late subset for the deferred-subset path: capture full-rank h_pre_norm above,
+    // then drop rows the server doesn't need before the (expensive) norm + LM head.
+    if (cparams.embeddings_pre_norm && inp_out_ids) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
 
     // Final norm
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);

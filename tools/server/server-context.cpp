@@ -812,7 +812,9 @@ private:
             // sched_reserve()'s worst-case compute buffer. Default n_ubatch=2048
             // reserves multi-GiB; chunking the MTP graph in smaller sub-batches
             // reclaims that with only modest PP overhead on the MTP head.
-            cparams_mtp.n_ubatch = std::max<uint32_t>(64u,
+            // Floor=512 (was 64): a 2048-token PP chunk gets 4 MTP launches instead of 32,
+            // which cuts per-launch fixed overhead substantially with negligible buffer growth.
+            cparams_mtp.n_ubatch = std::max<uint32_t>(512u,
                 cparams_mtp.n_seq_max * (1u + (uint32_t) params_base.speculative.draft.n_max) + 4u);
 
             ctx_dft.reset(llama_init_from_model(model_tgt, cparams_mtp));
@@ -2804,14 +2806,18 @@ private:
                             break;
                         }
 
-                        // embedding requires all tokens in the batch to be output;
-                        // MTP also wants logits at every prompt position so the
-                        // streaming hook can mirror t_h_pre_norm into ctx_dft.
+                        // embedding requires all tokens in the batch to be output.
+                        // For MTP, we need h_pre_norm at every prompt position, but the graph now
+                        // captures it full-rank (see qwen35moe.cpp + cparams.embeddings_pre_norm),
+                        // so we DON'T need to force per-PP-token output=true here. The expensive
+                        // path (LM head over n_tokens × 248K vocab + multi-GiB logits D2H) is gone.
+                        // Use task->need_embd() (only true for actual embedding/rerank requests)
+                        // instead of slot.need_embd() (which OR's in MTP's hardcoded true).
                         common_batch_add(batch,
                             cur_tok,
                             slot.prompt.tokens.pos_next(),
                             { slot.id },
-                            slot.need_embd());
+                            slot.task->need_embd());
                         slot.prompt.tokens.push_back(cur_tok);
 
                         slot.n_prompt_tokens_processed++;
