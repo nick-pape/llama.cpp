@@ -514,6 +514,14 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
         // TODO:this is generally true, but would be nice to assert it
         {
             const float * h_tgt = llama_get_embeddings_pre_norm(ctx_tgt);
+            if (getenv("LLAMA_DEBUG_PRENORM")) {
+                fprintf(stderr, "[DBG] speculative::process: h_tgt=%p n_tokens=%d n_embd=%d  h_tgt[row0][:4]=%g,%g,%g,%g  h_tgt[row_last_consumed=%d][:4]=%g,%g,%g,%g\n",
+                        (const void *) h_tgt, n_tokens, n_embd,
+                        h_tgt[0], h_tgt[1], h_tgt[2], h_tgt[3],
+                        n_tokens-2,
+                        h_tgt[(n_tokens-2)*n_embd+0], h_tgt[(n_tokens-2)*n_embd+1],
+                        h_tgt[(n_tokens-2)*n_embd+2], h_tgt[(n_tokens-2)*n_embd+3]);
+            }
             std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
 
             //{

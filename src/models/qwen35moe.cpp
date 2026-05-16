@@ -240,10 +240,20 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
     cb(cur, "h_pre_norm", -1);
     res->t_h_pre_norm = cur;
 
+    if (getenv("LLAMA_DEBUG_PRENORM")) {
+        fprintf(stderr, "[DBG] qwen35moe::graph: t_h_pre_norm captured shape ne=[%lld,%lld,%lld,%lld] type=%s, cparams.embeddings_pre_norm=%d, inp_out_ids=%p\n",
+                (long long) cur->ne[0], (long long) cur->ne[1], (long long) cur->ne[2], (long long) cur->ne[3],
+                ggml_type_name(cur->type), (int) cparams.embeddings_pre_norm, (void *) inp_out_ids);
+    }
+
     // Late subset for the deferred-subset path: capture full-rank h_pre_norm above,
     // then drop rows the server doesn't need before the (expensive) norm + LM head.
     if (cparams.embeddings_pre_norm && inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        if (getenv("LLAMA_DEBUG_PRENORM")) {
+            fprintf(stderr, "[DBG] qwen35moe::graph: after late get_rows, cur ne=[%lld,%lld,%lld,%lld]\n",
+                    (long long) cur->ne[0], (long long) cur->ne[1], (long long) cur->ne[2], (long long) cur->ne[3]);
+        }
     }
 
     // Final norm

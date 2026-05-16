@@ -984,7 +984,12 @@ float * llama_context::get_embeddings_pre_norm_ith(int32_t i) {
             if (i < 0 || (size_t) (((int64_t) i + 1) * n_embd) > embd_pre_norm.size) {
                 throw std::runtime_error(format("batch token index %d out of range for h_pre_norm buffer", i));
             }
-            return embd_pre_norm.data + (int64_t) i * n_embd;
+            float * row = embd_pre_norm.data + (int64_t) i * n_embd;
+            if (getenv("LLAMA_DEBUG_PRENORM")) {
+                fprintf(stderr, "[DBG] get_ith(i=%d) [pre_norm-mode] returning row[:4]=%g,%g,%g,%g\n",
+                        i, row[0], row[1], row[2], row[3]);
+            }
+            return row;
         }
 
         const int64_t j = output_resolve_row(i);
@@ -1985,8 +1990,24 @@ int llama_context::decode(const llama_batch & batch_inp) {
             const int64_t  n_h_rows   = (int64_t) ubatch.n_tokens;
             float * embd_pre_norm_out = embd_pre_norm.data + n_tokens_prev*n_embd;
 
+            if (getenv("LLAMA_DEBUG_PRENORM")) {
+                fprintf(stderr, "[DBG] extract: ubatch.n_tokens=%u n_outputs=%d n_tokens_prev=%lld n_h_rows=%lld n_embd=%u t_h_pre_norm.ne=[%lld,%lld] buf.size=%zu copy_bytes=%zu\n",
+                        ubatch.n_tokens, (int) n_outputs, (long long) n_tokens_prev, (long long) n_h_rows, n_embd,
+                        (long long) t_h_pre_norm->ne[0], (long long) t_h_pre_norm->ne[1],
+                        embd_pre_norm.size, (size_t)(n_h_rows*n_embd*sizeof(float)));
+            }
+
             GGML_ASSERT((n_tokens_prev + n_h_rows)*n_embd <= (int64_t) embd_pre_norm.size);
             ggml_backend_tensor_get_async(backend_h, t_h_pre_norm, embd_pre_norm_out, 0, n_h_rows*n_embd*sizeof(float));
+
+            if (getenv("LLAMA_DEBUG_PRENORM")) {
+                // force sync so the buffer is populated before we read
+                ggml_backend_sched_synchronize(sched.get());
+                fprintf(stderr, "[DBG] extract: after sync, embd_pre_norm[0][:4]=%g,%g,%g,%g  embd_pre_norm[last][:4]=%g,%g,%g,%g\n",
+                        embd_pre_norm_out[0], embd_pre_norm_out[1], embd_pre_norm_out[2], embd_pre_norm_out[3],
+                        embd_pre_norm_out[(n_h_rows-1)*n_embd + 0], embd_pre_norm_out[(n_h_rows-1)*n_embd + 1],
+                        embd_pre_norm_out[(n_h_rows-1)*n_embd + 2], embd_pre_norm_out[(n_h_rows-1)*n_embd + 3]);
+            }
         }
 
         // Copy backend sampling output if this ubatch produced any sampling tensors.
