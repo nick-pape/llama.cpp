@@ -7,19 +7,30 @@ evaluate whether the MTP support added by upstream PR
 **OPEN as of 2026-05-15**) delivers usable decode speedup on top of our
 existing MoE-expert-weight cache, on the homelab's specific workload.
 
-**TL;DR — strongly workload-dependent.** On the long code-review
-prompt that's our default sweep workload, MTP regresses or barely
-ties baseline (best: 72.5 vs 71.2 t/s = 1.018×). On a predictable
-factual workload (US states list), the *same* MTP configuration
-delivers **+28% (111.3 vs 86.9 t/s)**. Plan's acceptance gate of 1.5×
-not met on either, but the gap is meaningful enough that MTP is worth
-keeping in the toolbox for high-accept-rate workloads.
+**TL;DR — MTP works, but it's a regression on this card under SDXL
+coexistence constraints.** At isolated test conditions
+(parallel=1 ctx=8192 cache=96), MTP delivers +1.8% to +28% depending
+on workload shape. But fitting MTP into a budget that *also* allows
+SDXL on the same card requires dropping parallel 4→3 and cache 96→64,
+which together cost MORE decode than MTP recovers (head-to-head loses
+−10% to −31% across all workloads tested). The MTP economics need
+cache=96 + parallel=4, which is exactly what we have to give up.
+
+**Decision: stay on current prod (`cd9a2bd60`, no MTP, cache=96,
+parallel=4).** Branch `mtp-experiment` (HEAD `7ae14a77a`) is
+preserved on `nick-pape/llama.cpp` for the day the second GPU lands
+(see "Pro 2000 unblocks this" below).
 
 **Path A (self-convert MXFP4+MTP) is unnecessary** because Unsloth
 already publishes the same MXFP4_MOE quant we use in prod with MTP
-heads pre-baked in `unsloth/Qwen3.6-35B-A3B-MTP-GGUF`. Branch
-`mtp-experiment` (HEAD `7ae14a77a`) is preserved on
-`nick-pape/llama.cpp`.
+heads pre-baked in `unsloth/Qwen3.6-35B-A3B-MTP-GGUF`.
+
+**Pro 2000 unblocks this.** Once a second GPU dedicates ~16 GiB to
+SDXL + embed-gpu + rerank-gpu + whisper-gpu, the 4500 gets all 32 GiB
+for Qwen+MTP. At full cache=96 parallel=4 ctx=1M MTP-on, the +28% on
+factual workloads + +14% on short prompts comes back for free with no
+trade-offs. MTP becomes a clear prod default *only* in that hardware
+configuration. The work captured here ports forward unchanged.
 
 ## Setup
 
@@ -125,6 +136,57 @@ MTP's economics on this hardware/workload don't pencil out:
 - Prefill throughput regresses moderately under MTP (982 → 760 t/s) —
   expected, since prefill doesn't benefit from speculative decoding
   but pays the GDN-rollback memory bookkeeping.
+
+## Head-to-head at prod-shape budget (2026-05-15, evening)
+
+After the workload-shape finding, the real question became: can we
+**enable MTP as the prod default** given the VRAM cost?
+
+### Measured cost at full prod settings (parallel=4 ctx=1048576 q8/q8 KV)
+
+| Config | Process VRAM | Δ vs no-MTP baseline |
+|---|---|---|
+| Baseline (MTP off, mmproj on) | 24,926 MiB | — |
+| MTP on + blk.40 on GPU | 30,212 MiB | **+5,286 MiB (~5.2 GiB)** |
+
+Breakdown of the 5.2 GiB MTP cost at prod shape:
+- MTP draft KV (4 sequences × 262144 ctx × q8/q8): ~2.2 GiB
+- MTP head weights (1 MoE block on GPU): ~1.0 GiB
+- GDN partial rollback state (~500 MiB at n-max=3 per am17an): ~0.3 GiB at n=2
+- MoE cache pool extra cell (layer 40, 3 buckets at 96 slots): ~0.15 GiB
+- Compute buffer expansion + spec-decode bookkeeping: ~1.5 GiB
+
+### Budget against ComfyUI/SDXL coexistence
+
+SDXL measured cost on the same card (image-gen via litellm → comfy shim → comfyui):
+- Total GPU before: 437 MiB (driver only)
+- Total GPU during/post gen: 7,061 MiB
+- **SDXL exact footprint: 6,624 MiB (~6.5 GiB)** — and `comfyui /free` releases it cleanly back to 437 MiB.
+
+Budget for Qwen+MTP to coexist with SDXL: 32,134 − 437 − 6,624 = **25,073 MiB**.
+
+### Knob sweep to fit budget (parallel=3 + cache shrink, MTP on)
+
+| cache | proc VRAM (MiB) | fits 25,073 MiB? |
+|---|---|---|
+| 96 | 27,030 | ❌ over by 2.0 GiB |
+| 88 | 26,466 | ❌ over by 1.4 GiB |
+| 80 | 25,896 | ❌ over by 0.8 GiB |
+| 72 | 25,332 | ❌ over by 0.3 GiB |
+| **64** | **24,846** | ✅ fits with 227 MiB margin |
+| 56 | 24,120 | ✅ fits with 953 MiB margin |
+
+To fit MTP alongside SDXL on this card requires **parallel 4→3 + cache 96→64** (plus other smaller compromises).
+
+### Head-to-head: original prod vs MTP-tuned at budget
+
+| workload | A: prod (parallel=4 cache=96 no MTP) | B: MTP-tuned (parallel=3 cache=64 MTP-on) | Δ decode | Δ prompt |
+|---|---|---|---|---|
+| code (long, creative) | 68.5 t/s | 47.4 t/s | **−31%** | −30% |
+| list (factual) | 84.5 t/s | 76.3 t/s | **−10%** | −20% |
+| summ (structured prose) | 66.3 t/s | 56.2 t/s | **−15%** | −22% |
+
+**B regresses on every workload.** The cache shrink + parallel drop required to make room for MTP costs more decode than MTP recovers — even on the "list" workload where MTP previously gave +28% (at cache=96 parallel=1). The MTP win requires holding cache=96, which we can't afford alongside SDXL on this card.
 
 ## Decision
 
