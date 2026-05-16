@@ -974,8 +974,20 @@ float * llama_context::get_embeddings_pre_norm_ith(int32_t i) {
             throw std::runtime_error("no pre-norm embeddings");
         }
 
-        const int64_t j = output_resolve_row(i);
         const uint32_t n_embd = model.hparams.n_embd;
+
+        // When cparams.embeddings_pre_norm is set, the buffer holds h_pre_norm for ALL
+        // tokens in the batch (not just n_outputs rows) — indexed directly by the batch
+        // token index. output_resolve_row would map via output_ids which only has entries
+        // for actual output tokens, so it would fail or return the wrong row.
+        if (cparams.embeddings_pre_norm) {
+            if (i < 0 || (size_t) (((int64_t) i + 1) * n_embd) > embd_pre_norm.size) {
+                throw std::runtime_error(format("batch token index %d out of range for h_pre_norm buffer", i));
+            }
+            return embd_pre_norm.data + (int64_t) i * n_embd;
+        }
+
+        const int64_t j = output_resolve_row(i);
         return embd_pre_norm.data + j*n_embd;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid pre-norm embeddings id %d, reason: %s\n", __func__, i, err.what());
@@ -2215,7 +2227,10 @@ void llama_context::output_reorder() {
             }
         }
 
-        if (embd_pre_norm.size > 0) {
+        // embd_pre_norm: skip the reorder swap when the buffer is laid out in batch-token order
+        // (cparams.embeddings_pre_norm) rather than output-row order. output_swaps maps output-row
+        // indices; swapping those rows in a batch-token-indexed buffer would corrupt h_pre_norm.
+        if (embd_pre_norm.size > 0 && !cparams.embeddings_pre_norm) {
             for (uint64_t k = 0; k < n_embd; k++) {
                 std::swap(embd_pre_norm.data[i0*n_embd + k], embd_pre_norm.data[i1*n_embd + k]);
             }
