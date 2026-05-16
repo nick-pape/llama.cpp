@@ -149,12 +149,15 @@ After the workload-shape finding, the real question became: can we
 | Baseline (MTP off, mmproj on) | 24,926 MiB | — |
 | MTP on + blk.40 on GPU | 30,212 MiB | **+5,286 MiB (~5.2 GiB)** |
 
-Breakdown of the 5.2 GiB MTP cost at prod shape:
-- MTP draft KV (4 sequences × 262144 ctx × q8/q8): ~2.2 GiB
-- MTP head weights (1 MoE block on GPU): ~1.0 GiB
-- GDN partial rollback state (~500 MiB at n-max=3 per am17an): ~0.3 GiB at n=2
-- MoE cache pool extra cell (layer 40, 3 buckets at 96 slots): ~0.15 GiB
-- Compute buffer expansion + spec-decode bookkeeping: ~1.5 GiB
+Breakdown of the 5.2 GiB MTP cost at prod shape (empirically probed
+with `-ctkd q8_0 -ctvd q8_0` and `--spec-draft-cpu-moe`):
+- MTP head MoE expert weights (offloadable to CPU): ~0.3 GiB (measured)
+- MTP draft KV (quant change had **zero** effect, so likely tiny —
+  scales with `--spec-draft-n-max` tokens, not full ctx): negligible
+- MTP non-MoE weights (attention norms, no flag): ~few hundred MiB
+- **~4.5 GiB hides in compute-buffer expansion + spec-decode
+  scheduler bookkeeping + extra context allocation — no flag exposes
+  it.** Would require patching the spec-decode allocator to reduce.
 
 ### Budget against ComfyUI/SDXL coexistence
 
