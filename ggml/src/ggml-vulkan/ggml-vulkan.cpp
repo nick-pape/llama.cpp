@@ -1506,6 +1506,7 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t sb1, sb2, sb3;
     uint32_t neq1, rq3;
     float scale;
+    uint32_t K;
 };
 
 struct vk_op_ssm_scan_push_constants {
@@ -3954,13 +3955,13 @@ static void ggml_vk_load_shaders(vk_device& device) {
             ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_s, #NAMELC #F16ACC "_aligned_s", NAMELC ## _aligned ## F16ACC ## _len, NAMELC ## _aligned ## F16ACC ## _data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, s_ ## WARPTILE, s_align, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
 
 #define CREATE_MMQ(TYPE, PIPELINE_NAME, NAMELC, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID, REQSUBGROUPSIZE) \
-        if (device->mul_mat ## ID ## _l[TYPE]) { \
+        if (device->mul_mat ## ID ## _l_int[TYPE]) { \
             ggml_vk_create_pipeline(device, device-> PIPELINE_NAME .f32acc->l, #NAMELC        "_l", NAMELC ## _len,        NAMELC ##  _data,        "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, l_ ## WARPTILE, 1, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
         } \
-        if (device->mul_mat ## ID ## _m[TYPE]) { \
+        if (device->mul_mat ## ID ## _m_int[TYPE]) { \
             ggml_vk_create_pipeline(device, device-> PIPELINE_NAME .f32acc->m, #NAMELC        "_m", NAMELC ## _len,        NAMELC ##  _data,        "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, m_ ## WARPTILE, 1, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
         } \
-        if (device->mul_mat ## ID ## _s[TYPE]) { \
+        if (device->mul_mat ## ID ## _s_int[TYPE]) { \
             ggml_vk_create_pipeline(device, device-> PIPELINE_NAME .f32acc->s, #NAMELC        "_s", NAMELC ## _len,        NAMELC ##  _data,        "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, s_ ## WARPTILE, 1, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
         } \
 
@@ -4131,11 +4132,11 @@ static void ggml_vk_load_shaders(vk_device& device) {
             ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_s, #NAMELC #F16ACC "_aligned_s", NAMELC ## _aligned ## F16ACC ## _fp32_len, NAMELC ## _aligned ## F16ACC ## _fp32_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, s_ ## WARPTILE, s_align, false, REQSUBGROUPSIZE > 0, REQSUBGROUPSIZE);   \
 
 #define CREATE_MMQ(TYPE, PIPELINE_NAME, NAMELC, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID) \
-        if (device->mul_mat ## ID ## _l[TYPE]) \
+        if (device->mul_mat ## ID ## _l_int[TYPE]) \
             ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->l, #NAMELC "_l", NAMELC ## _fp32_len, NAMELC ## _fp32_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, l_ ## WARPTILE, 1);   \
-        if (device->mul_mat ## ID ## _m[TYPE]) \
+        if (device->mul_mat ## ID ## _m_int[TYPE]) \
             ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->m, #NAMELC "_m", NAMELC ## _fp32_len, NAMELC ## _fp32_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, m_ ## WARPTILE, 1);   \
-        if (device->mul_mat ## ID ## _s[TYPE]) \
+        if (device->mul_mat ## ID ## _s_int[TYPE]) \
             ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->s, #NAMELC "_s", NAMELC ## _fp32_len, NAMELC ## _fp32_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, s_ ## WARPTILE, 1);   \
 
         CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32, matmul_f32_f32, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
@@ -5716,12 +5717,12 @@ static vk_device ggml_vk_get_device(size_t idx) {
                 break;
             }
 
-            device->mul_mat_l_int[i]    = true;
-            device->mul_mat_m_int[i]    = true;
-            device->mul_mat_s_int[i]    = true;
-            device->mul_mat_id_l_int[i] = true;
-            device->mul_mat_id_m_int[i] = true;
-            device->mul_mat_id_s_int[i] = true;
+            device->mul_mat_l_int[i]    = device->mul_mat_l[i];
+            device->mul_mat_m_int[i]    = device->mul_mat_m[i];
+            device->mul_mat_s_int[i]    = device->mul_mat_s[i];
+            device->mul_mat_id_l_int[i] = device->mul_mat_id_l[i];
+            device->mul_mat_id_m_int[i] = device->mul_mat_id_m[i];
+            device->mul_mat_id_s_int[i] = device->mul_mat_id_s[i];
         }
 
 
@@ -10767,6 +10768,7 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
     const ggml_tensor * src_q     = dst->src[0];
     const ggml_tensor * src_v     = dst->src[2];
     const ggml_tensor * src_beta  = dst->src[4];
+    const ggml_tensor * src_state = dst->src[5];
 
     GGML_ASSERT(dst->buffer != nullptr);
 
@@ -10774,6 +10776,9 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
     const uint32_t H        = (uint32_t)src_v->ne[1];
     const uint32_t n_tokens = (uint32_t)src_v->ne[2];
     const uint32_t n_seqs   = (uint32_t)src_v->ne[3];
+
+    // state is 3D (S_v*S_v*H, K, n_seqs); K is the snapshot slot count.
+    const uint32_t K = (uint32_t)src_state->ne[1];
 
     const uint32_t s_off = S_v * H * n_tokens * n_seqs;
 
@@ -10808,7 +10813,8 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
         sv1, sv2, sv3,
         sb1, sb2, sb3,
         neq1, rq3,
-        scale
+        scale,
+        K
     };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,

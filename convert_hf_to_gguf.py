@@ -95,6 +95,7 @@ class ModelBase:
     gguf_writer: gguf.GGUFWriter
     model_name: str | None
     metadata_override: Path | None
+    metadata: gguf.Metadata
     dir_model_card: Path
     remote_hf_model_id: str | None
 
@@ -5549,13 +5550,103 @@ class _Qwen35MRopeMixin:
             self.gguf_writer.add_rope_dimension_sections(self._QWEN35_DEFAULT_MROPE_SECTION)
 
 
+class _Qwen35MtpMixin:
+    """Shared MTP wiring for Qwen3.5/3.6 text variants. The HF config carries
+    the MTP block under `mtp_num_hidden_layers` and the tensors under
+    `mtp.*`; we extend block_count, emit the nextn metadata key, and remap
+    `mtp.*` to the standard layer-indexed nextn naming so the existing
+    tensor_map handles them."""
+
+    # Class-level annotations so the type checker understands the attributes
+    # available on the concrete subclasses in the MRO
+    hparams: dict[str, Any]
+    model_arch: gguf.MODEL_ARCH
+    gguf_writer: gguf.GGUFWriter
+    block_count: int
+    tensor_map: gguf.TensorNameMap
+
+    mtp_only: bool = False
+    no_mtp: bool = False
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.block_count = self.hparams["num_hidden_layers"]
+        if not self.no_mtp:
+            self.block_count += self.hparams.get("mtp_num_hidden_layers", 0)
+        self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
+    @classmethod
+    def filter_tensors(cls, item):
+        name, _ = item
+        if name.startswith("mtp."):
+            if cls.no_mtp:
+                return None
+            return item
+        if cls.mtp_only:
+            # In --mtp mode, drop trunk weights and keep only the shared embeddings/output
+            # tensors that the standalone MTP graph references at inference time.
+            canonical = name.replace("language_model.", "")
+            keep = canonical in (
+                "model.embed_tokens.weight", "model.norm.weight", "lm_head.weight",
+                "embed_tokens.weight", "norm.weight",
+            )
+            if not keep:
+                return None
+        return super().filter_tensors(item)  # ty: ignore[unresolved-attribute]
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()  # ty: ignore[unresolved-attribute]
+        if self.no_mtp:
+            return
+        if (n := self.hparams.get("mtp_num_hidden_layers", 0)) > 0:
+            self.gguf_writer.add_nextn_predict_layers(n)
+
+    def prepare_metadata(self, vocab_only: bool):
+        # TextModel.prepare_metadata resolves a directory fname_out into a concrete
+        # file path, so snapshot is_dir() first to decide whether to apply the mtp- prefix.
+        from_dir = self.fname_out.is_dir()
+        super().prepare_metadata(vocab_only=vocab_only)  # ty: ignore[unresolved-attribute]
+
+        if not self.mtp_only or not from_dir:
+            return
+
+        output_type: str = self.ftype.name.partition("_")[2]  # pyright: ignore[reportAttributeAccessIssue] # ty: ignore[unresolved-attribute]
+        fname_default: str = gguf.naming_convention(
+            self.metadata.name, self.metadata.basename, self.metadata.finetune,                  # pyright: ignore[reportAttributeAccessIssue] # ty: ignore[unresolved-attribute]
+            self.metadata.version, size_label=None, output_type=output_type, model_type=None)    # pyright: ignore[reportAttributeAccessIssue] # ty: ignore[unresolved-attribute]
+        self.fname_out = self.fname_out.parent / f"mtp-{fname_default}.gguf"
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # Remap MTP block tensors to llama.cpp's layer-indexed nextn naming.
+        if name.startswith("mtp."):
+            n_layer = self.hparams["num_hidden_layers"]
+            if name.find("layers.") != -1:
+                assert bid is not None
+                name = name.replace(f"mtp.layers.{bid}", f"model.layers.{bid + n_layer}")
+            else:
+                remapper = {
+                    "mtp.fc":                    "model.layers.{bid}.eh_proj",
+                    "mtp.pre_fc_norm_embedding": "model.layers.{bid}.enorm",
+                    "mtp.pre_fc_norm_hidden":    "model.layers.{bid}.hnorm",
+                    "mtp.norm":                  "model.layers.{bid}.shared_head.norm",
+                }
+                stem   = Path(name).stem
+                suffix = Path(name).suffix
+                tmpl   = remapper[stem] + suffix
+                for b in range(n_layer, self.block_count):
+                    yield from super().modify_tensors(data_torch, tmpl.format(bid=b), b)  # ty: ignore[unresolved-attribute]
+                return
+
+        yield from super().modify_tensors(data_torch, name, bid)  # ty: ignore[unresolved-attribute]
+
+
 @ModelBase.register("Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM")
-class Qwen3_5TextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
+class Qwen3_5TextModel(_Qwen35MtpMixin, _Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     model_arch = gguf.MODEL_ARCH.QWEN35
 
 
 @ModelBase.register("Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM")
-class Qwen3_5MoeTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
+class Qwen3_5MoeTextModel(_Qwen35MtpMixin, _Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     model_arch = gguf.MODEL_ARCH.QWEN35MOE
 
 
@@ -14053,6 +14144,14 @@ def parse_args() -> argparse.Namespace:
         help="(Experimental) Export multimodal projector (mmproj) for vision models. This will only work on some vision models. A prefix 'mmproj-' will be added to the output file name.",
     )
     parser.add_argument(
+        "--mtp", action="store_true",
+        help="(Experimental) Export only the multi-token prediction (MTP) head as a separate GGUF, suitable for use as a speculative draft. Output file name will get a '-MTP' suffix.",
+    )
+    parser.add_argument(
+        "--no-mtp", action="store_true",
+        help="(Experimental) Exclude the multi-token prediction (MTP) head from the converted GGUF. Pair with --mtp on a second run to publish trunk and MTP as two files. Note: the split form duplicates embeddings, so the bundled default is more space-efficient overall.",
+    )
+    parser.add_argument(
         "--mistral-format", action="store_true",
         help="Whether the model is stored following the Mistral format.",
     )
@@ -14210,6 +14309,20 @@ def main() -> None:
             model_class = MistralMoeModel
         else:
             model_class = MistralModel
+
+        if args.mtp and args.no_mtp:
+            logger.error("--mtp and --no-mtp are mutually exclusive")
+            sys.exit(1)
+
+        if (args.mtp or args.no_mtp) and not issubclass(model_class, _Qwen35MtpMixin):
+            logger.error("--mtp / --no-mtp are only supported for Qwen3.5/3.6 text variants today")
+            sys.exit(1)
+
+        # set on the class so __init__ / filter_tensors see the correct mode
+        if args.no_mtp:
+            model_class.no_mtp = True  # ty: ignore[unresolved-attribute]
+        if args.mtp:
+            model_class.mtp_only = True  # ty: ignore[unresolved-attribute]
 
         model_instance = model_class(dir_model, output_type, fname_out,
                                      is_big_endian=args.bigendian, use_temp_file=args.use_temp_file,
