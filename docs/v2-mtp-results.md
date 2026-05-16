@@ -7,13 +7,19 @@ evaluate whether the MTP support added by upstream PR
 **OPEN as of 2026-05-15**) delivers usable decode speedup on top of our
 existing MoE-expert-weight cache, on the homelab's specific workload.
 
-**TL;DR — gate not met, MTP regressed or barely-tied baseline on this
-workload.** Best MTP configuration: 72.5 t/s vs 71.2 t/s baseline
-(1.018×). The plan's acceptance gate was ≥1.5× (102+ t/s). Per the
-plan's decision point, we **do NOT invest in path A** (custom
-MXFP4+MTP self-conversion). Branch `mtp-experiment` (HEAD `c5905e14e`)
-is preserved on `nick-pape/llama.cpp` for re-test once upstream
-addresses the open issues.
+**TL;DR — strongly workload-dependent.** On the long code-review
+prompt that's our default sweep workload, MTP regresses or barely
+ties baseline (best: 72.5 vs 71.2 t/s = 1.018×). On a predictable
+factual workload (US states list), the *same* MTP configuration
+delivers **+28% (111.3 vs 86.9 t/s)**. Plan's acceptance gate of 1.5×
+not met on either, but the gap is meaningful enough that MTP is worth
+keeping in the toolbox for high-accept-rate workloads.
+
+**Path A (self-convert MXFP4+MTP) is unnecessary** because Unsloth
+already publishes the same MXFP4_MOE quant we use in prod with MTP
+heads pre-baked in `unsloth/Qwen3.6-35B-A3B-MTP-GGUF`. Branch
+`mtp-experiment` (HEAD `7ae14a77a`) is preserved on
+`nick-pape/llama.cpp`.
 
 ## Setup
 
@@ -52,6 +58,32 @@ A separate short-prompt smoke test (single-line "Write a short paragraph
 about Paris") showed MTP@2 hitting 82.3 t/s vs 72.2 t/s baseline
 (**+14%**) — so MTP *can* help, but the long code-generation workload
 is the wrong shape for it.
+
+### Workload-shape sensitivity (run after the main sweep)
+
+To stress the workload hypothesis, ran the *same* MTP@2 +
+p-min=0.9 + blk.40-on-GPU config on a predictable prompt: "List all 50
+US states in alphabetical order, with the year each joined the union
+in parentheses."
+
+| Run (states list, n_predict=1500) | Prompt t/s | Decode t/s | Δ |
+|---|---|---|---|
+| Baseline (no MTP) | 62.8 | 86.9 | 1.00× |
+| MTP@2 + p-min=0.9 + blk.40 on GPU | 58.1 | **111.3** | **1.28×** |
+
+**MTP delivers a real +28% speedup on factual / list / structured
+output**, while it ties or regresses on creative / code generation.
+Same flags, same model, only the prompt's predictability differs.
+
+Cache hit rate on the states prompt was higher across the board (91.1%
+main vs 85.3% on code-review), reflecting that a tighter expert
+distribution helps both the trunk cache AND MTP draft acceptance.
+Same flags, only the prompt changes.
+
+This is consistent with am17an's reference 0.72 accept rate on his
+unspecified bench — predictable next-token distribution → high accept
+→ MTP wins. Code generation has high entropy → low accept → MTP
+overhead dominates.
 
 ## Analysis
 
@@ -96,23 +128,29 @@ MTP's economics on this hardware/workload don't pencil out:
 
 ## Decision
 
-Per the plan's acceptance gate and decision point #2:
-
-> If MTP delivers < 1.5× decode, do not invest in path A. Document
-> the bench, keep the branch, re-test when upstream lands fixes.
+Per the plan's acceptance gate (1.5× decode) and decision point #2:
 
 - **Path A (self-convert MXFP4_MOE+MTP)** — unnecessary regardless,
   since `unsloth/Qwen3.6-35B-A3B-MTP-GGUF` already publishes the same
   MXFP4_MOE quant we use in prod with MTP heads pre-baked.
-- **Production deployment** — no. Prod stack continues to run the
-  v2-merge `cd9a2bd60` build with the existing MoE cache.
+- **Production deployment as a default** — no. The code-generation /
+  agentic-tool-call workloads we run most don't benefit (or regress).
+  Prod stack continues to run the v2-merge `cd9a2bd60` build with the
+  existing MoE cache.
+- **MTP as a *conditional* path** — worth considering. If a workload
+  is known to be high-accept-rate (factual recall, structured output,
+  retrieval summarization), enabling MTP is a +28% throughput win
+  with the right config (`--spec-draft-n-max 2 --spec-draft-p-min 0.9`,
+  MTP block kept on GPU via `-ot 'blk\.([0-3]?[0-9])\.ffn.*exps=CPU'`).
+  Could be implemented as a separate LiteLLM model name pointing at a
+  parallel `llama-server` instance with MTP enabled.
 - **Branch lifecycle** — `mtp-experiment` stays on `nick-pape/llama.cpp`.
   Re-test triggers:
   1. PR #22673 merges upstream and the API stabilizes (we'd rebase).
-  2. We start running workloads where MTP shines (high accept rate
-     scenarios — chat with predictable next tokens, structured-output
-     generation, repetitive content). The current sweep prompt is
-     code-generation, the worst case.
+  2. We add a workload-aware routing layer that picks MTP-on for
+     high-predictability requests. (Symmetric with the
+     embed-cpu/embed-gpu routing pattern in
+     [[project_prod_ai_stack]].)
   3. The mmproj SIGSEGV bug is fixed (would let us bench with vision).
 
 ## Open observations worth following up
