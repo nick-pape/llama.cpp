@@ -20,6 +20,12 @@ class llama_batch_allocr;
 class llama_io_read_i;
 class llama_io_write_i;
 
+// MoE per-expert slot cache (ggml/src/ggml-moe-cache.h). Forward-declared
+// here so llama_context can own one without dragging the internal header
+// into every consumer of llama-context.h.
+struct ggml_moe_cache;
+typedef struct ggml_moe_cache * ggml_moe_cache_t;
+
 // "memory" as in abstract memory for the context
 struct llama_memory_i;
 struct llama_memory_context_i;
@@ -344,6 +350,11 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
+
+    // Per-expert MoE slot cache; nullptr when disabled.
+    // Owned by the context: created in the constructor, freed in the destructor,
+    // re-attached to the scheduler at the end of sched_reserve().
+    ggml_moe_cache_t moe_cache = nullptr;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;

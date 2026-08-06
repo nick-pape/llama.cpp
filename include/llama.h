@@ -395,6 +395,14 @@ extern "C" {
         ggml_abort_callback abort_callback;
         void *              abort_callback_data;
 
+        // Per-expert MoE slot cache: number of expert slots (per layer, per bucket) to keep resident on the
+        // primary GPU. 0 disables the cache and runs the existing contiguous-batch offload path unchanged.
+        // [EXPERIMENTAL]
+        int32_t moe_expert_cache_size;
+        // Eviction policy for the MoE expert cache. Values match ggml_moe_cache_policy enum:
+        // 0=rr (round-robin, default), 1=lru, 2=slru, 3=lfru-decay. [EXPERIMENTAL]
+        int32_t moe_cache_policy;
+
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
         bool embeddings;  // if true, extract embeddings (together with logits)
         bool offload_kqv; // offload the KQV ops (including the KV cache) to GPU
