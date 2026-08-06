@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-moe-cache.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -454,6 +455,72 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        // initialize MoE per-expert slot cache (if requested) before sched_reserve so it gets attached.
+        // v2 supports any cache_size in [0, n_experts]:
+        //   - cache_size == 0 → no cache (baseline)
+        //   - cache_size == n_experts → fast path, no overflow ever
+        //   - 0 < cache_size < n_experts → cache used for ops that fit, overflow ops
+        //     route through a per-op cudaMallocAsync scratch buffer
+        if (params.moe_expert_cache_size > 0) {
+            ggml_backend_t gpu_backend = nullptr;
+            for (auto & backend : backends) {
+                auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
+                if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    gpu_backend = backend.get();
+                    break;
+                }
+            }
+            if (gpu_backend == nullptr) {
+                LLAMA_LOG_WARN("%s: --moe-expert-cache-size %d requested but no GPU backend available; disabling\n",
+                        __func__, params.moe_expert_cache_size);
+            } else {
+                ggml_moe_cache_policy policy = (ggml_moe_cache_policy) params.moe_cache_policy;
+                moe_cache = ggml_moe_cache_init(gpu_backend, (int) model.hparams.n_layer, params.moe_expert_cache_size, 0, policy);
+                if (moe_cache == nullptr) {
+                    LLAMA_LOG_WARN("%s: failed to allocate MoE expert cache (slots=%d, layers=%d); disabling\n",
+                            __func__, params.moe_expert_cache_size, (int) model.hparams.n_layer);
+                } else {
+                    LLAMA_LOG_INFO("%s: MoE expert cache enabled: %d slots/bucket x %d layers, %.2f MiB allocated\n",
+                            __func__, params.moe_expert_cache_size, (int) model.hparams.n_layer,
+                            ggml_moe_cache_total_bytes(moe_cache) / (1024.0 * 1024.0));
+
+                    // CUDA's default op_offload_min_batch_size is 32, which keeps
+                    // single-token decode MoE on CPU — the cache code path in
+                    // compute_splits becomes dead code. Force it to 1 via the
+                    // runtime setter exposed by ggml-cuda. Required because the
+                    // env-var fallback in common/arg.cpp runs too late: -ot
+                    // parsing triggers ggml_backend_load_all() which reads the
+                    // env var BEFORE the --moe-expert-cache-size handler can
+                    // setenv. The runtime setter sidesteps the timing issue.
+                    auto * gpu_dev = ggml_backend_get_device(gpu_backend);
+                    auto * gpu_reg = gpu_dev ? ggml_backend_dev_backend_reg(gpu_dev) : nullptr;
+                    using set_min_batch_t = bool (*)(int /*device*/, int /*min_batch_size*/);
+                    auto set_min_batch_fn = gpu_reg
+                        ? (set_min_batch_t) ggml_backend_reg_get_proc_address(gpu_reg, "ggml_backend_cuda_set_op_offload_min_batch_size")
+                        : nullptr;
+                    if (set_min_batch_fn) {
+                        const char * dev_name = ggml_backend_dev_name(gpu_dev);
+                        int dev_idx = 0;
+                        if (dev_name) {
+                            const char * p = dev_name;
+                            while (*p && (*p < '0' || *p > '9')) ++p;
+                            if (*p) dev_idx = atoi(p);
+                        }
+                        if (set_min_batch_fn(dev_idx, 1)) {
+                            LLAMA_LOG_INFO("%s: CUDA op_offload_min_batch_size set to 1 on device %d (required for MoE cache to engage during decode)\n",
+                                    __func__, dev_idx);
+                        } else {
+                            LLAMA_LOG_WARN("%s: failed to set CUDA op_offload_min_batch_size on device %d; set GGML_OP_OFFLOAD_MIN_BATCH=1 in env as workaround\n",
+                                    __func__, dev_idx);
+                        }
+                    } else {
+                        LLAMA_LOG_WARN("%s: backend doesn't expose ggml_backend_cuda_set_op_offload_min_batch_size; cache may not engage during decode\n",
+                                __func__);
+                    }
+                }
+            }
+        }
+
         sched_reserve();
 
         if (!cparams.flash_attn) {
@@ -477,6 +544,11 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    if (moe_cache != nullptr) {
+        ggml_moe_cache_free(moe_cache);
+        moe_cache = nullptr;
+    }
 
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -599,6 +671,10 @@ void llama_context::sched_reserve() {
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
 
+    if (moe_cache != nullptr) {
+        ggml_backend_sched_set_moe_cache(sched.get(), moe_cache);
+    }
+
     llama_memory_context_ptr mctx;
     if (memory) {
         LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
@@ -633,6 +709,9 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                if (moe_cache != nullptr) {
+                    ggml_backend_sched_set_moe_cache(sched.get(), moe_cache);
+                }
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -3509,6 +3588,8 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
+        /*.moe_expert_cache_size       =*/ 0,
+        /*.moe_cache_policy            =*/ 1,   // GGML_MOE_CACHE_POLICY_LRU (winner of policy sweep)
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
         /*.no_perf                     =*/ true,
