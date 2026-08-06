@@ -475,13 +475,13 @@ llama_context::llama_context(
                         __func__, params.moe_expert_cache_size);
             } else {
                 ggml_moe_cache_policy policy = (ggml_moe_cache_policy) params.moe_cache_policy;
-                moe_cache = ggml_moe_cache_init(gpu_backend, (int) model.hparams.n_layer, params.moe_expert_cache_size, 0, policy);
+                moe_cache = ggml_moe_cache_init(gpu_backend, (int) model.hparams.n_layer(), params.moe_expert_cache_size, 0, policy);
                 if (moe_cache == nullptr) {
                     LLAMA_LOG_WARN("%s: failed to allocate MoE expert cache (slots=%d, layers=%d); disabling\n",
-                            __func__, params.moe_expert_cache_size, (int) model.hparams.n_layer);
+                            __func__, params.moe_expert_cache_size, (int) model.hparams.n_layer());
                 } else {
                     LLAMA_LOG_INFO("%s: MoE expert cache enabled: %d slots/bucket x %d layers, %.2f MiB allocated\n",
-                            __func__, params.moe_expert_cache_size, (int) model.hparams.n_layer,
+                            __func__, params.moe_expert_cache_size, (int) model.hparams.n_layer(),
                             ggml_moe_cache_total_bytes(moe_cache) / (1024.0 * 1024.0));
 
                     // CUDA's default op_offload_min_batch_size is 32, which keeps
